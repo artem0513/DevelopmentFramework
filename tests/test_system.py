@@ -744,6 +744,21 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
         self.env["ASE_LOG_RETENTION_DAYS"] = "0"
         self.cli("context", ok=(3,))
 
+    def test_installed_launcher_canonicalizes_state_home_through_directory_alias(self):
+        # Windows runners may supply TEMP through an 8.3 alias; a directory
+        # reparse alias reproduces the same lexical-vs-canonical path boundary.
+        alias = self.base / "launcher-base-alias"
+        try:
+            alias.symlink_to(self.base, target_is_directory=True)
+        except OSError:
+            if os.name != "nt":
+                raise
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.base)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.base = alias
+        self.test_installed_launcher_recovers_missing_environment_and_preserves_explicit_state_home()
+
     def test_installed_launcher_recovers_missing_environment_and_preserves_explicit_state_home(self):
         codex, skills = self.base / "codex", self.base / "skills"
         install_env = dict(self.env, LOCALAPPDATA=str(self.base / "local"))
@@ -764,14 +779,21 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
                                     cwd=self.base, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             return json.loads(result.stdout)
+        def assert_state_home(state_dir, target):
+            actual = Path(state_dir)
+            # Engine returns canonical paths. Compare to the same filesystem
+            # identity instead of a runner TEMP alias spelling (e.g. RUNNER~1).
+            self.assertEqual(actual, actual.resolve())
+            self.assertTrue(actual.is_relative_to(target.resolve()),
+                            f"State path {actual} is outside canonical target {target.resolve()}")
         initialized = launcher("init")
-        self.assertTrue(Path(initialized["state_dir"]).is_relative_to(self.base / "local" / "AutonomousSE"))
+        assert_state_home(initialized["state_dir"], self.base / "local" / "AutonomousSE")
         for args, target in ((("--home", str(self.base / "explicit")), self.base / "explicit"),
                              (("--home=" + str(self.base / "absolute-equals"),), self.base / "absolute-equals"),
                              (("--home=equals",), self.base / "equals")):
-            self.assertTrue(Path(launcher(*args, "init")["state_dir"]).is_relative_to(target))
+            assert_state_home(launcher(*args, "init")["state_dir"], target)
         script = ("import os, unittest\nclass EnvironmentTests(unittest.TestCase):\n"
-                  f"    def test_codex_home(self): self.assertEqual(os.environ.get('CODEX_HOME'), {str(codex)!r})\n"
+                  f"    def test_codex_home(self): self.assertEqual(os.environ.get('CODEX_HOME'), {str(codex.resolve())!r})\n"
                   "    def test_home(self): self.assertTrue(os.environ.get('HOME'))\n")
         if os.name == "nt":
             script += "    def test_userprofile(self): self.assertTrue(os.environ.get('USERPROFILE'))\n"
