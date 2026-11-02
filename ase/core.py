@@ -169,6 +169,55 @@ def validate_contract(contract, repo):
 def test_counts(output, parser):
     output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
     total, skipped, failed = 0, 0, 0
+    # Bun is also used behind package scripts with no explicit parser. Require
+    # its runner header and complete, internally consistent summary per suite;
+    # isolated "N pass" lines are not evidence of an executed test run.
+    bun_runs = re.split(r"(?m)^bun test v\d[^\r\n]*\r?$", output)
+    if parser is None and len(bun_runs) > 1:
+        # Autodetection must not approve just the Bun portion of a mixed-runner
+        # command while losing failures, skips or an empty foreign test run.
+        # Detect summary syntax independently of whether its counters are zero.
+        foreign_summary = re.compile(
+            r"\bRan \d+ tests? in\b|\b(?:Total|Failed|Skipped):\s*\d+\b|"
+            r"\b\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed)\b|"
+            r"\bcollected \d+ items?\b|"
+            r"(?i:\bno tests? (?:ran|collected|found)\b|"
+            r"\bno test files found\b|\bno test is available\b)|"
+            r"# (?:tests|fail|skipped|todo)\s+\d+\b|"
+            r"Tests\s*:|Tests\s+\d|TOTAL:"
+        )
+        if foreign_summary.search(output):
+            return {"total": 0, "skipped": 0, "failed": 0}
+        summary = re.compile(
+            r"(?m)(?P<counts>(?:^[ \t]*\d+ (?:pass|skip|todo|fail)[ \t]*\r?\n)+)"
+            r"(?:^[ \t]*\d+ expect\(\) calls?[ \t]*\r?\n)?"
+            r"^[ \t]*Ran (?P<ran>\d+) tests? across \d+ files?\."
+            r"(?: \[[^\r\n]+\])?[ \t]*\r?$"
+        )
+        summary_line = re.compile(
+            r"(?m)^[ \t]*(?:\d+ (?:pass|skip|todo|fail)\b|"
+            r"\d+ expect\(\) calls?\b|Ran \d+ tests? across\b|bun[ \t]+test\b)"
+        )
+        if summary_line.search(bun_runs[0]):
+            return {"total": 0, "skipped": 0, "failed": 0}
+        for run in bun_runs[1:]:
+            matches = list(summary.finditer(run))
+            if len(matches) != 1:
+                return {"total": 0, "skipped": 0, "failed": 0}
+            match = matches[0]
+            # A complete suffix must not hide an earlier/later partial summary.
+            unmatched = run[:match.start()] + run[match.end():]
+            if summary_line.search(unmatched):
+                return {"total": 0, "skipped": 0, "failed": 0}
+            entries = re.findall(r"(\d+) (pass|skip|todo|fail)", match["counts"])
+            counts = {kind: int(number) for number, kind in entries}
+            if (len(counts) != len(entries) or not {"pass", "fail"} <= counts.keys()
+                    or sum(counts.values()) != int(match["ran"])):
+                return {"total": 0, "skipped": 0, "failed": 0}
+            total += counts["pass"] + counts["fail"]
+            skipped += counts.get("skip", 0) + counts.get("todo", 0)
+            failed += counts["fail"]
+        return {"total": total, "skipped": skipped, "failed": failed}
     if parser == "unittest":
         match = re.search(r"Ran (\d+) tests? in", output)
         total = int(match[1]) if match else 0
