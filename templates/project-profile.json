@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "purpose": "Descriptive adoption worksheet; not loaded as execution permissions",
+  "repositories": [],
+  "sources": [],
+  "conventions": {
+    "branch_pattern": null,
+    "task_identity": null
+  },
+  "verification": {
+    "commands": []
+  },
+  "publication": {
+    "enabled": false,
+    "remote": null
+  }
+}

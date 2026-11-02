@@ -1,0 +1,8 @@
+{
+  "topic": "storage-decision",
+  "statement": "On the observed date, the project selected SQLite for local task state.",
+  "observed_at": "2026-11-01T00:00:00+00:00",
+  "source_refs": [
+    "local:docs/storage-decision.md"
+  ]
+}

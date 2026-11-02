@@ -1,0 +1,13 @@
+{
+  "id": "replace-with-task-id",
+  "request": "Original user request; preserve its business meaning",
+  "risk": "MEDIUM",
+  "acceptance": [
+    {"id": "AC-1", "expected": "Replace with observable confirmed behavior", "mandatory": true, "commands": ["unit"]}
+  ],
+  "commands": [
+    {"id": "unit", "argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "kind": "test", "required": true, "parser": "unittest", "timeout": 300}
+  ],
+  "protected_paths": [".github/workflows/**", ".ase/**"],
+  "max_attempts": 2
+}
