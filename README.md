@@ -3,13 +3,13 @@
 A local Codex workflow that records actual execution evidence, uses separate acceptance/review sessions, and refuses unsupported completion or publishing. Python 3.11+ standard library, SQLite, Git and an authenticated Codex CLI. Windows/PowerShell is the primary tested environment.
 
 ```powershell
-python scripts/install.py
+python scripts/install.py --project E:/path/to/repo
 & "$HOME/.codex/bin/ase.ps1" --repo E:/path/to/repo init
 ```
 
-The installer backs up changed owned files, installs eight discoverable skills under `~/.agents/skills`, three native agent definitions under `~/.codex/agents`, a user runtime/launcher and a short managed global AGENTS pointer. Existing `config.toml` is preserved; `autonomous.config.toml` is an optional separate profile. New skills become available on the next Codex turn/session. Superpowers and .NET test are installed with the current native plugin mechanism; see [installation evidence](docs/validation.md).
+This checkout is a passive template. Installation requires an explicit mode. `--project <repo>` installs nine owned skills in that repository's `.agents/skills`, three native roles in `.codex/agents`, exact local skill-enable entries in `.codex/config.toml`, and a managed project instruction block. Existing project content is preserved and changed owned files are backed up. Shared runtime/launcher preparation does not activate engineering in other projects. `--runtime-only` prepares tooling without routing; legacy global activation requires explicit `--global`. See [project adoption](docs/project-adoption.md).
 
-Open an existing repository in Codex and provide a normal development request. The global router instructs Codex to inspect the project, establish a task contract, implement, delegate verification/review, execute checks and report the gate. This is model-driven routing: the CLI's explicit input is a confirmed JSON contract, not a deterministic natural-language requirement compiler. See [workflow](docs/workflow.md) and [framework routing](docs/frameworks.md).
+Ask the assistant to copy/adapt this template for a named software project when needed. The opted-in project's local routing covers actual code/config changes and their verification. Financial analysis, interpreting data-quality warnings and ordinary document work follow their domain instructions. Merely opening another project does not adopt it. Routing remains model-driven; the CLI takes a confirmed JSON contract. See [workflow](docs/workflow.md) and [framework routing](docs/frameworks.md).
 
 From this checkout, the same commands work with `python -m ase`:
 
@@ -37,7 +37,7 @@ python -m ase --repo E:/path/to/repo publish task-id
 
 **Automatic verification from a chat:** the installed `autonomous_se` MCP service accepts only `verification_start` and `verification_status` for configured repository roots. The chat implements and executes checks in its workspace sandbox, then the host service launches independent reviewers with `read-only` permissions and records genuine receipts. This avoids the nested CLI startup denial without granting write access to the real Codex home. A fresh ordinary-language chat completed this entire path with APPROVED. See [the fix and evidence](docs/nested-workflow.md).
 
-The service is currently registered for `E:/Tools/DevelopmentFramework` and its disposable child repositories. An authorized bootstrap for another project registers that root with `python scripts/install.py --register-verifier --root <path>`. The installer backs up config, pins the executable/state home and approves only the two verification tools; future tools retain a prompting default. New chats load the service automatically. If a current chat lacks the MCP catalog or a repository is outside the allowlist, the gate remains BLOCKED; sandbox permissions are preserved.
+Verifier roots are an explicit host allowlist, separate from project adoption. After shared runtime preparation, an authorized bootstrap can register a root with `python scripts/install.py --register-verifier --root <path>`. Registration alone does not copy skills or create routing. It backs up config and approves only the two verification tools; future tools retain a prompting default. If the host tools or root are unavailable, the gate remains BLOCKED; sandbox permissions are preserved. Existing local allowlists are not documented as universal template defaults.
 
 Push is dry-run unless `--execute` is supplied and a human has authorized that repository's exact single remote destination:
 

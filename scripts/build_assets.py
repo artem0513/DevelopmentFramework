@@ -24,12 +24,21 @@ for name, extra in extensions.items():
     skills[name] = (description, body + extra)
 for name, (description, body) in skills.items():
     if name == 'task-orchestrator':
+        body = ('Use this engineering workflow only when the target repository explicitly adopts DevelopmentFramework '
+                'in its local AGENTS instructions. The template location or current chat does not opt another project in. '
+                'Apply it to actual software code/config implementation and verification. Domain work such as interpreting '
+                'a financial report or explaining source-data warnings follows the relevant domain skills; it is not '
+                'software debugging merely because a report contains errors. ' + body)
         body += (' In a chat, execute `start` and `check` in the existing tool sandbox, then use the Autonomous SE MCP '
                  '`verification_start` tool with the absolute repo and task_id and poll `verification_status` until terminal. '
                  'This host tool produces separate read-only Codex receipts without starting a new harness inside the tool sandbox. '
                  'Inspect result.report.quality_gate.status; COMPLETED alone is not approval. Prefer this transport whenever available. '
                  'If unavailable or the repository is outside its configured roots, keep verification BLOCKED; preserve sandbox restrictions. '
                  'Do not start nested CLI verification, copy credentials, or relax permissions as a fallback.')
+    if name == 'project-bootstrap':
+        body = ('Activate a target project only after the user explicitly requests adoption. Run the template installer '
+                'with --project <target>; keep skills, native roles and routing project-local. Shared runtime-only or '
+                'verifier-only setup does not adopt projects. Never turn on global engineering routing as a side effect. ' + body)
     directory = root / 'skills' / name
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'SKILL.md').write_text('---\nname: ' + name + '\ndescription: ' + json.dumps(description) + '\n---\n\n' + body + '\n\nRead the detailed workflow at `$CODEX_HOME/autonomous-se/runtime/docs/workflow.md` (default `~/.codex/autonomous-se/runtime/docs/workflow.md`) when executing this role. CLI: `~/.codex/bin/ase.ps1 --repo <path> <command>` on Windows; installed `ase` launcher on Unix. In the source checkout use `python -m ase`.\n', encoding='utf-8')

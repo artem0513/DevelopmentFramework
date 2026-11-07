@@ -763,7 +763,7 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
         codex, skills = self.base / "codex", self.base / "skills"
         install_env = dict(self.env, LOCALAPPDATA=str(self.base / "local"))
         result = subprocess.run([sys.executable, str(ROOT / "scripts" / "install.py"),
-            "--home", str(codex), "--skills", str(skills)], env=install_env, capture_output=True, text=True)
+            "--global", "--home", str(codex), "--skills", str(skills)], env=install_env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         launch_env = dict(install_env)
         for name in ("HOME", "USERPROFILE", "CODEX_HOME"):
@@ -821,7 +821,7 @@ class InstallationTests(unittest.TestCase):
             agents.write_text(original, encoding="utf-8")
             def install():
                 result = subprocess.run([sys.executable, str(ROOT / "scripts" / "install.py"),
-                    "--home", str(codex), "--skills", str(skills)], capture_output=True, text=True)
+                    "--global", "--home", str(codex), "--skills", str(skills)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 return json.loads(result.stdout)
             install()

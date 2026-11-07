@@ -1,5 +1,9 @@
 # Autonomous SE workflow
 
+## Activation boundary
+
+This workflow applies only after explicit adoption by the target software project. Use `scripts/install.py --project <repo>` from the template, then configure that project's actual checks and sources. Shared tooling or an available MCP server alone does not activate the workflow. Financial report analysis, source-data warnings and document tasks follow their domain instructions. A confirmed software defect requiring code/config changes is an engineering task in an opted-in project. See [project adoption](project-adoption.md).
+
 Use `$CODEX_HOME/bin/ase.ps1` on Windows (default `~/.codex/bin/ase.ps1`), or the installed `ase` launcher on Unix. From this checkout use `python -m ase`. Always pass `--repo <canonical repository>` before the command. State is outside the repository and isolated by canonical path.
 
 ## Understand and plan
