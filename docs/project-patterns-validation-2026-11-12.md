@@ -28,3 +28,7 @@ Local raw evidence is intentionally ignored by Git: [behavior observations](../o
 ## Primary sources checked
 
 The [design and research notes](superpowers/specs/2026-11-12-project-patterns-design.md) connect the user's requirements to [OpenAI's prior-art/reuse guidance](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide), [Anthropic's focused current-code search](https://claude.com/resources/articles/how-claude-code-works-in-large-codebases-best-practices-and-where-to-start), [Claude's legacy-pattern and instruction guidance](https://code.claude.com/docs/en/best-practices) and [GitHub's repository/path-specific instructions](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/add-custom-instructions/add-repository-instructions). The exact opt-out and outcome record are this framework's design for the user's stated preferences.
+
+## Subsequent delivery on the same date
+
+The separate project-local mode has since been implemented and checked. Its final source-candidate acceptance covers preservation of these pending skills; both537-test suites pass and substantive review has no P0–P3 findings or mandatory missing coverage. These skill changes were included in published source commit [181a6b7](https://github.com/artem0513/DevelopmentFramework/commit/181a6b73439a18fab40198a3b5dbfc7bd63569aa). See the [later validation and publication report](project-local-validation-2026-11-12.md). Earlier qualifications above remain the historical result of that earlier evidence packet, not the later delivery's status.

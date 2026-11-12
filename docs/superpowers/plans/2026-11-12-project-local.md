@@ -62,4 +62,6 @@
 - [x] Run focused integration, full suites and clean package with a complete source freeze and raw byte-preserved logs.
 - [x] Execute real local launcher + SQLite/journal isolation and separate Codex AC/review using the installed local runtime; record full receipts, original source inventory and actual source packet.
 - [x] Resolve in-scope P0–P2 findings within existing persisted budgets; retain unverified coverage explicitly.
-- [ ] Refresh adopted copies with backups, save context/worklog, inspect the staged source inventory for private state, commit and fast-forward push to the existing authorized remote/branch, then verify remote SHA.
+- [x] Refresh adopted copies with backups, save context/worklog, inspect the staged source inventory for private state, commit and fast-forward push to the existing authorized remote/branch, then verify remote SHA.
+
+Observed source publication: `181a6b73439a18fab40198a3b5dbfc7bd63569aa` on `origin/feature/project-opt-in`; remote SHA equals local. This prose closeout follows that actual push. Final evidence and limits are in `docs/project-local-validation-2026-11-12.md`; private raw receipts and continuation context remain under ignored outputs.
