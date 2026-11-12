@@ -2,7 +2,9 @@
 
 Use this reference only for a material unresolved decision or a changed authorization boundary.
 
-A question is necessary when all three hold: the answer cannot be retrieved reliably from authorized sources; it materially changes outcome, compatibility, cost, risk or authority; there is no safe choice within the approved scope. State the recommended interpretation or solution, its reason and the consequence of the alternative before the question. Continue independent permitted work while waiting. Choose ordinary internal details yourself.
+A question is necessary when all three hold: the answer is not reliably established after the relevant bounded [answer investigation](../../task-discovery/references/answer-investigation.md), or is an owner-only decision; it materially changes outcome, compatibility, cost, risk or authority; there is no safe choice within the approved scope. Report the inspected scope and stopping reason without claiming unavailable or uninspected sources contain no answer. State the recommended interpretation or solution, its reason and the consequence of the alternative before the question. Continue already approved independent work while the dependent part waits. Choose ordinary internal details yourself.
+
+Route a remaining material question to the task owner first: concise checked evidence, remaining uncertainty, recommendation and why, then the decision needed. If the owner needs team input, prepare a concrete question for owner review and send only after explicit approval of that question and destination. Standing permission for a channel or routine communication does not bypass this review for unresolved task questions. Do not request a second approval when the owner already approved the concrete question and destination. Preparing an internal draft within the task is reversible work; it does not itself require a separate approval.
 
 The proposal is about 5–8 lines: result; business approach and reason; technical means and reused capabilities; 2–4 steps; verification; material assumptions and limits. Keep the detailed contract separately inspectable. Do not hide a material risk to meet a line count.
 

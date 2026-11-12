@@ -11,4 +11,6 @@ For status read `ase --project PROJECT report TASK`, the current checkpoint and 
 
 For dated activity use `ase worklog` and `ase meeting-report` with explicit date bounds and timezone. Draft results, decisions, blockers and next actions; label current versus historical/as-of blockers. Read [finish and reports](../task-orchestrator/references/finish-and-reports.md) before session closure or requested stop. Summaries do not alter task approval or evidence.
 
-Drafting is authorized by a drafting request. Sending to email/chat or publishing needs explicit authorization for the destination. Never infer billable hours from agent activity.
+For an unresolved task question, follow [questions and approval](../task-orchestrator/references/questions-and-approval.md): investigate relevant evidence first, then present the remaining material uncertainty and recommended answer to the owner. If team input is needed, prepare an internal draft for owner review; send only once the concrete question and destination are approved. Standing channel permission does not bypass this owner review, and an already approved concrete question does not need another approval.
+
+Drafting is authorized by a drafting request or as internal preparation within the approved task. Other sending to email/chat or publishing needs explicit authorization for the destination. Never infer billable hours from agent activity.
