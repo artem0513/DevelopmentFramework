@@ -1,5 +1,4 @@
 """Project-isolated transactional SQLite memory, without raw chat retention."""
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,46 +6,94 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
+from .projects import ProjectContext, ProjectRegistry, _canonical, _outside, _safe_state, resolve_state_home
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
 def default_home():
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
-    return base / "AutonomousSE"
+    return resolve_state_home()
 
 
 class Store:
     def __init__(self, repo, home=None):
+        if isinstance(repo, ProjectContext):
+            if home is not None and resolve_state_home(home) != repo.state_home:
+                raise ValueError("Project context state home conflicts with explicit home")
+            registry = ProjectRegistry(repo.state_home)
+            try:
+                project = registry.validate(repo)
+            finally:
+                registry.close()
+        else:
+            root = Path(repo).expanduser().resolve(strict=True)
+            selected_home = resolve_state_home(home)
+            _outside(selected_home, root)
+            registry = ProjectRegistry(selected_home)
+            try:
+                project = registry.for_root(root)
+            finally:
+                registry.close()
+        self._initialize(project)
+
+    def _initialize(self, project, *, preparing=False):
         try:
             self.log_retention_days = int(os.environ.get("ASE_LOG_RETENTION_DAYS", "30"))
         except ValueError:
             raise ValueError("ASE_LOG_RETENTION_DAYS must be an integer from 1 to 365") from None
         if not 1 <= self.log_retention_days <= 365:
             raise ValueError("ASE_LOG_RETENTION_DAYS must be an integer from 1 to 365")
-        self.repo = Path(repo).resolve(strict=True)
-        identity = os.path.normcase(str(self.repo))
-        self.project_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
-        self.root = Path(home or default_home()).resolve() / "projects" / self.project_id
-        if self.root.resolve() != self.root:
-            raise ValueError("Project state reparse points are not supported")
+        self.project = project
+        self.repo = project.root.resolve(strict=True)
+        self.project_id = project.project_id
+        self.workspace_id = project.workspace_id
+        self.state_home = project.state_home
+        if (not project.storage_key or Path(project.storage_key).name != project.storage_key
+                or project.storage_key in {".", ".."}):
+            raise ValueError("Invalid project storage key")
+        self.root = self.state_home / "projects" / project.storage_key
+        _safe_state(self.root)
         for name in ("memory.sqlite3", "memory.sqlite3-wal", "memory.sqlite3-shm", "backups"):
             path = self.root / name
-            if path.resolve() != path or (path.is_file() and path.stat().st_nlink > 1):
-                raise ValueError("State files must remain inside their project directory")
+            _safe_state(path)
         if self.root == self.repo or self.root.is_relative_to(self.repo):
             raise ValueError("State home must be outside the repository")
         self.root.mkdir(parents=True, exist_ok=True)
+        if not preparing and not (self.root / "memory.sqlite3").is_file():
+            raise ValueError("Missing project memory database; explicit recovery required")
         self.db = sqlite3.connect(self.root / "memory.sqlite3", timeout=30)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.migrate()
-        with self.db:
-            self.db.execute("INSERT OR IGNORE INTO projects VALUES(?,?,?,?)", (
-                self.project_id, str(self.repo), "{}", now()))
-        self.prune_evidence()
+        try:
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA foreign_keys=ON")
+            self.db.execute("PRAGMA journal_mode=WAL")
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if preparing and 0 < version <= 5:
+                legacy = self.db.execute("SELECT repo FROM projects WHERE id IN (?,?)",
+                                         (self.project_id, project.storage_key)).fetchall()
+                pending_empty = (project.storage_key == self.project_id
+                                 and not self.db.execute("SELECT 1 FROM projects LIMIT 1").fetchone())
+                if not pending_empty and not any(_canonical(row[0]) == _canonical(self.repo) for row in legacy):
+                    raise ValueError("Legacy project database identity does not match selected workspace")
+            self.migrate()
+            with self.db:
+                identity = self.db.execute("SELECT payload FROM runtime_records WHERE kind='project_identity' AND key='identity'").fetchone()
+                expected = {"project_id": self.project_id, "storage_key": project.storage_key}
+                if identity is not None and json.loads(identity[0]) != expected:
+                    raise ValueError("Project database identity conflicts with registry")
+                if identity is None:
+                    if not preparing:
+                        raise ValueError("Missing project database identity; explicit recovery required")
+                    self.db.execute("INSERT INTO runtime_records VALUES(?,?,?,?,?)", (
+                        "project_identity", "identity", 1, json.dumps(expected), now()))
+                self.db.execute("INSERT OR IGNORE INTO projects VALUES(?,?,?,?)", (
+                    self.project_id, str(self.repo), "{}", now()))
+            if not preparing:
+                self.prune_evidence()
+        except BaseException:
+            self.db.close()
+            raise
 
     def prune_evidence(self):
         """Remove expired known verbose evidence, preserving structured memory.
@@ -100,7 +147,7 @@ class Store:
 
     def migrate(self):
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 4:
+        if version > 5:
             raise ValueError("Memory schema newer than this application")
         if version == 0:
             self.db.executescript("""
@@ -150,6 +197,29 @@ class Store:
             PRAGMA user_version=4;
             COMMIT;
             """)
+
+        if version < 5:
+            if version == 4:
+                self.backup()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute("""CREATE TABLE IF NOT EXISTS runtime_records(
+                    kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,
+                    payload TEXT NOT NULL,updated TEXT NOT NULL,PRIMARY KEY(kind,key))""")
+                self.db.execute("""CREATE TABLE IF NOT EXISTS runtime_events(
+                    sequence INTEGER PRIMARY KEY,event_key TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,task_id TEXT,payload TEXT NOT NULL,created TEXT NOT NULL)""")
+                self.db.execute("""CREATE TABLE IF NOT EXISTS task_discoveries(
+                    task_id TEXT NOT NULL REFERENCES tasks(id),revision INTEGER NOT NULL,
+                    payload TEXT NOT NULL,created TEXT NOT NULL,PRIMARY KEY(task_id,revision))""")
+                self.db.execute("""INSERT OR IGNORE INTO runtime_records(kind,key,revision,payload,updated)
+                    SELECT 'knowledge_validity',CAST(id AS TEXT),1,?,? FROM knowledge_claims""",
+                                (json.dumps({"validity": "UNKNOWN"}), now()))
+                self.db.execute("PRAGMA user_version=5")
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
 
     def task(self, task_id):
         row = self.db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()

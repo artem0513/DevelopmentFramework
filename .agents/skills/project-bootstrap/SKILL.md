@@ -1,8 +1,16 @@
 ---
 name: project-bootstrap
-description: "Initialize repository-specific verification by discovering its stack, test commands and existing agent conventions."
+description: "Use when the user explicitly requests adoption of DevelopmentFramework in a selected project or local workspace, or backend preflight for that adoption."
 ---
 
-Activate a target project only after the user explicitly requests adoption. Run the template installer with --project <target>; keep skills, native roles and routing project-local. Shared runtime-only or verifier-only setup does not adopt projects. Never turn on global engineering routing as a side effect. Inspect existing AGENTS.md, package scripts, .NET solutions/projects, CI and architecture docs. Use `init` and review discovered commands; configure tests/build/lint/security/integration checks from actual project conventions. Preserve existing configuration and back up changes. Update project AGENTS with a concise orchestrator pointer. Route framework-specific work using the vendor registry. Absent tests or infrastructure remain BLOCKED. For a future project, use templates/project-profile.json in the installed runtime as a descriptive starting point; leave repositories and sources empty until the user supplies them. Paths, provider choices and branch conventions come from that project. The template grants no access and registers no MCP roots. Read references/skill-routing.md before combining installed methods.
+# Explicit workspace adoption
 
-Read the detailed workflow at `$CODEX_HOME/autonomous-se/runtime/docs/workflow.md` (default `~/.codex/autonomous-se/runtime/docs/workflow.md`) when executing this role. CLI: `~/.codex/bin/ase.ps1 --repo <path> <command>` on Windows; installed `ase` launcher on Unix. In the source checkout use `python -m ase`.
+A template, installed runtime or readable workspace does not adopt other projects. Prepare tooling separately from project routing. Activate only the explicitly selected existing project/workspace and backend targets; no Git repository is required. Preserve applicable local instructions and existing user authorization.
+
+Preview `python scripts/install.py --project PATH --target codex --preview` from the framework source, adding `--target claude` or `--target copilot` only when selected. Review exact owned files, hashes, scope and backup paths before applying. `--runtime-only --target BACKEND` prepares shared tooling without routing. Never change authentication, unrelated integrations or provider permission settings as a setup shortcut.
+
+Register project identity and timezone with the local `ase` CLI; inspect actual source inventory, domain constraints, checks and capability versions. The bundled project profile is a worksheet, not an access grant. Use task-discovery to record tool presence separately from permission, resource access, structured output and independent execution.
+
+Use software checks for code/config implementation, domain evidence for documents/research, and real resource observations for infrastructure. Native role pointers and protocol tests do not prove live model support. Missing subscribed backends remain explicitly unavailable; do not install them merely to complete a support matrix.
+
+Read [skill routing](references/skill-routing.md) when selecting optional methods. Inspect and pin a vendor package before explicitly scoped copying; downloaded scripts are not executed. A shared runtime never activates project routing globally.

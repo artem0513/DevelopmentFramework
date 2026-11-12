@@ -9,6 +9,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from scripts import install as installer
@@ -127,6 +128,26 @@ class ProjectInstallationTests(unittest.TestCase):
         self.assertEqual(path.read_text().count(installer.BEGIN), 1)
         self.assertTrue(path.read_text().startswith(original.rstrip()))
         self.assertTrue(any(p.read_text() == original for p in (self.home / "backups").rglob("AGENTS.md")))
+
+    def test_relocated_project_rebuilds_only_owned_absolute_skill_selectors(self):
+        old_project = self.base / 'old-project'
+        old_project.mkdir()
+        old_skill = old_project / '.agents/skills/task-orchestrator/SKILL.md'
+        config = self.project / '.codex/config.toml'
+        config.parent.mkdir()
+        unrelated = '# user settings\nmodel="preserve"\n[[skills.config]]\npath="unrelated/domain/SKILL.md"\nenabled=false\n'
+        owned = ('\n' + installer.SKILLS_BEGIN + '\n[[skills.config]]\npath=' + json.dumps(str(old_skill))
+                 + '\nenabled=true\n' + installer.SKILLS_END + '\n')
+        config.write_text(unrelated + owned)
+        self.install(project=self.project)
+        text = config.read_text()
+        self.assertTrue(text.startswith(unrelated))
+        self.assertNotIn(str(old_skill).replace('\\', '\\\\'), text)
+        entries = tomllib.loads(text)['skills']['config']
+        self.assertEqual(entries[0], {'path': 'unrelated/domain/SKILL.md', 'enabled': False})
+        self.assertEqual({entry['path'] for entry in entries[1:]}, {
+            str(self.project / '.agents/skills' / name / 'SKILL.md') for name in ('task-orchestrator', 'quality-gate')})
+        self.assertEqual(list(old_project.iterdir()), [])
 
     def test_existing_active_override_receives_routing_instead_of_ignored_agents(self):
         override = self.project / "AGENTS.override.md"
@@ -281,18 +302,21 @@ class ProjectInstallationTests(unittest.TestCase):
         self.assertIn("--project", p.stderr)
         self.assertFalse((self.home / "autonomous-se").exists())
 
-    def test_verifier_only_registration_does_not_call_installer(self):
-        with patch.object(installer, "install") as install, patch.object(installer, "register_verifier") as register:
+    def test_deprecated_verifier_registration_does_not_call_installer_or_register(self):
+        with patch.object(installer, "install") as install, patch.object(installer, "register_verifier") as register, \
+             contextlib.redirect_stderr(io.StringIO()) as output, self.assertRaises(SystemExit) as error:
             installer.main(["--home", str(self.home), "--register-verifier", "--root", str(self.project)])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("deprecated", output.getvalue())
         install.assert_not_called()
-        register.assert_called_once()
+        register.assert_not_called()
 
     def test_missing_verifier_runtime_is_reported_without_registration_or_config_change(self):
         before = self.config.read_bytes()
         with patch.object(installer.shutil, "which", return_value=sys.executable), \
              patch.object(installer.subprocess, "run") as process, self.assertRaises(SystemExit) as error:
             installer.register_verifier(self.home, [self.project], self.base / "state")
-        self.assertIn("--runtime-only", str(error.exception))
+        self.assertIn("deprecated", str(error.exception))
         process.assert_not_called()
         self.assertEqual(self.config.read_bytes(), before)
 
@@ -330,7 +354,7 @@ class VendorDestinationTests(unittest.TestCase):
 
     def test_vendor_inspection_needs_no_destination_and_performs_no_installation(self):
         with patch.object(vendor_skills.urllib.request, "urlopen", return_value=io.BytesIO(b"---\nname: angular-developer\n---\nFixture")), \
-             patch.object(vendor_skills.subprocess, "run") as process, contextlib.redirect_stdout(io.StringIO()) as output:
+             patch.object(subprocess, "run") as process, contextlib.redirect_stdout(io.StringIO()) as output:
             vendor_skills.main(["--stack", "angular", "--ref", "a" * 40, "--inspect"])
         process.assert_not_called()
         self.assertIn("angular-developer", output.getvalue())
@@ -348,15 +372,13 @@ class VendorDestinationTests(unittest.TestCase):
             _, data = installer.project_skill_config(project.resolve(), [owned])
             config.write_bytes(data)
 
-            def downloaded(argv, **kwargs):
-                destination = Path(argv[argv.index("--dest") + 1])
-                target = destination / "angular-developer/SKILL.md"
-                target.parent.mkdir(parents=True)
-                target.write_text("---\nname: angular-developer\n---\nFixture\n")
-                return subprocess.CompletedProcess(argv, 0)
+            package = io.BytesIO()
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("skills-" + "a" * 40 + "/angular-developer/SKILL.md",
+                                 "---\nname: angular-developer\n---\nFixture\n")
 
-            with patch.object(vendor_skills.urllib.request, "urlopen", return_value=io.BytesIO(b"# Reviewed source")), \
-                 patch.object(vendor_skills.subprocess, "run", side_effect=downloaded), \
+            with patch.object(vendor_skills.urllib.request, "urlopen", return_value=io.BytesIO(package.getvalue())), \
+                 patch.object(subprocess, "run", side_effect=AssertionError("No external installer")), \
                  patch.dict(os.environ, {"CODEX_HOME": str(project / "isolated-codex")}), \
                  contextlib.redirect_stdout(io.StringIO()):
                 vendor_skills.main(["--stack", "angular", "--project", str(project), "--ref", "a" * 40])
@@ -400,7 +422,7 @@ class VendorDestinationTests(unittest.TestCase):
                 (root / relative).mkdir(parents=True)
                 before = sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
                 with patch.object(vendor_skills.urllib.request, "urlopen") as network, \
-                     patch.object(vendor_skills.subprocess, "run") as download, self.assertRaises(ValueError):
+                     patch.object(subprocess, "run") as download, self.assertRaises(ValueError):
                     vendor_skills.main(["--stack", "angular", mode, str(root), "--ref", "a" * 40])
                 network.assert_not_called()
                 download.assert_not_called()

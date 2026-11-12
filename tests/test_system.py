@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,7 @@ class SystemTests(unittest.TestCase):
 
     def cli(self, *args, ok=(0,)):
         result = subprocess.run(
-            [sys.executable, "-m", "ase", "--repo", str(self.repo), "--home", str(self.home), *args],
+            [sys.executable, str(ROOT / "tests" / "legacy_cli_fixture.py"), "--repo", str(self.repo), "--home", str(self.home), *args],
             cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=60)
         self.assertIn(result.returncode, ok, result.stdout + result.stderr)
         try:
@@ -563,6 +564,12 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
             "--repo", str(self.repo), "--task", self.task, "--home", str(self.home)],
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # These are frozen v1 receipt protocol regressions. The production
+        # public CLI deliberately refuses new authority from a legacy task.
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        original = hook.read_text(encoding="utf-8")
+        hook.write_text(original.replace(shlex.join([sys.executable, "-m", "ase"]),
+                                        shlex.join([sys.executable, str(ROOT / "tests" / "legacy_cli_fixture.py")])), encoding="utf-8", newline="\n")
 
     def test_native_git_hook_blocks_main_divergent_head_and_failed_gate(self):
         self.start()
@@ -670,7 +677,7 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
     def test_v1_memory_migration_backs_up_and_preserves_tasks(self):
         self.start()
         database = next(self.home.rglob("memory.sqlite3"))
-        # Reconstruct the actual v1 schema from a freshly populated v4 database.
+        # Reconstruct the actual v1 schema from a freshly populated database.
         with closing(sqlite3.connect(database)) as db, db:
             db.execute("DROP TABLE knowledge_claims")
             db.execute("DROP TABLE time_entry_audit")
@@ -682,7 +689,7 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
             db.execute("PRAGMA user_version=1")
         self.assertIn(self.task, json.dumps(self.cli("status", self.task)))
         with closing(sqlite3.connect(database)) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("SELECT request FROM tasks WHERE id=?", (self.task,)).fetchone()[0],
                              "Implement integer addition with executable evidence.")
         backups = list(database.parent.glob("backups/*.sqlite3"))
@@ -787,25 +794,34 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
             self.assertTrue(actual.is_relative_to(target.resolve()),
                             f"State path {actual} is outside canonical target {target.resolve()}")
         initialized = launcher("init")
-        assert_state_home(initialized["state_dir"], self.base / "local" / "AutonomousSE")
+        self.assertEqual(Path(initialized["root"]), self.repo.resolve())
         for args, target in ((("--home", str(self.base / "explicit")), self.base / "explicit"),
                              (("--home=" + str(self.base / "absolute-equals"),), self.base / "absolute-equals"),
                              (("--home=equals",), self.base / "equals")):
-            assert_state_home(launcher(*args, "init")["state_dir"], target)
+            initialized_at_target = launcher(*args, "init")
+            self.assertEqual(Path(initialized_at_target["root"]), self.repo.resolve())
+            self.assertTrue((target.resolve() / "registry.sqlite3").is_file())
         script = ("import os, unittest\nclass EnvironmentTests(unittest.TestCase):\n"
-                  f"    def test_codex_home(self): self.assertEqual(os.environ.get('CODEX_HOME'), {str(codex.resolve())!r})\n"
-                  "    def test_home(self): self.assertTrue(os.environ.get('HOME'))\n")
+                  "    def test_codex_home(self): self.assertIsNone(os.environ.get('CODEX_HOME'))\n"
+                  "    def test_home(self): self.assertIsNone(os.environ.get('HOME'))\n")
         if os.name == "nt":
-            script += "    def test_userprofile(self): self.assertTrue(os.environ.get('USERPROFILE'))\n"
+            script += "    def test_userprofile(self): self.assertIsNone(os.environ.get('USERPROFILE'))\n"
         (self.repo / "test_launcher_env.py").write_text(script, encoding="utf-8")
         contract = {"id": "launcher", "request": "Verify environment in actual child process",
                     "acceptance": [{"id": "AC1", "expected": "Codex has an explicit home", "commands": ["unit"]}],
                     "commands": [{"id": "unit", "argv": [sys.executable, "-m", "unittest", "test_launcher_env", "-v"],
                                   "kind": "test", "parser": "unittest", "required": True}]}
+        contract.update(schema_version=2, profile="software", scope={"resources": ["test_launcher_env.py"], "effects": []},
+                        evidence=contract.pop("commands"), stages=[{"id": "verify", "acceptance_ids": ["AC1"]}])
         path = self.base / "launcher-task.json"
         path.write_text(json.dumps(contract), encoding="utf-8")
         launcher("start", str(path))
-        self.assertEqual(launcher("check", "launcher")["status"], "PASS")
+        proposal = self.base / "launcher-proposal.json"
+        proposal.write_text(json.dumps({"summary": "Run the explicit child environment tests", "stage_ids": ["verify"]}))
+        proposed = launcher("task", "propose", "launcher", "--file", str(proposal), "--expected-revision", "1")
+        launcher("task", "approve", "launcher", "--proposal-hash", proposed["proposal_hash"], "--user-message-ref", "test:explicit-approved-environment-check", "--stage", "verify")
+        receipt = launcher("check", "launcher")
+        self.assertEqual(receipt["results"][0]["exit_code"], 0)
 
 
 class InstallationTests(unittest.TestCase):
@@ -835,9 +851,7 @@ class InstallationTests(unittest.TestCase):
             install()
             install()
             self.assertEqual(agents.read_text(encoding="utf-8").count("<!-- autonomous-se managed begin -->"), 1)
-            self.assertTrue(any(p.read_text(encoding="utf-8") == "# customized managed profile\n"
-                                for p in (codex / "backups").rglob("autonomous.config.toml")))
-            self.assertIn("enabled = true", profile.read_text(encoding="utf-8"))
+            self.assertEqual(profile.read_text(encoding="utf-8"), "# customized managed profile\n")
             self.assertFalse(json.loads((codex / "autonomous-se" / "installation.json").read_text())["remote_push_enabled"])
 
 

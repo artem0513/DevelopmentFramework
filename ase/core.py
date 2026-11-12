@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, date as calendar_date, timedelta
 import fnmatch
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import quote, quote_plus
 
 from .store import Store, now
 
@@ -26,8 +28,16 @@ PROTECTED = [".github/workflows/*", ".codex/*", ".agents/*", "AGENTS.md", ".gitm
 SECRET = re.compile(r"(?i)(?:sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9_]{16,}|Bearer\s+[a-z0-9._-]{12,}|(?:password|api[_-]?key|token|secret)\s*[=:]\s*[^\s,;]{8,})")
 
 
-def redact(value):
-    value = re.sub(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[REDACTED]@", str(value))
+def redact(value, sensitive_values=()):
+    value = str(value)
+    variants = set()
+    for secret in sensitive_values:
+        if isinstance(secret, str) and secret:
+            variants.update((secret, quote(secret, safe=""), quote_plus(secret),
+                base64.b64encode(secret.encode()).decode(), json.dumps(secret, ensure_ascii=True)[1:-1]))
+    for secret in sorted(variants, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[REDACTED]@", value)
     value = re.sub(r"(?i)([?&](?:token|api[_-]?key|secret|password)=)[^&\s]+", r"\1[REDACTED]", value)
     return SECRET.sub("[REDACTED]", value)
 
@@ -248,11 +258,13 @@ def test_counts(output, parser):
     return {"total": total, "skipped": skipped, "failed": failed}
 
 
-def execute(argv, cwd, log, timeout=300):
+def execute(argv, cwd, log, timeout=300, *, env=None, cancel_requested=None, sensitive_values=(), max_output_bytes=None):
     """shell=False; keep only redacted stdout/stderr; record failures to start."""
     started = now()
     began = time.monotonic()
-    code, error, timed_out = None, None, False
+    code, error, timed_out, cancelled, limited = None, None, False, False, False
+    if max_output_bytes is not None and (type(max_output_bytes) is not int or max_output_bytes < 1024):
+        raise ValueError("Output limit must be at least 1024 bytes")
     argv = list(argv)
     # Windows npm/pnpm/yarn are batch wrappers. Run the CLI's JS entry point
     # directly rather than cmd.exe interpolation of repository-supplied args.
@@ -279,33 +291,73 @@ def execute(argv, cwd, log, timeout=300):
             with tempfile.TemporaryFile(mode="w+b") as spool:
                 proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=spool, stderr=subprocess.STDOUT,
                                         shell=False, start_new_session=os.name != "nt",
-                                        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+                                        env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"})
+                job, settled = None, False
                 try:
-                    proc.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
                     if os.name == "nt":
-                        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
-                    else:
-                        import signal
+                        from .runner import _WindowsJob
+                        job = _WindowsJob(proc)
+                    while proc.poll() is None:
+                        if cancel_requested is not None and cancel_requested():
+                            cancelled = True
+                            break
+                        if max_output_bytes is not None and os.fstat(spool.fileno()).st_size > max_output_bytes:
+                            limited = True
+                            break
+                        remaining = timeout - (time.monotonic() - began)
+                        if remaining <= 0:
+                            timed_out = True
+                            break
                         try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
+                            proc.wait(timeout=min(0.1, remaining))
+                        except subprocess.TimeoutExpired:
                             pass
-                    if proc.poll() is None:
-                        proc.kill()
+                    if cancel_requested is not None and cancel_requested():
+                        cancelled = True
+                    if cancelled:
+                        error = "PROCESS_CANCELLED"
+                    limited = limited or (max_output_bytes is not None and os.fstat(spool.fileno()).st_size > max_output_bytes)
+                    if limited:
+                        error = "PROCESS_OUTPUT_LIMIT"
+                    settled = not (timed_out or cancelled or limited)
+                finally:
+                    # A completed command may deliberately start a persistent
+                    # resource. Cancellation must still own its descendants
+                    # when the command parent has already exited.
+                    if job:
+                        try:
+                            job.close(terminate=not settled)
+                        finally:
+                            if job.handle:
+                                job.close()
+                    if not settled:
+                        if os.name == "nt" and job is None and proc.poll() is None:
+                            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+                        elif os.name != "nt":
+                            import signal
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        if proc.poll() is None:
+                            proc.kill()
                     proc.wait(timeout=30)
                 code = proc.returncode
                 spool.seek(0)
-                output = spool.read().decode("utf-8", "replace")
+                output = spool.read(max_output_bytes if max_output_bytes is not None else -1).decode("utf-8", "replace")
         except OSError as ex:
-            error = redact(ex)
-    output = redact(output)
+            error = redact(ex, sensitive_values)
+    # A capped stream may end midway through a secret, so literal redaction
+    # cannot safely recognize its truncated suffix/prefix.
+    output = "[OUTPUT OMITTED: PROCESS_OUTPUT_LIMIT]\n" if limited else redact(output, sensitive_values)
     Path(log).parent.mkdir(parents=True, exist_ok=True)
     Path(log).write_text(output, encoding="utf-8")
-    return {"argv": [redact(a) for a in argv], "cwd": str(cwd), "started": started, "ended": now(),
+    result = {"argv": [redact(a, sensitive_values) for a in argv], "cwd": str(cwd), "started": started, "ended": now(),
             "duration_seconds": time.monotonic() - began, "exit_code": code, "error": error,
-            "timed_out": timed_out, "log": str(log), "log_sha256": digest(Path(log).read_bytes())}
+            "timed_out": timed_out, "cancelled": cancelled, "log": str(log), "log_sha256": digest(Path(log).read_bytes())}
+    if max_output_bytes is not None:
+        result["output_limited"] = limited
+    return result
 
 
 class Engine:
@@ -468,7 +520,6 @@ class Engine:
             workdir = self.verification_workdir or self.repo
             argv = [*self._codex(), "exec", "--ephemeral", "--sandbox", "read-only", "--cd", str(workdir),
                     "--skip-git-repo-check",
-                    "-c", "mcp_servers.autonomous_se.enabled=false",
                     "--output-schema", str(schema_path), "--output-last-message", str(raw_path), "--json", prompt]
             receipt = execute(argv, workdir, folder / (role + ".session.log"), 1200)
             receipt.update({"role": role, "fingerprint": before["fingerprint"], "contract_sha256": digest(canonical(c)),

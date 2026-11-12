@@ -1,51 +1,80 @@
-"""Generate the small skill routers and native agent definitions."""
-from pathlib import Path
-import json
+"""Generate native role pointers from canonical skills/, without installing.
 
-root = Path(__file__).resolve().parents[1]
-skills = {
- 'project-context-manager': ('Retrieve and save isolated project context and decisions during development or session resumption.', 'Resolve the canonical repository; use `context` before re-scanning known decisions. Save concise decisions, session summaries and unresolved questions with project isolation. Exclude secrets and raw conversations. Use `backup` before maintenance.'),
- 'task-orchestrator': ('Coordinate software implementation tasks with independent acceptance verification, code review, executed tests and evidence-based completion.', 'Read the workflow reference. Inspect the repository and original requirement; establish observable ACs and unresolved assumptions, then create the task contract. Delegate implementation only where tasks are independent. Always delegate independent AC verification and code review, then run real checks and the deterministic gate. P0/P1/P2 require an in-scope fix followed automatically by fresh tests and new independent AC/review; repeat within max_attempts without resetting the budget on resume. Stop on missing infrastructure, an unresolved scope/authorization decision or exhaustion. Never downgrade a finding or reuse pre-fix receipts to get approval. Inspect blocked_reasons separately: any unresolved infrastructure/verification blocker stops automatic mutation even when the overall status is REJECTED. Explicit resume may probe restored checks/verification once before any further repair. Use `run` for bounded CLI orchestration. Missing independent sessions block approval. Finish with a truthful report and dry-run publication unless explicitly authorized.'),
- 'independent-ac-verifier': ('Independently verify a software task against its original acceptance criteria and actual execution evidence.', 'Act separately from the implementer. Read original request, confirmed ACs, raw diff/code and test artifacts. Verify every mandatory criterion with behavior evidence. Return criterion identifier, expected behavior, source evidence, method, status, limitations and missing coverage. Use PASS only with meaningful evidence; unresolved or unexecuted checks remain UNVERIFIED/BLOCKED. Suggest AC-derived tests without copying implementation assumptions. Use `verify` to create runner-captured independent receipts.'),
- 'independent-code-reviewer': ('Review software changes independently for correctness, security, missing requirements and regressions.', 'Inspect actual code and diff independently of implementation conclusions. Return findings with severity, file and line, evidence and fix guidance. Examine edge cases, errors, concurrency, security, compatibility, data integrity and tests. For .NET examine DI lifetimes, CancellationToken propagation, EF queries/transactions, disposal, serialization and event idempotency. P0, P1 and P2 findings block approval; P3 is advisory. Blocking findings require fixes, fresh tests and new independent AC/review sessions; stop at the persisted retry limit.'),
- 'quality-gate': ('Evaluate recorded build, test, independent AC and review evidence before completion or Git publishing.', 'Execute `gate TASK`; rely on its current-source receipts and exit status, not written PASS claims. Require mandatory AC evidence, positive test counts, successful required commands and no P0/P1/P2 findings. P3 remains advisory. Reject stale/tampered artifacts and protected modifications. Generate `report TASK`. Only APPROVED can proceed to configured publication. Hooks are bypassable locally; use protected trusted CI for enforcement.'),
- 'time-reporter': ('Record project activity and draft daily or weekly timesheets with explicit human confirmation.', 'Use isolated SQLite time entries. Classify agent execution separately from human work. Only use measured intervals or explicit user-provided durations and retain confirmation status. Draft daily/weekly summaries with sources; corrections must preserve truthful attribution. Never infer billable hours from agent elapsed time. Send or write an external timesheet only with explicit authorization.'),
- 'communication-assistant': ('Draft project status messages, PR explanations and stakeholder reports from current verification evidence.', 'Read `report TASK` and distinguish implemented, executed, verified, unverified and blocked work. Draft concise audience-appropriate updates including risks and decisions needed. Cite current artifacts and actual PR URLs only. Sending to Slack/Teams/email or publishing requires explicit user authorization; producing the draft is authorized by a drafting request.'),
- 'project-bootstrap': ('Initialize repository-specific verification by discovering its stack, test commands and existing agent conventions.', 'Inspect existing AGENTS.md, package scripts, .NET solutions/projects, CI and architecture docs. Use `init` and review discovered commands; configure tests/build/lint/security/integration checks from actual project conventions. Preserve existing configuration and back up changes. Update project AGENTS with a concise orchestrator pointer. Route framework-specific work using the vendor registry. Absent tests or infrastructure remain BLOCKED.'),
-}
-extensions = {
- 'project-context-manager': ' On task start, resume, switch and significant-stage completion, read references/task-continuity.md. Use restore to reconcile saved observations with current Git and save a revision-checked checkpoint with one exact next action. SQLite remains canonical; exported handoffs are views, not a second mutable task truth. For durable decisions, recurring problems or user corrections, read references/durable-knowledge.md and query the relevant topic before recording a dated source-backed claim.',
- 'task-orchestrator': ' Read references/skill-routing.md to choose one workflow. Restore existing task identity and scope before creating replacements. Record confirmed ACs per child when relevant; distinguish local, committed, published and merged evidence. For document-dependent requirements read references/source-coverage.md and preserve unresolved source gaps. Checkpoint significant stages and before handoff.',
- 'project-bootstrap': ' For a future project, use templates/project-profile.json in the installed runtime as a descriptive starting point; leave repositories and sources empty until the user supplies them. Paths, provider choices and branch conventions come from that project. The template grants no access and registers no MCP roots. Read references/skill-routing.md before combining installed methods.',
- 'communication-assistant': ' Use the current checkpoint and coverage summary when reporting task continuity or document-derived scope. Empty source inventory is unconfigured, never complete analysis. Keep reports separate from task state and authorization.'
-}
-for name, extra in extensions.items():
-    description, body = skills[name]
-    skills[name] = (description, body + extra)
-for name, (description, body) in skills.items():
-    if name == 'task-orchestrator':
-        body = ('Use this engineering workflow only when the target repository explicitly adopts DevelopmentFramework '
-                'in its local AGENTS instructions. The template location or current chat does not opt another project in. '
-                'Apply it to actual software code/config implementation and verification. Domain work such as interpreting '
-                'a financial report or explaining source-data warnings follows the relevant domain skills; it is not '
-                'software debugging merely because a report contains errors. ' + body)
-        body += (' In a chat, execute `start` and `check` in the existing tool sandbox, then use the Autonomous SE MCP '
-                 '`verification_start` tool with the absolute repo and task_id and poll `verification_status` until terminal. '
-                 'This host tool produces separate read-only Codex receipts without starting a new harness inside the tool sandbox. '
-                 'Inspect result.report.quality_gate.status; COMPLETED alone is not approval. Prefer this transport whenever available. '
-                 'If unavailable or the repository is outside its configured roots, keep verification BLOCKED; preserve sandbox restrictions. '
-                 'Do not start nested CLI verification, copy credentials, or relax permissions as a fallback.')
-    if name == 'project-bootstrap':
-        body = ('Activate a target project only after the user explicitly requests adoption. Run the template installer '
-                'with --project <target>; keep skills, native roles and routing project-local. Shared runtime-only or '
-                'verifier-only setup does not adopt projects. Never turn on global engineering routing as a side effect. ' + body)
-    directory = root / 'skills' / name
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / 'SKILL.md').write_text('---\nname: ' + name + '\ndescription: ' + json.dumps(description) + '\n---\n\n' + body + '\n\nRead the detailed workflow at `$CODEX_HOME/autonomous-se/runtime/docs/workflow.md` (default `~/.codex/autonomous-se/runtime/docs/workflow.md`) when executing this role. CLI: `~/.codex/bin/ase.ps1 --repo <path> <command>` on Windows; installed `ase` launcher on Unix. In the source checkout use `python -m ase`.\n', encoding='utf-8')
-for name, skill in [('ase-ac-verifier', 'independent-ac-verifier'), ('ase-code-reviewer', 'independent-code-reviewer'), ('ase-implementer', 'task-orchestrator')]:
-    description, instruction = skills[skill]
-    for reference in ('task-continuity.md', 'skill-routing.md', 'source-coverage.md'):
-        instruction = instruction.replace('references/' + reference, '$CODEX_HOME/autonomous-se/runtime/skills/' + skill + '/references/' + reference)
-    target = root / 'agents' / (name + '.toml')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text('name = ' + json.dumps(name) + '\ndescription = ' + json.dumps(description) + '\ndeveloper_instructions = ' + json.dumps(instruction + ' Preserve the original task scope. Report actual evidence and limitations. Separate read-only CLI sessions supply the verification sandbox; agent definitions inherit permissions.') + '\n', encoding='utf-8')
+Product instructions live in skills/. Use --check to detect stale descriptors;
+target installations are a separate reviewed installer operation.
+"""
+import argparse
+import json
+from pathlib import Path
+import re
+
+ROOT = Path(__file__).resolve().parents[1]
+OWNED_SKILLS = (
+    'task-orchestrator', 'task-intake', 'task-discovery', 'project-context-manager',
+    'project-bootstrap', 'independent-ac-verifier', 'independent-code-reviewer',
+    'quality-gate', 'communication-assistant', 'time-reporter', 'gh-fix-ci',
+)
+ROLES = {'ase-implementer': 'task-orchestrator', 'ase-ac-verifier': 'independent-ac-verifier',
+         'ase-code-reviewer': 'independent-code-reviewer'}
+
+
+def descriptions(root=ROOT):
+    found = {path.parent.name for path in (root / 'skills').glob('*/SKILL.md')}
+    if found != set(OWNED_SKILLS):
+        raise ValueError('Canonical skills must contain exactly the 11 owned entrypoints')
+    result = {}
+    for skill in OWNED_SKILLS:
+        text = (root / 'skills' / skill / 'SKILL.md').read_text(encoding='utf-8')
+        match = re.search(r'^description:\s*(.+)$', text, flags=re.M)
+        if not match:
+            raise ValueError('Missing skill description: ' + skill)
+        raw = match[1].strip()
+        result[skill] = json.loads(raw) if raw.startswith('"') else raw
+    return result
+
+
+def generated_assets(root=ROOT):
+    descriptions_by_skill = descriptions(root)
+    outputs = {}
+    for role, skill in ROLES.items():
+        description = descriptions_by_skill[skill]
+        for target, relative in (('codex', '.agents/skills'), ('claude', '.claude/skills'),
+                                 ('copilot', '.github/skills')):
+            instructions = ('Read ' + relative + '/' + skill + '/SKILL.md in the selected workspace. '
+                            'Preserve the original approved scope and existing permissions. '
+                            'Use the local ase CLI and original evidence; report unavailable capabilities honestly. '
+                            'For useful independent ready work with permitted native subagents, read ' + relative +
+                            '/task-orchestrator/references/parallel-work.md. One lead integrates adaptive waves while preserving '
+                            'root leases, ownership and budgets; serial fallback remains available. '
+                            'Native advisory answers do not replace genuine independent Runner receipts. '
+                            'This descriptor grants no access, approval or independent execution by itself.')
+            if target == 'codex':
+                path = root / 'agents' / (role + '.toml')
+                content = ('name = ' + json.dumps(role) + '\ndescription = ' + json.dumps(description) +
+                           '\ndeveloper_instructions = ' + json.dumps(instructions) + '\n')
+            else:
+                suffix = '.agent.md' if target == 'copilot' else '.md'
+                path = root / 'templates/agents' / target / (role + suffix)
+                content = ('---\nname: ' + role + '\ndescription: ' + json.dumps(description) +
+                           '\n---\n\n' + instructions + '\n')
+            outputs[path] = content.encode('utf-8')
+    return outputs
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='Read-only generated asset consistency check')
+    args = parser.parse_args(argv)
+    changed = []
+    for path, content in generated_assets().items():
+        if not path.is_file() or path.read_bytes() != content:
+            changed.append(str(path.relative_to(ROOT)))
+            if not args.check:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+    print(json.dumps({'changed': changed, 'check': args.check}, indent=2))
+    return 1 if args.check and changed else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

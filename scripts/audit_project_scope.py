@@ -61,6 +61,22 @@ def without_block(text, label):
     return re.sub(pattern, "", text, flags=re.S).strip()
 
 
+def audit_install_manifest(manifest):
+    """Backend-neutral read-only hash audit, explicitly not a routing test."""
+    files = manifest.get("files", manifest.get("owned_files", []))
+    mismatched = []
+    for item in files:
+        path = Path(item["path"])
+        if (not path.is_file() or path.is_symlink() or path.stat().st_nlink > 1
+                or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]):
+            mismatched.append(str(path))
+    checks = {"owned_inventory_present": bool(files), "owned_file_hashes_match": not mismatched,
+              "project_scope_explicit": manifest.get("scope") != "project" or bool(manifest.get("project"))}
+    return {"status": "PASS" if all(checks.values()) else "FAIL", "checks": checks,
+            "mismatched_files": mismatched, "targets": manifest.get("targets", []),
+            "scope": "owned file/hash audit only; no discovery, model routing or live backend guarantee"}
+
+
 def run(home, project, backup, domain_project=None):
     plan = json.loads((backup / "scope-plan.json").read_text(encoding="utf-8"))
     before = read_config(backup / "config.toml")
@@ -158,11 +174,17 @@ def run(home, project, backup, domain_project=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("home", "project", "backup"):
-        parser.add_argument("--" + name, required=True, type=Path)
+        parser.add_argument("--" + name, type=Path)
+    parser.add_argument("--manifest", type=Path, help="Audit a portable installation manifest instead of legacy scope evidence")
     parser.add_argument("--domain-project", type=Path)
     args = parser.parse_args()
     try:
-        result = run(args.home, args.project, args.backup, args.domain_project)
+        if args.manifest:
+            result = audit_install_manifest(json.loads(args.manifest.read_text(encoding="utf-8-sig")))
+        elif all((args.home, args.project, args.backup)):
+            result = run(args.home, args.project, args.backup, args.domain_project)
+        else:
+            parser.error("Supply --manifest or all of --home, --project and --backup")
     except (OSError, ValueError, KeyError, TypeError):
         result = {"status": "FAIL", "error": "Missing or invalid audit inputs; private contents omitted"}
     print(json.dumps(result, indent=2))

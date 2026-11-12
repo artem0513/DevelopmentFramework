@@ -1,6 +1,7 @@
 """Canonical SQLite task handoffs and optional source coverage, never authority."""
 import json
 import re
+from pathlib import Path
 
 from .core import redact
 from .inspection import safe_git, safe_snapshot
@@ -22,6 +23,10 @@ def _strings(value, name):
 
 
 def _observation(repo):
+    if not (Path(repo) / ".git").exists():
+        return {"repository": str(Path(repo).resolve()), "branch": None, "commit": None,
+                "fingerprint": None, "worktree": None, "kind": "filesystem",
+                "limitation": "Root identity only; v2 scoped source observations establish content drift"}
     observed = safe_snapshot(repo)
     # rev-parse prints literal HEAD for an unborn branch even on failure.
     if not re.fullmatch(r"[a-fA-F0-9]{40,64}", observed["commit"] or ""):

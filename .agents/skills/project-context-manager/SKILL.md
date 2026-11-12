@@ -1,8 +1,18 @@
 ---
 name: project-context-manager
-description: "Retrieve and save isolated project context and decisions during development or session resumption."
+description: "Use when local project memory, dated decisions, source freshness, task continuation, checkpoints or session closure need retrieval or persistence."
 ---
 
-Resolve the canonical repository; use `context` before re-scanning known decisions. Save concise decisions, session summaries and unresolved questions with project isolation. Exclude secrets and raw conversations. Use `backup` before maintenance. On task start, resume, switch and significant-stage completion, read references/task-continuity.md. Use restore to reconcile saved observations with current Git and save a revision-checked checkpoint with one exact next action. SQLite remains canonical; exported handoffs are views, not a second mutable task truth. For durable decisions, recurring problems or user corrections, read references/durable-knowledge.md and query the relevant topic before recording a dated source-backed claim.
+# Local project continuity
 
-Read the detailed workflow at `$CODEX_HOME/autonomous-se/runtime/docs/workflow.md` (default `~/.codex/autonomous-se/runtime/docs/workflow.md`) when executing this role. CLI: `~/.codex/bin/ase.ps1 --repo <path> <command>` on Windows; installed `ase` launcher on Unix. In the source checkout use `python -m ase`.
+Resolve the explicit project/workspace identity with `ase`; use the same local SQLite state across Codex, Claude and Copilot on this computer. `--home` takes precedence over `ASE_HOME` and the platform default. Another computer or cloud agent needs an explicit reviewed export; there is no automatic synchronization. Project paths and source locators grant no authority.
+
+Before rescanning, retrieve current context and relevant knowledge topics. Preserve provenance, version/freshness observations, supersession and uncertainty. Refresh changed dependencies and affected dependents rather than every project record. Git commit alone does not describe dirty files or a non-Git workspace.
+
+On start/resume/switch, use `ase --project PROJECT restore TASK`, reconcile current observations and preserve newer/staged user work. Reuse the task identity and root budgets. Use revision-checked checkpoints with one exact next action; on stale CAS reload, merge facts and retry. A handoff export is a view, not a second mutable truth.
+
+At stage boundaries, stop and session end, read [task continuity](references/task-continuity.md) and task-orchestrator's [finish and reports](../task-orchestrator/references/finish-and-reports.md). Save a dated closure for completed, awaiting-approval, blocked, paused, cancelled and interrupted sessions. Closing a session does not mark the task completed.
+
+Store concise evidence references, decisions and blockers; exclude credentials, raw conversations, full transcripts and recordings. For durable claims or recurring corrections read [durable knowledge](references/durable-knowledge.md). Use `ase backup` before maintenance. Missing facts remain unknown.
+
+Credential values live only in the separate encrypted local vault. Persist references, exact target, captured revision and safe auth status, never import-file contents, headers, tokens or session responses. Project export does not carry the vault. Rotation/configuration changes require fresh affected checks and observations; keep historical facts labeled historical and never replay completed mutations to refresh credentials.

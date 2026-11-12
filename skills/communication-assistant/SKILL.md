@@ -1,8 +1,14 @@
 ---
 name: communication-assistant
-description: "Draft project status messages, PR explanations and stakeholder reports from current verification evidence."
+description: "Use when a managed task needs a concise proposal, final status, meeting summary, PR explanation or stakeholder draft based on current evidence."
 ---
 
-Read `report TASK` and distinguish implemented, executed, verified, unverified and blocked work. Draft concise audience-appropriate updates including risks and decisions needed. Cite current artifacts and actual PR URLs only. Sending to Slack/Teams/email or publishing requires explicit user authorization; producing the draft is authorized by a drafting request. Use the current checkpoint and coverage summary when reporting task continuity or document-derived scope. Empty source inventory is unconfigured, never complete analysis. Keep reports separate from task state and authorization.
+# Concise task communication
 
-Read the detailed workflow at `$CODEX_HOME/autonomous-se/runtime/docs/workflow.md` (default `~/.codex/autonomous-se/runtime/docs/workflow.md`) when executing this role. CLI: `~/.codex/bin/ase.ps1 --repo <path> <command>` on Windows; installed `ase` launcher on Unix. In the source checkout use `python -m ase`.
+Before execution, prepare a roughly 5–8-line proposal: expected result; recommended business approach and reason; technical means and reuse; 2–4 main steps; verification; material assumptions/limits. Keep the detailed contract separately inspectable. Reuse existing approval for the same scope. Ask only a genuine material blocker after recommending an interpretation and explaining its reason and consequences; use task-orchestrator's [questions and approval](../task-orchestrator/references/questions-and-approval.md).
+
+For status read `ase --project PROJECT report TASK`, the current checkpoint and source coverage. Distinguish implemented, executed, independently verified, unavailable, blocked and actually published results. Cite existing artifacts and actual URLs. Empty source inventory is unconfigured, not completed analysis.
+
+For dated activity use `ase worklog` and `ase meeting-report` with explicit date bounds and timezone. Draft results, decisions, blockers and next actions; label current versus historical/as-of blockers. Read [finish and reports](../task-orchestrator/references/finish-and-reports.md) before session closure or requested stop. Summaries do not alter task approval or evidence.
+
+Drafting is authorized by a drafting request. Sending to email/chat or publishing needs explicit authorization for the destination. Never infer billable hours from agent activity.

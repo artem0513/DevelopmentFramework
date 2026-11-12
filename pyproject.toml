@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autonomous-se"
 version = "0.1.0"
-description = "Evidence-driven Codex workflow and isolated SQLite project memory"
+description = "Supervised project workflows, executed evidence and isolated SQLite memory"
 requires-python = ">=3.11"
 dependencies = []
 
@@ -13,4 +13,7 @@ dependencies = []
 ase = "ase.__main__:main"
 
 [tool.setuptools]
-packages = ["ase"]
+packages = ["ase", "ase.adapters"]
+
+[tool.setuptools.package-data]
+ase = ["data/timezones/*", "data/timezones/**/*"]

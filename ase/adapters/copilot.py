@@ -1,0 +1,35 @@
+"""Experimental parser only: live prompt JSONL/clean-start not verified here."""
+from . import probe_cli, invocation
+from ..protocol import decode_json, normalized, packet_prompt
+
+
+class CopilotAdapter:
+    name = "copilot"
+
+    def probe(self, config):
+        caps = probe_cli(self.name, config, ["--output-format", "--no-custom-instructions", "--disable-builtin-mcps", "--no-auto-update"])
+        if not caps["protocol_only"]:
+            caps.update(available=False, blocker="COPILOT_CLEAN_START_UNVERIFIED", clean_start=False)
+        caps["live_format_verified"] = False
+        return caps
+
+    def build_invocation(self, request, capabilities):
+        return invocation(capabilities, ["--output-format", "json", "--no-custom-instructions", "--disable-builtin-mcps",
+            "--no-auto-update", "--no-ask-user", "--no-experimental", "--no-bash-env", "--deny-tool",
+            "shell,write,read,url,memory", "-p", packet_prompt(request)])
+
+    def parse_result(self, raw_events, final_payload):
+        # Deliberately do not accept SDK session.idle or intermediate assistant text.
+        if not raw_events or raw_events[-1].get("type") != "result":
+            return normalized(blocker="TERMINAL_RESULT_MISSING")
+        terminal = raw_events[-1]
+        session_id = terminal.get("session_id")
+        if len([e for e in raw_events if e.get("type") == "result"]) != 1 or not isinstance(session_id, str) or not session_id:
+            return normalized(blocker="SESSION_PROTOCOL_INVALID", terminal=terminal)
+        if terminal.get("subtype") != "success" or terminal.get("is_error") is not False:
+            return normalized(blocker="BACKEND_ERROR", session_id=session_id, terminal=terminal)
+        try:
+            payload = decode_json(terminal["result"])
+        except (ValueError, TypeError, KeyError):
+            return normalized(blocker="STRUCTURED_OUTPUT_INVALID", session_id=session_id, terminal=terminal)
+        return normalized(payload, session_id=session_id, terminal=terminal)

@@ -196,7 +196,7 @@ class ContinuityTests(unittest.TestCase):
             db.execute("PRAGMA user_version=2")
         self.store = Store(self.repo, self.base / "state")
         self.addCleanup(self.store.close)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertEqual(self.store.task("one")["request"], "request")
         backups = list((self.store.root / "backups").glob("*.sqlite3"))
         self.assertEqual(len(backups), 1)

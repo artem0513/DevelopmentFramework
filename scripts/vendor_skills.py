@@ -3,11 +3,14 @@ import argparse
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 import urllib.request
 import datetime
 import shutil
+import hashlib
+import io
+import stat
+import zipfile
+from pathlib import PurePosixPath
 
 try:
     from .install import project_target, project_skill_config, file_target, directory_target
@@ -22,6 +25,57 @@ REGISTRY = {
  'azure-functions': ('MicrosoftDocs/Agent-Skills', ['skills/azure-functions']),
 }
 
+
+def package_files(content, paths):
+    """Read pinned ZIP bytes in memory; never extract links or execute scripts."""
+    files = {}
+    total = 0
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as error:
+        raise ValueError('Pinned vendor package is not a valid ZIP archive') from error
+    with archive:
+        roots = set()
+        for entry in archive.infolist():
+            name = entry.filename
+            path = PurePosixPath(name)
+            if (path.is_absolute() or '\\' in name or '\x00' in name
+                    or path.as_posix() != name.rstrip('/')
+                    or any(part in ('..', '.') or ':' in part for part in path.parts)):
+                raise ValueError('Vendor archive contains an unsafe path')
+            if not path.parts:
+                raise ValueError('Vendor archive contains an empty path')
+            roots.add(path.parts[0])
+            mode = entry.external_attr >> 16
+            if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
+                raise ValueError('Vendor archive contains a link or special file')
+            total += entry.file_size
+            if total > 100 * 1024 * 1024:
+                raise ValueError('Vendor package exceeds the unpacked size limit')
+            relative = PurePosixPath(*path.parts[1:])
+            for source in paths:
+                prefix = PurePosixPath(source)
+                if relative.is_relative_to(prefix) and not entry.is_dir():
+                    tail = relative.relative_to(prefix)
+                    target = str(PurePosixPath(prefix.name) / tail)
+                    if any(os.path.normcase(target) == os.path.normcase(prior) for prior in files):
+                        raise ValueError('Vendor archive has duplicate destination files')
+                    files[target] = archive.read(entry)
+        if len(roots) != 1:
+            raise ValueError('Vendor archive must have one package root')
+    for source in paths:
+        entrypoint = PurePosixPath(source).name + '/SKILL.md'
+        if entrypoint not in files:
+            raise ValueError('Pinned vendor package is missing ' + entrypoint)
+        text = files[entrypoint].decode('utf-8')
+        if not text.startswith('---') or '\nname:' not in text:
+            raise ValueError('Pinned package contains an invalid skill entrypoint')
+    owned = {os.path.normcase(str(Path(name))) for name in files}
+    for name in files:
+        if any(os.path.normcase(str(parent)) in owned for parent in Path(name).parents):
+            raise ValueError('Vendor archive file is also a destination directory')
+    return files
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--stack', choices=REGISTRY, required=True)
@@ -29,12 +83,14 @@ def main(argv=None):
     destination.add_argument('--dest', type=Path, help='Explicit skill destination')
     destination.add_argument('--project', type=Path, help='Activate vendor skills in one existing project')
     destination.add_argument('--global', dest='global_install', action='store_true', help='Explicit global vendor installation')
-    p.add_argument('--ref', help='Reviewed immutable commit; otherwise resolve current default branch')
+    p.add_argument('--ref', help='Reviewed immutable commit; required for installation')
     p.add_argument('--inspect', action='store_true', help='Print resolved source and SKILL.md without installation')
-    p.add_argument('--method', choices=['auto', 'download', 'git'], default='auto', help='Use git sparse checkout for Windows long-path ZIP failures')
+    p.add_argument('--method', choices=['auto', 'download'], default='auto', help='Compatibility option; pinned packages use the stdlib ZIP copier')
     a = p.parse_args(argv)
     if not a.inspect and not (a.dest or a.project or a.global_install):
         p.error('Select --dest, --project or --global; inspection alone needs no destination')
+    if not a.inspect and not a.ref:
+        p.error('Installation requires --ref with a reviewed full commit SHA')
     repo, paths = REGISTRY[a.stack]
     project = None
     config_write = None
@@ -50,6 +106,7 @@ def main(argv=None):
     elif a.global_install:
         a.dest = Path.home() / '.agents/skills'
     if a.dest is not None:
+        a.dest = a.dest.expanduser().resolve()
         directory_target(a.dest)
         for path in paths:
             file_target(a.dest / Path(path).name / 'SKILL.md')
@@ -57,38 +114,51 @@ def main(argv=None):
     def fetch(url):
         req = urllib.request.Request(url, headers={'User-Agent': 'autonomous-se/0.1'})
         with urllib.request.urlopen(req, timeout=60) as response:
-            return response.read()
+            data = response.read(100 * 1024 * 1024 + 1)
+            if len(data) > 100 * 1024 * 1024:
+                raise ValueError('Vendor download exceeds the package size limit')
+            return data
     ref = a.ref or json.loads(fetch(f'https://api.github.com/repos/{repo}/commits/HEAD'))['sha']
     if len(ref) != 40 or any(c not in '0123456789abcdef' for c in ref.lower()):
         raise SystemExit('--ref must be an immutable full commit SHA')
-    for path in paths:
-        content = fetch(f'https://raw.githubusercontent.com/{repo}/{ref}/{path}/SKILL.md').decode()
-        print(json.dumps({'repo': repo, 'ref': ref, 'path': path}))
-        if a.inspect:
+    if a.inspect:
+        for path in paths:
+            content = fetch(f'https://raw.githubusercontent.com/{repo}/{ref}/{path}/SKILL.md').decode('utf-8')
+            print(json.dumps({'repo': repo, 'ref': ref, 'path': path}))
             print(content)
-    if not a.inspect:
-        codex_home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex'))
-        installer = codex_home / 'skills/.system/skill-installer/scripts/install-skill-from-github.py'
-        result = subprocess.run([sys.executable, str(installer), '--repo', repo, '--ref', ref, '--dest', str(a.dest), '--method', a.method, '--path', *paths], check=False)
-        if result.returncode:
-            raise SystemExit(result.returncode)
-        a.dest.mkdir(parents=True, exist_ok=True)
-        lock = a.dest / ('ase-vendor-' + a.stack + '.json')
-        if project:
-            project_target(project, lock)
-        file_target(lock)
-        lock.write_text(json.dumps({'repo': repo, 'commit': ref, 'paths': paths}, indent=2), encoding='utf-8')
-        if config_write:
-            config, data = config_write
-            project_target(project, config)
-            file_target(config)
-            if config.exists() and config.read_bytes() != data:
-                stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-                backup = file_target(project_target(project, project / '.codex/autonomous-se-backups' / stamp / 'config.toml'))
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(config, backup)
-            config.parent.mkdir(parents=True, exist_ok=True)
-            config.write_bytes(data)
+        return
+    content = fetch(f'https://codeload.github.com/{repo}/zip/{ref}')
+    files = package_files(content, paths)
+    lock = {'repo': repo, 'commit': ref, 'paths': paths,
+            'archive_sha256': hashlib.sha256(content).hexdigest(),
+            'files': {name: hashlib.sha256(data).hexdigest() for name, data in sorted(files.items())}}
+    writes = [(a.dest / name, data) for name, data in sorted(files.items())]
+    writes.append((a.dest / ('ase-vendor-' + a.stack + '.json'), json.dumps(lock, indent=2).encode('utf-8')))
+    if config_write:
+        writes.append(config_write)
+    scope = project or a.dest
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    backup_root = (project / '.codex/autonomous-se-backups' if project else a.dest / '.ase-vendor-backups') / stamp
+    changes = []
+    # The entire downloaded tree and every backup path are checked before the
+    # first mutation; discovering a late conflict cannot leave half a package.
+    for index, (target, data) in enumerate(writes):
+        file_target(project_target(scope, target))
+        if not target.exists() or target.read_bytes() != data:
+            backup = backup_root / str(index) / target.name if target.exists() else None
+            if backup:
+                file_target(project_target(scope, backup))
+            changes.append((target, data, backup))
+    for target, data, backup in changes:
+        file_target(project_target(scope, target))
+        if backup:
+            file_target(project_target(scope, backup))
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    print(json.dumps({'repo': repo, 'commit': ref, 'destination': str(a.dest),
+                      'changed': [str(target) for target, _, _ in changes]}, indent=2))
 
 
 if __name__ == '__main__':

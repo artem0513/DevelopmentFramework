@@ -1,8 +1,8 @@
-"""Read-only Git inspection for the unsandboxed verification coordinator.
+"""Read-only Git inspection for local CLI workflow services.
 
 Git's apparently read-only commands can invoke repository-configured fsmonitor,
 clean filters and diff helpers. This adapter disables those execution paths and
-accepts only the inspection forms actually used by the coordinator. Publishing
+accepts only the inspection forms used by the local runtime. Publishing
 continues to use the ordinary CLI inside its existing authorization boundary.
 """
 from datetime import datetime, timezone
@@ -33,7 +33,16 @@ def _trusted_git():
     raise ValueError("Trusted Git executable unavailable in absolute host PATH")
 
 
-TRUSTED_GIT = _trusted_git()
+try:
+    TRUSTED_GIT = _trusted_git()
+except ValueError:
+    # Generic project memory, documents and reporting do not require Git.
+    # Resolve/raise only when an actual software inspection requests it.
+    TRUSTED_GIT = None
+
+
+def trusted_git():
+    return TRUSTED_GIT or _trusted_git()
 
 
 def _environment():
@@ -45,7 +54,7 @@ def _environment():
 
 
 def _base(repo):
-    return [TRUSTED_GIT, "--no-pager", "--no-optional-locks", "-C", str(repo),
+    return [trusted_git(), "--no-pager", "--no-optional-locks", "-C", str(repo),
             # Trust only the already selected canonical checkout for this invocation.
             # Windows tool sandboxes run as a different user; helpers remain disabled.
             "-c", "safe.directory=" + str(repo), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
