@@ -1,5 +1,7 @@
 # Local credentials and approved access
 
+In [project-local mode](project-local.md), use that project's local launcher without `--home` to select its own encrypted vault under ignored `.devframework/local/credentials`. Each project is separate; Codex/Claude/Copilot within it share profiles. The existing explicit external-home commands below still select independent shared state. Import files must still be outside workspaces/Git; only the validated protected local state vault is admitted inside a source root.
+
 Codex, Claude, and Copilot use the same `ase` CLI and the same local state home. On Windows, explicitly imported profiles are encrypted with Windows DPAPI for the current user. This protects persisted bytes under the Windows account; it does not isolate secrets from other code running as that user. Other operating systems fail closed instead of writing a plaintext vault. The framework does not copy existing provider credentials.
 
 Create a private JSON import file **outside the current workspace and any Git working tree**. Use `templates/credentials.example.json` as a shape reference; put actual values only in the private file. The import leaves that file unchanged, so handle it as sensitive afterward. Use a unique profile ID and the exact HTTPS origin, without userinfo, a path, query, or fragment. HTTP is allowed only for loopback services. `http-basic` requires `username` and `password`, `http-bearer` requires `token`, and `environment` supports child environment variables. The `env` object maps environment variable names to keys in `secrets`.

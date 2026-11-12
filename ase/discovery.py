@@ -122,6 +122,9 @@ def validate_intake(payload):
 
 
 def _scope_path(value):
+    from .project_local import is_private_path
+    if is_private_path(value):
+        raise ValueError("Private project-local state is not a discovery source")
     _text(value, "scope path", 2048)
     path = value.replace("\\", "/")
     if Path(path).is_absolute() or PureWindowsPath(path).is_absolute() or PureWindowsPath(path).drive:
@@ -222,12 +225,24 @@ def discover_capabilities(project, *, scope, backend_config):
     queue = []
 
     def add(path, reason=None, origin=None):
+        from .project_local import is_private_path
         candidate = root / path
         try:
             resolved = candidate.resolve()
         except (OSError, RuntimeError):
             limitations.append("Unknown dependency path: " + str(path))
             return
+        if candidate.is_file() and candidate.stat().st_nlink > 1:
+            if reason:
+                limitations.append("Hardlinked dependency excluded: " + str(path))
+                return
+            raise ValueError("Hardlinked files are not discovery sources")
+        if (is_private_path(candidate.relative_to(root))
+                or (resolved.is_relative_to(root) and is_private_path(resolved.relative_to(root)))):
+            if reason:
+                limitations.append("Private dependency excluded: " + str(path))
+                return
+            raise ValueError("Private project-local state is not a discovery source")
         if (not resolved.is_relative_to(root)
                 or any(part.lower() == ".git" for part in candidate.relative_to(root).parts)
                 or any(part.lower() == ".git" for part in resolved.relative_to(root).parts)):

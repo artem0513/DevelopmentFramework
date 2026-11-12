@@ -128,10 +128,11 @@ def source_resources(store, contract, task_id=None):
 
 def _directory_sources(root, directory):
     """Bound generic directory inventory without traversing private Git data."""
+    from .project_local import is_private_path
     pending, count = [directory], 0
     while pending:
         for candidate in pending.pop().iterdir():
-            if candidate.name.lower() == ".git":
+            if candidate.name.lower() == ".git" or is_private_path(candidate.relative_to(root)):
                 continue
             count += 1
             if count > 1000:
@@ -144,10 +145,13 @@ def _directory_sources(root, directory):
             if candidate.is_dir():
                 pending.append(candidate)
             elif candidate.is_file():
+                if candidate.stat().st_nlink > 1:
+                    raise ValueError("Hardlinked files are not source inputs")
                 yield candidate
 
 
 def source_snapshot(store, contract, task_id=None):
+    from .project_local import is_private_path
     base = None
     if has_software(contract):
         from .inspection import safe_snapshot
@@ -157,6 +161,8 @@ def source_snapshot(store, contract, task_id=None):
     resources = source_resources(store, contract, task_id)
     dependencies = {}
     for resource in resources:
+        if is_private_path(resource):
+            raise ValueError("Private project-local state is not project source")
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", resource):
             missing.append(resource)
             continue
@@ -171,6 +177,10 @@ def source_snapshot(store, contract, task_id=None):
             # External resource identifiers are handled by actual probe evidence.
             missing.append(resource)
             continue
+        if is_private_path(path.relative_to(root)):
+            raise ValueError("Private project-local state is not project source")
+        if path.is_file() and path.stat().st_nlink > 1:
+            raise ValueError("Hardlinked files are not source inputs")
         if any(part.lower() == ".git" for part in path.relative_to(root).parts):
             raise ValueError("Private Git data is not project source")
         if path.is_dir():

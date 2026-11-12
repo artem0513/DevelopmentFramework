@@ -8,7 +8,9 @@ from pathlib import Path
 import shutil
 import time
 import threading
+import tempfile
 import uuid
+import weakref
 
 from .adapters import get_adapter
 from .gates import GateService, source_resources, source_snapshot, stage_checks
@@ -71,9 +73,12 @@ def _exclusive(path):
 
 
 def _target(root, value):
+    from .project_local import is_private_path
     if not isinstance(value, str) or not value or Path(value).is_absolute() or ".." in Path(value).parts:
         raise ValueError("Path escapes approved scope")
     candidate = root / value
+    if is_private_path(value) or (candidate.resolve().is_relative_to(root) and is_private_path(candidate.resolve().relative_to(root))):
+        raise ValueError("Private project-local state is outside source edit/packet scope")
     if (candidate.is_symlink() or not candidate.resolve().is_relative_to(root)
             or any(part.lower() == ".git" for part in candidate.resolve().relative_to(root).parts)):
         raise ValueError("Path escapes approved scope")
@@ -612,9 +617,21 @@ class WorkflowController:
         executable = config.get("executable") or shutil.which({"codex": "codex", "claude": "claude", "copilot": "copilot"}[backend])
         if not executable:
             raise ValueError("CLI_NOT_INSTALLED: " + backend)
-        trusted = self.store.state_home / "runner"
-        trusted.mkdir(parents=True, exist_ok=True)
-        return Runner({**config, "executable": str(Path(executable).resolve()), "trusted_cwd": str(trusted)}, self.store.root / "tasks" / task_id / "sessions")
+        from .project_local import validate_local_state
+        temporary = None
+        if validate_local_state(self.store.state_home, self.store.repo):
+            temporary = tempfile.TemporaryDirectory(prefix="ase-local-runner-")
+            trusted = Path(temporary.name)
+        else:
+            trusted = self.store.state_home / "runner"
+            trusted.mkdir(parents=True, exist_ok=True)
+        runner = Runner({**config, "executable": str(Path(executable).resolve()), "trusted_cwd": str(trusted)}, self.store.root / "tasks" / task_id / "sessions")
+        # Keep the clean empty cwd alive for the Runner's whole operation; only
+        # subprocess captures/receipts persist, under the project's private state.
+        runner._temporary_cwd = temporary
+        if temporary is not None:
+            weakref.finalize(runner, temporary.cleanup)
+        return runner
 
     def verify(self, task_id, stage_id=None):
         with self._ownership(task_id):

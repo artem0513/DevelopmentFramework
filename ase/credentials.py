@@ -209,7 +209,13 @@ class CredentialVault:
         if os.name != 'nt':
             raise CredentialError('unsupported_platform')
         self.home = _safe_path(home)
-        _outside_git(self.home)
+        from .project_local import validate_local_state
+        try:
+            local = validate_local_state(self.home)
+        except ValueError:
+            raise CredentialError('unsafe_path') from None
+        if not local:
+            _outside_git(self.home)
         self.directory = self.home / 'credentials'
         self.path = self.directory / 'vault.json'
         self.lock_path = self.directory / 'vault.lock'

@@ -16,6 +16,10 @@ import hashlib
 import copy
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from ase.project_local import config_bytes, is_private_path
+
 BEGIN = "<!-- autonomous-se managed begin -->"
 END = "<!-- autonomous-se managed end -->"
 SKILLS_BEGIN = "# autonomous-se project skill selection begin"
@@ -39,7 +43,9 @@ def _is_link(path):
     try:
         # Path.is_junction is unavailable on supported Python 3.11. Windows
         # lstat has exposed the reparse tag since Python 3.8.
-        return getattr(path.lstat(), 'st_reparse_tag', None) == getattr(stat, 'IO_REPARSE_TAG_MOUNT_POINT', object())
+        info = path.lstat()
+        return bool(getattr(info, 'st_file_attributes', 0) & 0x400) or (
+            getattr(info, 'st_reparse_tag', None) == getattr(stat, 'IO_REPARSE_TAG_MOUNT_POINT', object()))
     except (FileNotFoundError, NotADirectoryError):
         return False
 
@@ -304,13 +310,17 @@ def _payload(target, data, *, scope, backup_root, index):
             'changed': changed, 'backup': str(backup) if backup else None}
 
 
-def _routing(skill_root):
+def _routing(skill_root, project_local=False):
     return (BEGIN + '\nThis workspace explicitly adopts DevelopmentFramework for managed tasks. '
             'Use ' + skill_root + '/task-orchestrator/SKILL.md and the appropriate domain skills. '
             'Choose software only for actual code or configuration implementation; documents, financial analysis, '
             'research and infrastructure use their own acceptance profiles. Preserve project rules and user authorization. '
             'Restore local context, propose the outcome concisely, and reuse existing scope approval. '
-            'Independent acceptance and review plus the evidence gate are required for verified completion.\n' + END)
+            'Independent acceptance and review plus the evidence gate are required for verified completion.'
+            + (' Use this project\'s .devframework/bin/ase.ps1 (PowerShell) or .devframework/bin/ase (shell) '
+               'for framework commands; .devframework/config.toml selects project-local configuration and '
+               '.devframework/local holds private state. Do not substitute a shared/global runtime or state home.'
+               if project_local else '') + '\n' + END)
 
 
 def _launcher_bytes(runtime):
@@ -329,35 +339,156 @@ def _launcher_bytes(runtime):
     return powershell.encode('utf-8'), shell.encode('utf-8')
 
 
-def plan_install(targets: list[str], project, *, runtime_home: Path) -> dict:
+def _local_launcher_bytes():
+    """Use launcher-relative locations; restore PowerShell's process environment."""
+    py = str(Path(sys.executable)).replace("'", "''")
+    powershell = (
+        "$aseRuntime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../autonomous-se/runtime'))\n"
+        "$aseProject = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))\n"
+        "if (-not (Test-Path -LiteralPath (Join-Path $aseProject '.devframework/config.toml') -PathType Leaf)) {\n"
+        "  throw 'Project-local installation requires its config.toml'\n}\n"
+        "$asePython = $null\n"
+        f"foreach ($aseCandidate in @('{py}', 'python3', 'python')) {{\n"
+        "  $aseCommand = Get-Command $aseCandidate -ErrorAction SilentlyContinue\n"
+        "  if ($aseCommand) {\n"
+        "    & $aseCommand.Source -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>$null\n"
+        "    if ($LASTEXITCODE -eq 0) { $asePython = $aseCommand.Source; break }\n"
+        "  }\n}\n"
+        "if (-not $asePython) { throw 'Python 3.11+ is required' }\n"
+        "$aseForward = @()\n"
+        "for ($aseIndex = 0; $aseIndex -lt $args.Count; $aseIndex++) {\n"
+        "  $aseArg = [string]$args[$aseIndex]\n"
+        "  if ($aseArg -match '^--home=[A-Za-z]$' -and $aseIndex + 1 -lt $args.Count -and (([string]$args[$aseIndex + 1]).StartsWith('\\') -or ([string]$args[$aseIndex + 1]).StartsWith('/'))) {\n"
+        "    $aseIndex++; $aseArg = $aseArg + ':' + [string]$args[$aseIndex]\n"
+        "  }\n  $aseForward += $aseArg\n}\n"
+        "if (-not ($aseForward | Where-Object { $_ -match '^--repo(=|$)' })) {\n"
+        "  $aseForward = @('--repo', $aseProject) + $aseForward\n}\n"
+        "$aseHadPythonPath = Test-Path Env:PYTHONPATH\n"
+        "$aseOldPythonPath = $env:PYTHONPATH\n"
+        "try {\n"
+        "  $env:PYTHONPATH = $aseRuntime + [IO.Path]::PathSeparator + $aseOldPythonPath\n"
+        "  & $asePython -P -m ase @aseForward\n"
+        "  $aseExitCode = $LASTEXITCODE\n"
+        "} finally {\n"
+        "  if ($aseHadPythonPath) { $env:PYTHONPATH = $aseOldPythonPath } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }\n"
+        "}\nexit $aseExitCode\n")
+    shell = (
+        '#!/bin/sh\n'
+        'ase_bin=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1\n'
+        'ase_runtime="$ase_bin/../autonomous-se/runtime"\n'
+        'ase_project=$(CDPATH= cd -- "$ase_bin/../.." && pwd -P) || exit 1\n'
+        '[ -f "$ase_project/.devframework/config.toml" ] || { echo "Project-local installation requires its config.toml" >&2; exit 1; }\n'
+        'ase_python=\n'
+        'for ase_candidate in ' + shlex.quote(sys.executable) + ' python3 python; do\n'
+        '  if command -v "$ase_candidate" >/dev/null 2>&1 && "$ase_candidate" -c \'import sys; sys.exit(sys.version_info < (3, 11))\' 2>/dev/null; then\n'
+        '    ase_python=$ase_candidate; break\n  fi\ndone\n'
+        '[ -n "$ase_python" ] || { echo "Python 3.11+ is required" >&2; exit 1; }\n'
+        'ase_selected=\n'
+        'for ase_arg do\n  case "$ase_arg" in --repo|--repo=*) ase_selected=1;; esac\ndone\n'
+        '[ -n "$ase_selected" ] || set -- --repo "$ase_project" "$@"\n'
+        'PYTHONPATH="$ase_runtime${PYTHONPATH:+:$PYTHONPATH}" exec "$ase_python" -P -m ase "$@"\n')
+    return powershell.encode('utf-8'), shell.encode('utf-8')
+
+
+def _local_config_bytes(path, targets, timezone):
+    if not path.exists():
+        return config_bytes(targets, timezone='UTC' if timezone is None else timezone)
+    data = path.read_bytes()
+    existing = data.decode('utf-8')
+    try:
+        parsed = tomllib.loads(existing)
+        if set(parsed) != {'schema_version', 'mode', 'targets', 'timezone', 'log_retention_days'}:
+            raise ValueError('Project-local config has missing or unknown fields')
+        if type(parsed['schema_version']) is not int or parsed['schema_version'] != 1 or parsed['mode'] != 'project-local':
+            raise ValueError('Unsupported project-local config schema or mode')
+        config_bytes(parsed['targets'], timezone=parsed['timezone'], log_retention_days=parsed['log_retention_days'])
+        updated_targets = list(dict.fromkeys(parsed['targets'] + targets))
+        desired = {'targets': updated_targets, 'timezone': parsed['timezone'] if timezone is None else timezone}
+        config_bytes(updated_targets, timezone=desired['timezone'], log_retention_days=parsed['log_retention_days'])
+        # Strict root fields permit changing only the chosen value spans while
+        # preserving comments, whitespace, retention and the user's timezone.
+        tokens = _toml_tokens(existing)
+        replacements, index = [], 0
+        while index < len(tokens):
+            if tokens[index][0] == '\n':
+                index += 1
+                continue
+            equal = index
+            while tokens[equal][0] != '=':
+                equal += 1
+            key = _toml_key(existing[tokens[index][1]:tokens[equal][1]].strip())
+            stop = _toml_value_end(tokens, equal + 1)
+            if len(key) == 1 and key[0] in desired and parsed[key[0]] != desired[key[0]]:
+                replacements.append((tokens[equal + 1][1], tokens[stop - 1][2], json.dumps(desired[key[0]], ensure_ascii=False)))
+            index = stop
+        for start, end, value in reversed(replacements):
+            existing = existing[:start] + value + existing[end:]
+        tomllib.loads(existing)
+        return existing.encode('utf-8') if replacements else data
+    except (tomllib.TOMLDecodeError, TypeError, KeyError, UnicodeError) as ex:
+        raise ValueError('Invalid project-local config: ' + str(ex)) from ex
+
+
+def _check_tracked_private(project):
+    if any((parent / '.git').exists() for parent in [project, *project.parents]):
+        from ase.inspection import _run
+        tracked = _run(project, ['ls-files', '--cached', '-z']).decode('utf-8', 'strict').split('\0')
+        if any(is_private_path(path) for path in tracked if path):
+            raise ValueError('Private project-local state must not be tracked by Git')
+
+
+def _package_file(source):
+    relative = source.relative_to(ROOT)
+    selected = (source.is_file() and source.suffix != '.pyc'
+                and '__pycache__' not in relative.parts and not is_private_path(relative))
+    if selected:
+        if source.stat().st_nlink > 1:
+            raise ValueError('Canonical package contains hardlinked source files: ' + str(source))
+        if _is_link(source) or any(_is_link(p) for p in source.parents if p.is_relative_to(ROOT)):
+            raise ValueError('Canonical package contains linked source files: ' + str(source))
+    return selected
+
+
+def plan_install(targets: list[str], project, *, runtime_home: Path = None, project_local=False, timezone=None) -> dict:
     """Build a complete read-only preview for explicit portable backend targets.
 
     ``project`` accepts a registered ProjectContext, an explicit existing path,
     or None for runtime-only preparation. Registration itself is not performed.
     """
-    return _plan_install(targets, project, runtime_home=runtime_home)
+    return _plan_install(targets, project, runtime_home=runtime_home, project_local=project_local, timezone=timezone)
 
 
-def _plan_install(targets, project, *, runtime_home, legacy_global=False, skill_home=None):
+def _plan_install(targets, project, *, runtime_home=None, legacy_global=False, skill_home=None,
+                  project_local=False, timezone=None):
     if not targets or any(target not in TARGETS for target in targets):
         raise ValueError('Select one or more explicit targets: codex, claude, copilot')
     targets = list(dict.fromkeys(targets))
-    home = Path(runtime_home).expanduser().absolute()
-    # Explicit root aliases are canonicalized; aliases beneath them are rejected.
-    home = home.resolve()
-    directory_target(home)
     context = project if project is not None and hasattr(project, 'project_id') and hasattr(project, 'root') else None
     if project is not None:
         project = Path(context.root if context else project).expanduser().resolve(strict=True)
         if not project.is_dir() or any(c in str(project) for c in '\r\n\0'):
             raise ValueError('Supply an existing project directory')
-    if project is not None and (home == project or home.is_relative_to(project)):
+    if project_local:
+        if project is None or legacy_global or skill_home is not None:
+            raise ValueError('Project-local installation requires one selected project and project destinations')
+        home = project / '.devframework'
+        if runtime_home is not None and Path(runtime_home).expanduser().absolute() != home:
+            raise ValueError('Project-local tooling home must be exactly project/.devframework')
+        directory_target(project_target(project, home))
+        directory_target(project_target(project, home / 'local/backups'))
+        _check_tracked_private(project)
+    else:
+        if runtime_home is None:
+            raise ValueError('Select an explicit shared tooling home')
+        home = Path(runtime_home).expanduser().resolve()
+        directory_target(home)
+    if not project_local and project is not None and (home == project or home.is_relative_to(project)):
         raise ValueError('Shared tooling home must be outside the selected project')
     if legacy_global and (project is not None or targets != ['codex']):
         raise ValueError('Legacy global activation is an explicit Codex-only mode')
     runtime = home / 'autonomous-se/runtime'
     stamp = _stamp()
-    backup_root = home / 'backups/autonomous-se' / stamp
+    backup_root = home / ('local/backups/autonomous-se' if project_local else 'backups/autonomous-se') / stamp
     planned, seen = [], set()
 
     def add(target, data, scope=home):
@@ -369,11 +500,19 @@ def _plan_install(targets, project, *, runtime_home, legacy_global=False, skill_
         seen.add(item['path'])
         planned.append(item)
 
+    if project_local:
+        config = _safe_destination(project, home / 'config.toml')
+        add(config, _local_config_bytes(config, targets, timezone))
+        ignore = _safe_destination(project, home / '.gitignore')
+        current = ignore.read_text(encoding='utf-8') if ignore.exists() else ''
+        # Append after existing rules, so an earlier negation cannot undo it.
+        lines = [line for line in current.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+        updated = current if lines and lines[-1] == '/local/' else current.rstrip() + '\n/local/\n'
+        add(ignore, updated.encode('utf-8'))
+
     for directory in ('ase', 'skills', 'agents', 'docs', 'templates', 'scripts'):
         for source in sorted((ROOT / directory).rglob('*')):
-            if source.is_file() and '__pycache__' not in source.parts and source.suffix != '.pyc':
-                if _is_link(source) or any(_is_link(p) for p in source.parents if p.is_relative_to(ROOT)):
-                    raise ValueError('Canonical package contains linked source files')
+            if _package_file(source):
                 add(runtime / source.relative_to(ROOT), source.read_bytes())
     instruction_files, destinations = {}, {}
     for target in targets if project is not None else []:
@@ -388,18 +527,19 @@ def _plan_install(targets, project, *, runtime_home, legacy_global=False, skill_
                 instruction = override
         instruction = _safe_destination(project, instruction)
         current = instruction.read_text(encoding='utf-8') if instruction.exists() else ''
-        add(instruction, managed_text(current, BEGIN, END, _routing(skill_relative)).encode('utf-8'), project)
+        add(instruction, managed_text(current, BEGIN, END, _routing(skill_relative, project_local)).encode('utf-8'), project)
         instruction_files[target] = str(instruction)
         entries = []
         for source in sorted((ROOT / 'skills').rglob('*')):
-            if source.is_file() and '__pycache__' not in source.parts and source.suffix != '.pyc':
+            if _package_file(source):
                 destination = skill_directory / source.relative_to(ROOT / 'skills')
                 add(destination, source.read_bytes(), project)
                 if source.name == 'SKILL.md':
                     entries.append(destination)
         roles = ROOT / ('agents' if target == 'codex' else 'templates/agents/' + target)
         for source in sorted(roles.glob('*.toml' if target == 'codex' else '*.md')):
-            add(project / role_relative / source.name, source.read_bytes(), project)
+            if _package_file(source):
+                add(project / role_relative / source.name, source.read_bytes(), project)
         if target == 'codex':
             config, data = project_skill_config(project, entries)
             add(config, data, project)
@@ -408,9 +548,11 @@ def _plan_install(targets, project, *, runtime_home, legacy_global=False, skill_
         directory_target(destination)
         destinations['codex'] = str(destination)
         for source in sorted((ROOT / 'skills').rglob('*')):
-            if source.is_file() and '__pycache__' not in source.parts and source.suffix != '.pyc':
+            if _package_file(source):
                 add(destination / source.relative_to(ROOT / 'skills'), source.read_bytes(), destination)
         for source in sorted((ROOT / 'agents').glob('*.toml')):
+            if not _package_file(source):
+                continue
             role = tomllib.loads(source.read_text(encoding='utf-8'))
             if 'developer_instructions' in role:
                 role['developer_instructions'] = role['developer_instructions'].replace(
@@ -421,10 +563,10 @@ def _plan_install(targets, project, *, runtime_home, legacy_global=False, skill_
         current = instruction.read_text(encoding='utf-8') if instruction.exists() else ''
         add(instruction, managed_text(current, BEGIN, END, _routing(str(destination))).encode('utf-8'))
         instruction_files['codex'] = str(instruction)
-    ps, shell = _launcher_bytes(runtime)
+    ps, shell = _local_launcher_bytes() if project_local else _launcher_bytes(runtime)
     add(home / 'bin/ase.ps1', ps)
     add(home / 'bin/ase', shell)
-    summary = {'runtime': str(runtime), 'targets': targets,
+    summary = {'runtime': str(runtime), 'targets': targets, 'project_local': bool(project_local),
                'scope': 'global' if legacy_global else 'project' if project is not None else 'runtime',
                'project': str(project) if project is not None else None,
                'project_id': getattr(context, 'project_id', None),
@@ -450,6 +592,14 @@ def apply_install(manifest: dict) -> dict:
         raise ValueError('Manifest digest mismatch')
     home = Path(manifest['runtime_home'])
     project = Path(manifest['project']) if manifest.get('project') else None
+    if manifest.get('project_local'):
+        if project is None or home != project / '.devframework':
+            raise ValueError('Invalid project-local manifest home')
+        directory_target(project_target(project, home))
+        directory_target(project_target(project, home / 'local/backups'))
+        if not Path(manifest['backup']).is_relative_to(home / 'local/backups'):
+            raise ValueError('Project-local backups must remain private')
+        _check_tracked_private(project)
     global_root = Path(manifest['skills']) if manifest.get('scope') == 'global' else None
     allowed_roots = {home, *([project] if project else []), *([global_root] if global_root else [])}
     changes, seen = [], set()
@@ -476,14 +626,24 @@ def apply_install(manifest: dict) -> dict:
             changes.append((target, data, backup, scope))
     # Local accident barrier, not a transaction against IO errors or a hostile
     # process changing path objects between checks and writes.
+    if manifest.get('project_local'):
+        changes.sort(key=lambda change: change[0] != home / '.gitignore')
     for target, data, backup, scope in changes:
         _safe_destination(scope, target)
-        if backup:
+        # Repair ignore protection before creating any private backup. Keep its
+        # old bytes in memory until the new rule is in place, then back them up.
+        ignore_backup = bool(backup and manifest.get('project_local') and target == home / '.gitignore')
+        ignore_before = target.read_bytes() if ignore_backup else None
+        if backup and not ignore_backup:
             _safe_destination(home, backup)
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target, backup)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+        if ignore_backup:
+            _safe_destination(home, backup)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_bytes(ignore_before)
     if sys.platform != 'win32':
         (home / 'bin/ase').chmod(0o755)
     return {key: value for key, value in manifest.items() if key != 'files'}
@@ -622,8 +782,10 @@ def main(argv=None):
     mode.add_argument('--cleanup-mcp', type=Path, metavar='CONFIG', help='Preview only the owned historical MCP entry')
     mode.add_argument('--apply-manifest', type=Path, help='Apply a previously reviewed install/cleanup JSON manifest')
     parser.add_argument('--target', action='append', choices=TARGETS, help='Backend target; repeat for multiple backends')
+    parser.add_argument('--project-local', action='store_true', help='Keep runtime/config/private state in the selected project')
+    parser.add_argument('--timezone', help='IANA timezone for project-local configuration (new projects default to UTC)')
     state = Path(os.environ.get('ASE_HOME', Path(os.environ.get('LOCALAPPDATA', Path.home() / '.local/share')) / 'AutonomousSE'))
-    parser.add_argument('--home', type=Path, default=state / 'tooling', help='Shared tooling destination; independent of provider homes')
+    parser.add_argument('--home', type=Path, help='Shared tooling destination; local mode only accepts project/.devframework')
     parser.add_argument('--skills', type=Path, help='Legacy global destination; requires --global')
     parser.add_argument('--preview', action='store_true', help='Print manifest without changing files')
     parser.add_argument('--authorization-ref', help='Explicit user authorization source for MCP cleanup')
@@ -631,6 +793,10 @@ def main(argv=None):
     parser.add_argument('--root', action='append', type=Path, default=[], help=argparse.SUPPRESS)
     parser.add_argument('--state-home', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.project_local and not args.project:
+        parser.error('--project-local requires --project')
+    if args.timezone is not None and not args.project_local:
+        parser.error('--timezone requires --project-local')
     if args.register_verifier:
         parser.error('--register-verifier is deprecated; no files or configuration were changed. Use local CLI adapters.')
     if args.apply_manifest:
@@ -646,8 +812,10 @@ def main(argv=None):
             parser.error('--skills requires --global; use --project for project activation')
         if not args.target and not args.global_install:
             parser.error('Select an explicit --target codex, claude or copilot')
-        manifest = _plan_install(args.target or ['codex'], args.project, runtime_home=args.home,
-                                 legacy_global=args.global_install, skill_home=args.skills)
+        manifest = _plan_install(args.target or ['codex'], args.project,
+                                 runtime_home=args.home if args.project_local else args.home or state / 'tooling',
+                                 legacy_global=args.global_install, skill_home=args.skills,
+                                 project_local=args.project_local, timezone=args.timezone)
         result = manifest if args.preview else apply_install(manifest)
     print(json.dumps(result, indent=2))
 

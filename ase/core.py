@@ -25,6 +25,7 @@ from .store import Store, now
 
 STATUSES = {"PASS", "FAIL", "UNVERIFIED", "BLOCKED", "NOT_APPLICABLE"}
 PROTECTED = [".github/workflows/*", ".codex/*", ".agents/*", "AGENTS.md", ".gitmodules", ".githooks/*"]
+PROTECTED += [".devframework/config.toml", ".devframework/.gitignore", ".devframework/bin/*", ".devframework/autonomous-se/*"]
 SECRET = re.compile(r"(?i)(?:sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9_]{16,}|Bearer\s+[a-z0-9._-]{12,}|(?:password|api[_-]?key|token|secret)\s*[=:]\s*[^\s,;]{8,})")
 
 
@@ -78,9 +79,16 @@ def snapshot(repo):
     repo = Path(repo).resolve()
     raw = subprocess.run(["git", "-C", str(repo), "ls-files", "--cached", "--others", "--exclude-standard", "-z"], capture_output=True, check=True).stdout
     paths = sorted(set(raw.decode("utf-8").split("\0")) - {""})
+    from .project_local import is_private_path
+    if any(is_private_path(path) for path in paths):
+        raise ValueError("Private project-local state cannot be source or publication input")
     files = {}
     for relative in paths:
         p = repo / relative
+        if p.is_file() and p.stat().st_nlink > 1:
+            raise ValueError("Hardlinked source cannot be fingerprinted or included in packets")
+        if p.resolve().is_relative_to(repo) and is_private_path(p.resolve().relative_to(repo)):
+            raise ValueError("Private project-local state cannot be source through an alias")
         if p.is_symlink():
             if not p.resolve().is_relative_to(repo):
                 raise ValueError("Symlink source escapes repository: " + relative)

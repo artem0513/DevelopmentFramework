@@ -8,19 +8,38 @@ import re
 import sqlite3
 import uuid
 
+from .project_local import find_local_config, validate_local_state
+
 
 def _now():
     return datetime.now(utc_timezone.utc).isoformat()
 
 
-def resolve_state_home(home=None):
+def local_config(project=None):
+    """Find selected path configuration without treating a UUID as cwd."""
+    if project is not None:
+        path = Path(project).expanduser()
+        if not path.is_dir():
+            return None
+        return find_local_config(path)
+    return find_local_config()
+
+
+def resolve_state_home(home=None, project=None):
     if home is not None:
-        return Path(home).expanduser().resolve()
-    configured = os.environ.get("ASE_HOME")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
-    return (base / "AutonomousSE").resolve()
+        selected = Path(home).expanduser()
+    else:
+        config = local_config(project)
+        if config is not None:
+            selected = config["root"] / ".devframework" / "local"
+        else:
+            configured = os.environ.get("ASE_HOME")
+            base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
+            selected = Path(configured).expanduser() if configured else base / "AutonomousSE"
+    # Validate local aliases before canonicalization; shared-home aliases retain
+    # the legacy canonical-home behavior.
+    validate_local_state(selected)
+    return selected.resolve()
 
 
 def _canonical(root):
@@ -37,6 +56,8 @@ def _safe_state(path):
 
 
 def _outside(home, root):
+    if validate_local_state(home, project_root=root):
+        return True
     if home == root or home.is_relative_to(root):
         raise ValueError("State home must be outside the repository or workspace")
 
@@ -54,8 +75,11 @@ class ProjectContext:
 
 
 class ProjectRegistry:
-    def __init__(self, state_home=None):
-        self.state_home = resolve_state_home(state_home)
+    def __init__(self, state_home=None, *, project=None):
+        self.state_home = resolve_state_home(state_home, project=project)
+        if project is not None and Path(project).expanduser().is_dir():
+            config = local_config(project)
+            _outside(self.state_home, config["root"] if config else Path(project).expanduser().resolve())
         self.state_home.mkdir(parents=True, exist_ok=True)
         for name in ("registry.sqlite3", "registry.sqlite3-wal", "registry.sqlite3-shm", "projects"):
             _safe_state(self.state_home / name)
@@ -106,6 +130,7 @@ class ProjectRegistry:
             raise ValueError("Unknown project or workspace: " + str(selector))
         if row["status"] != "ACTIVE":
             raise ValueError("Inactive project registration: " + row["status"])
+        _outside(self.state_home, Path(row["root"]))
         return self._context(row)
 
     def validate(self, context):
@@ -117,7 +142,7 @@ class ProjectRegistry:
             raise ValueError("Project context identity differs from registry")
         return actual
 
-    def register(self, root, *, kind, timezone):
+    def register(self, root, *, kind, timezone=None):
         return self._register(root, kind=kind, timezone=timezone)
 
     def for_root(self, root):
@@ -128,7 +153,7 @@ class ProjectRegistry:
         root = Path(root).expanduser().resolve(strict=True)
         if not root.is_dir():
             raise ValueError("Project root must be a directory")
-        _outside(self.state_home, root)
+        valid_local_home = _outside(self.state_home, root)
         if kind is not None and (not isinstance(kind, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", kind)):
             raise ValueError("Project kind must be a concise identifier")
         if timezone is not None and (not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+./-]{1,128}", timezone)):
@@ -142,6 +167,10 @@ class ProjectRegistry:
                     raise ValueError("Conflict: workspace already registered with different metadata")
                 project_id = row["project_id"]
             else:
+                if valid_local_home and self.db.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
+                    raise ValueError("Existing project-local identity requires explicit project attach after relocation")
+                config = local_config(root)
+                default_timezone = config["timezone"] if config else "Europe/Bucharest"
                 project_id, workspace_id = str(uuid.uuid4()), str(uuid.uuid4())
                 legacy_key = hashlib.sha256(_canonical(root).encode()).hexdigest()[:24]
                 legacy = self.state_home / "projects" / legacy_key / "memory.sqlite3"
@@ -149,7 +178,7 @@ class ProjectRegistry:
                 storage_key = legacy_key if legacy.is_file() else project_id
                 self.db.execute("INSERT INTO projects VALUES(?,?,?,?,?,?,?,?,?)", (
                     project_id, storage_key, kind or ("software" if (root / ".git").exists() else "workspace"),
-                    timezone or "Europe/Bucharest", "PREPARING", 1,
+                    timezone or default_timezone, "PREPARING", 1,
                     hashlib.sha256(_canonical(root).encode()).hexdigest(), workspace_id, _now()))
                 self.db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?)", (
                     workspace_id, project_id, str(root), _canonical(root), _now()))

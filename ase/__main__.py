@@ -11,7 +11,8 @@ import sys
 from .core import Engine, load, redact
 from .continuity import Continuity
 from .knowledge import Knowledge
-from .projects import ProjectRegistry, resolve_state_home
+from .projects import ProjectRegistry, local_config, resolve_state_home
+from .project_local import validate_local_state
 from .store import Store
 from .tasks import TaskService
 from .workflow import WorkflowController
@@ -32,7 +33,7 @@ class JSONArgumentParser(argparse.ArgumentParser):
 def parser():
     p = JSONArgumentParser(description="Project-local, evidence-driven supervised workflow")
     p.add_argument("--repo", default=".")
-    p.add_argument("--home", help="State home outside source repository")
+    p.add_argument("--home", help="Explicit state home (outside source or validated project-local state)")
     p.add_argument("--project", help="Registered project UUID or workspace alias")
     commands = p.add_subparsers(dest="command", required=True)
     credentials = commands.add_parser("credentials", help="Manage encrypted local credential profiles").add_subparsers(dest="action", required=True)
@@ -138,7 +139,7 @@ def parser():
     registration = project.add_parser("register")
     registration.add_argument("--root")
     registration.add_argument("--kind", required=True)
-    registration.add_argument("--timezone", required=True)
+    registration.add_argument("--timezone", help="Reporting timezone; defaults to project-local config")
     project.add_parser("list")
     attach = project.add_parser("attach")
     attach.add_argument("project_id")
@@ -276,14 +277,29 @@ def _task_command(store, action, args):
     raise ValueError("Unknown task command")
 
 
+def _state_project(args):
+    """A UUID selects within the repo/cwd registry, never a filesystem root."""
+    if args.project:
+        if Path(args.project).expanduser().is_dir():
+            return args.project
+        if local_config(args.repo) is None:
+            return args.project
+    return args.repo
+
+
 def _project_command(args):
-    home = resolve_state_home(args.home)
+    selection = getattr(args, "root", None) or _state_project(args)
+    home = resolve_state_home(args.home, project=selection)
     if args.action == "import":
         return asdict(import_project(Path(args.archive), home, root=Path(args.root), mode=args.mode))
-    with_registry = ProjectRegistry(home)
+    with_registry = ProjectRegistry(home, project=selection)
     try:
         if args.action == "register":
-            return asdict(with_registry.register(args.root or args.repo, kind=args.kind, timezone=args.timezone))
+            config = local_config(selection)
+            if args.timezone is None and config is None:
+                raise ValueError("--timezone is required without project-local configuration")
+            root = config["root"] if config else args.root or args.repo
+            return asdict(with_registry.register(root, kind=args.kind, timezone=args.timezone))
         if args.action == "attach":
             return asdict(with_registry.attach(args.project_id, args.root, expected_revision=args.expected_revision))
         return {"projects": [dict(row) for row in with_registry.db.execute(
@@ -294,13 +310,25 @@ def _project_command(args):
 
 
 def _credential_command(args):
-    # Preserve a supplied path until the vault has checked for reparse points.
-    supplied = args.home if args.home is not None else os.environ.get("ASE_HOME")
-    home = Path(supplied).expanduser() if supplied is not None else resolve_state_home()
-    vault = CredentialVault(home)
-    repo = Path(args.repo).expanduser().resolve()
-    if vault.home.is_relative_to(repo):
+    selection = _state_project(args)
+    config = local_config(selection)
+    home = resolve_state_home(args.home, project=selection)
+    repo_path = selection if Path(selection).expanduser().is_dir() else args.repo
+    repo = config["root"] if config else Path(repo_path).expanduser().resolve()
+    if args.project and not Path(args.project).expanduser().is_dir():
+        registry = ProjectRegistry(home, project=selection)
+        try:
+            repo = registry.resolve(args.project).root
+        finally:
+            registry.close()
+    # Do not erase a supplied external alias before the credential path check.
+    supplied = args.home if args.home is not None else (os.environ.get("ASE_HOME") if config is None else None)
+    if supplied is not None:
+        _safe_path(Path(supplied).expanduser())
+    valid_local = validate_local_state(home, project_root=repo)
+    if home.is_relative_to(repo) and not valid_local:
         raise CredentialError("unsafe_path")
+    vault = CredentialVault(home)
     if args.action == "import":
         source = _safe_path(args.file)
         if source.is_relative_to(repo):
@@ -323,8 +351,10 @@ def main(argv=None):
         elif cmd == "project" and args.action != "export":
             result = _project_command(args)
         else:
-            if args.project:
-                registry = ProjectRegistry(args.home)
+            if args.project and local_config(args.project) is not None:
+                store = Store(args.project, args.home)
+            elif args.project:
+                registry = ProjectRegistry(args.home, project=_state_project(args))
                 try:
                     selected = registry.resolve(args.project)
                 finally:

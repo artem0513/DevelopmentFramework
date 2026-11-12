@@ -5,7 +5,11 @@ description: "Use when task-relevant environment, sources, local knowledge fresh
 
 # Task discovery
 
-Start with the named resources and applicable local instructions. Expand inspection only for a material dependency of the requested result; record the relationship and remaining uninspected dependencies. Reading a location does not adopt it or authorize product changes, installations or external effects.
+Start with the named resources and applicable local instructions. Expand inspection only for a material dependency or a narrowly scoped search for relevant project examples; record the relationship and remaining uninspected dependencies. Reading a location does not adopt it or authorize product changes, installations or external effects.
+
+Before proposing implementation, search for similar work in the authorized project by default, including relevant shared packages and sibling microservices. Follow the [project examples](references/project-patterns.md) workflow. Record one outcome: a source-backed example and intended reuse; no suitable example within the inspected scope; or search skipped by the user's explicit instruction. An unavailable external example does not replace this local search. A known, current, suitable example can satisfy the search without an exhaustive scan.
+
+If the user explicitly says not to use templates/examples or not to search for analogues, skip deliberate example search and reuse for that task, including cached pattern retrieval and delegated searches. Continue necessary target/dependency inspection and applicable mandatory rules. Apply this choice before retrieving example records from memory; do not turn a task-specific opt-out into the next task's default.
 
 Retrieve project context and relevant source-backed knowledge before rescanning. Check source versions and current observations: Git commit alone does not cover dirty/untracked bytes, external settings or non-Git workspaces. Refresh affected records and their transitive dependents; retain historical provenance and explicit unknowns. Memory is local to this computer and project identity, with no automatic cloud synchronization.
 

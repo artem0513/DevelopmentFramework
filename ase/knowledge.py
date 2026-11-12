@@ -142,7 +142,7 @@ class Knowledge:
                 for item in result[key]:
                     text(item, key, limit=2048)
                     if key == "paths":
-                        self._local_path("local:" + item)
+                        self._local_path("local:" + item, allow_shared_reference=True)
         if "claim_ids" in result:
             self._list(result["claim_ids"], "claim_ids")
             if any(type(item) is not int or item < 1 for item in result["claim_ids"]):
@@ -164,12 +164,21 @@ class Knowledge:
     def _metadata(self, claim_id):
         return read_record(self.store.db, "knowledge_claim", str(claim_id))["payload"]
 
-    def _local_path(self, locator):
+    def _local_path(self, locator, *, allow_shared_reference=False):
+        from .project_local import is_private_path
         if not locator.startswith("local:") or not locator[6:]:
             raise ValueError("File source requires a local: reference")
+        if is_private_path(locator[6:]):
+            raise ValueError("Private project-local state is not a knowledge source")
         path = (self.store.repo / locator[6:]).resolve()
         if not path.is_relative_to(self.store.repo):
             raise ValueError("Local source is outside the selected workspace")
+        if is_private_path(path.relative_to(self.store.repo)):
+            raise ValueError("Private project-local state is not a knowledge source")
+        # Metadata may retain an unavailable source reference and its history.
+        # Actual verification/reading still rejects shared inodes before bytes.
+        if not allow_shared_reference and path.is_file() and path.stat().st_nlink > 1:
+            raise ValueError("Hardlinked files are not knowledge sources")
         return path
 
     def _source_key(self, source_id):
@@ -190,7 +199,7 @@ class Knowledge:
         if kind not in {"file", "live"}:
             raise ValueError("Source kind must be file or live")
         if kind == "file":
-            self._local_path(locator)
+            self._local_path(locator, allow_shared_reference=True)
         elif locator.startswith("local:"):
             raise ValueError("Local file observations cannot be recorded as live probes")
         availability = value.get("availability")
@@ -327,7 +336,7 @@ class Knowledge:
             all_claims = {claim["id"]: claim for claim in self.query()["claims"]}
             metadata = {key: self._metadata(key) for key in all_claims}
             dependencies = {key: read_record(self.store.db, "knowledge_dependencies", str(key))["payload"] or [] for key in all_claims}
-            selected_paths = {self._local_path("local:" + item) for item in scope.get("paths", [])}
+            selected_paths = {self._local_path("local:" + item, allow_shared_reference=True) for item in scope.get("paths", [])}
             source_metadata = {}
             selected = []
             for claim_id, claim in all_claims.items():
@@ -353,7 +362,7 @@ class Knowledge:
                     for ref in refs:
                         if ref.startswith("local:"):
                             try:
-                                declared_paths.add(self._local_path(ref))
+                                declared_paths.add(self._local_path(ref, allow_shared_reference=True))
                             except (OSError, ValueError):
                                 # Legacy out-of-scope links remain historical
                                 # references; they cannot expand a read scope.

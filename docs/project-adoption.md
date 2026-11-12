@@ -4,6 +4,8 @@ DevelopmentFramework is activated only in an explicitly selected existing projec
 
 ## Preview and apply
 
+Add `--project-local` for runtime/configuration inside `<project>/.devframework` and private memory/journal/backups in its ignored `local` child. Relative launchers and native project files support all three targets. See [project-local usage](project-local.md). Without that flag, the shared-tooling examples below retain their original behavior.
+
 Select backend targets explicitly. These commands illustrate an authorized installation; they do not authorize migration of the user's current environment:
 
 ```powershell
@@ -25,7 +27,7 @@ All eleven skill packages and their supporting files come from canonical `skills
 
 Pointers name the installed backend-local skill files. Codex appends exact local SKILL.md selections in `.codex/config.toml`, retaining unrelated values/comments and prior managed selections. Existing inline/dotted/table TOML forms remain supported. Other targets do not modify Codex settings. Existing instructions outside the owned managed block remain intact.
 
-Shared tooling defaults to `AutonomousSE/tooling` under the platform state location; `--home PATH` explicitly selects its installation destination. Runtime files remain under `autonomous-se/runtime`, launchers under `bin`, and backups under `backups/autonomous-se`. Runtime state uses CLI `--home`, then `ASE_HOME`, then the platform AutonomousSE directory. Provider authentication/homes, hooks, sandbox settings and unrelated integrations are not changed.
+Shared tooling defaults to `AutonomousSE/tooling` under the platform state location; `--home PATH` explicitly selects its installation destination. Runtime files remain under `autonomous-se/runtime`, launchers under `bin`, and shared backups under `backups/autonomous-se`. Project-local mode instead uses `.devframework` with backups in its ignored `local/backups` child. Runtime state uses explicit CLI `--home`, selected project-local config, `ASE_HOME`, then the platform AutonomousSE directory. Provider authentication/homes, hooks, sandbox settings and unrelated integrations are not changed.
 
 Prepare tooling alone with `python scripts/install.py --runtime-only --target codex --preview`. This creates no discoverable global skills/roles or project router. Legacy explicit Codex global activation remains `--global`; neither project installation nor runtime preparation implies it. A custom global skill destination requires that explicit mode.
 

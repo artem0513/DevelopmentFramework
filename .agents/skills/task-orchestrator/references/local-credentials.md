@@ -2,6 +2,8 @@
 
 Use for an authorized task that needs a service account. Codex, Claude and Copilot share the same local `ase` home/vault under the same OS user; do not create backend-specific copies. Put global `--home`, `--repo` and `--project` selectors before the command. Windows DPAPI CurrentUser is the implemented encrypted backend; another OS reports an explicit blocker, never plaintext fallback.
 
+In project-local mode invoke that project's `.devframework/bin/ase.ps1` or `.devframework/bin/ase`. The vault is separate per project inside protected ignored `.devframework/local/credentials`; an external import file is still required. Do not fall back to a global vault or another project to resolve a missing profile. Native provider/session caches are not relocated.
+
 Start with `ase credentials list`. Public metadata contains the reference, exact target origin, kind, revision, secret-field/environment names and `has_session`, not secret values or command arguments. Match the approved service and intended account. Retrieve existing context before asking; two unresolved production/test identities are a real decision, not a reason to guess.
 
 Import only the exact local file the user designated, outside workspaces/Git: `ase credentials import --file ABSOLUTE_FILE`. The importer reads and encrypts it locally. Do not open that file with model-facing read tools, paste it into a prompt, copy it into project sources or ask for secrets in chat. The original file remains unchanged and plaintext unless its owner stores/protects it separately. No automatic search of other credential files, browser stores or provider homes.

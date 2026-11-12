@@ -6,7 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-from .projects import ProjectContext, ProjectRegistry, _canonical, _outside, _safe_state, resolve_state_home
+from .projects import ProjectContext, ProjectRegistry, _canonical, _outside, _safe_state, local_config, resolve_state_home
 
 
 def now():
@@ -22,16 +22,18 @@ class Store:
         if isinstance(repo, ProjectContext):
             if home is not None and resolve_state_home(home) != repo.state_home:
                 raise ValueError("Project context state home conflicts with explicit home")
-            registry = ProjectRegistry(repo.state_home)
+            _outside(repo.state_home, repo.root)
+            registry = ProjectRegistry(repo.state_home, project=repo.root)
             try:
                 project = registry.validate(repo)
             finally:
                 registry.close()
         else:
-            root = Path(repo).expanduser().resolve(strict=True)
-            selected_home = resolve_state_home(home)
+            config = local_config(repo)
+            root = config["root"] if config else Path(repo).expanduser().resolve(strict=True)
+            selected_home = resolve_state_home(home, project=root)
             _outside(selected_home, root)
-            registry = ProjectRegistry(selected_home)
+            registry = ProjectRegistry(selected_home, project=root)
             try:
                 project = registry.for_root(root)
             finally:
@@ -39,8 +41,10 @@ class Store:
         self._initialize(project)
 
     def _initialize(self, project, *, preparing=False):
+        config = local_config(project.root)
+        default_retention = config["log_retention_days"] if config else 30
         try:
-            self.log_retention_days = int(os.environ.get("ASE_LOG_RETENTION_DAYS", "30"))
+            self.log_retention_days = int(default_retention if config else os.environ.get("ASE_LOG_RETENTION_DAYS", "30"))
         except ValueError:
             raise ValueError("ASE_LOG_RETENTION_DAYS must be an integer from 1 to 365") from None
         if not 1 <= self.log_retention_days <= 365:
@@ -50,6 +54,7 @@ class Store:
         self.project_id = project.project_id
         self.workspace_id = project.workspace_id
         self.state_home = project.state_home
+        valid_local_home = _outside(self.state_home, self.repo)
         if (not project.storage_key or Path(project.storage_key).name != project.storage_key
                 or project.storage_key in {".", ".."}):
             raise ValueError("Invalid project storage key")
@@ -58,7 +63,7 @@ class Store:
         for name in ("memory.sqlite3", "memory.sqlite3-wal", "memory.sqlite3-shm", "backups"):
             path = self.root / name
             _safe_state(path)
-        if self.root == self.repo or self.root.is_relative_to(self.repo):
+        if not valid_local_home and (self.root == self.repo or self.root.is_relative_to(self.repo)):
             raise ValueError("State home must be outside the repository")
         self.root.mkdir(parents=True, exist_ok=True)
         if not preparing and not (self.root / "memory.sqlite3").is_file():

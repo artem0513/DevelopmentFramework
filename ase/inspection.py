@@ -74,6 +74,10 @@ def _validate(args):
         return
     if command == "ls-files" and set(options).issubset({"--cached", "--others", "--exclude-standard", "-z", "--stage"}):
         return
+    if command == "check-ignore" and options == ["--no-index", "--quiet", "--", ".devframework/local/.ase-privacy-probe"]:
+        return
+    if command == "check-ignore" and options == ["--no-index", "--quiet", "--", ".devframework/local/"]:
+        return
     if command == "diff":
         flags = {"--cached", "--check", "--stat", "--name-only", "--no-ext-diff", "--no-textconv"}
         revisions = 0
@@ -138,9 +142,16 @@ def safe_snapshot(repo):
     repo = Path(repo).resolve(strict=True)
     raw = _run(repo, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
     paths = sorted(set(raw.decode("utf-8").split("\0")) - {""})
+    from .project_local import is_private_path
+    if any(is_private_path(path) for path in paths):
+        raise ValueError("Private project-local state cannot be source or publication input")
     files = {}
     for relative in paths:
         p = repo / relative
+        if p.is_file() and p.stat().st_nlink > 1:
+            raise ValueError("Hardlinked source cannot be fingerprinted or included in packets")
+        if p.resolve().is_relative_to(repo) and is_private_path(p.resolve().relative_to(repo)):
+            raise ValueError("Private project-local state cannot be source through an alias")
         if not p.resolve().is_relative_to(repo):
             raise ValueError("Source escapes repository: " + relative)
         if p.is_symlink():

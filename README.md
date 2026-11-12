@@ -4,7 +4,15 @@ A local workflow for managed software, infrastructure, document, research and mi
 
 Adoption is explicit per project or workspace. A shared runtime, an installed skill or reading another directory does not adopt it. Ordinary questions use domain tools. A financial report with warnings uses document/research evidence; changing its generating code uses the software profile.
 
-Preview an installation in the selected workspace and backend:
+For everything in the selected project folder, initialize the selected bots:
+
+```powershell
+python scripts/install.py --project D:/path/to/workspace --project-local --target codex --target claude --target copilot --timezone Europe/Bucharest
+```
+
+This creates project-owned runtime/settings under `.devframework` and ignored memory, dated journal, logs, receipts and backups under `.devframework/local`. Use `.devframework/bin/ase.ps1` in PowerShell or `.devframework/bin/ase` in a shell; no global installation or `ASE_HOME` setting is needed. The bots use their existing native account login. Select only the targets you want. See [project-local usage](docs/project-local.md).
+
+To review exact changes first, add `--preview` and apply its manifest. Shared tooling remains supported with the original project-adoption mode:
 
 ```powershell
 python scripts/install.py --project D:/path/to/workspace --target codex --preview > install-manifest.json
@@ -18,7 +26,7 @@ Project instructions, custom configuration/comments, unrelated skills and other 
 
 No live Claude/Copilot installation or model acceptance is claimed for this delivery. Their descriptors/adapters are protocol and packaging support pending a separately authorized, available live environment. Codex live evidence is recorded separately from deterministic tests. Native role files and successful fixtures do not establish subscriptions, permissions or independent model execution.
 
-From this checkout use `python -m ase`; installed launchers are named `ase` / `ase.ps1` under the chosen tooling home's `bin`. They do not change authentication or force a provider home. `--home`, then `ASE_HOME`, then the platform AutonomousSE directory selects local state. Tooling home defaults to a `tooling` child of that state location, independently of provider configuration.
+From this checkout use `python -m ase`; installed launchers are named `ase` / `ase.ps1` under the chosen tooling home's `bin`. They do not change authentication or force a provider home. State selection is explicit `--home`, then the selected project's `.devframework/config.toml`, then `ASE_HOME`, then the platform AutonomousSE directory. A local launcher anchors its own project even when called from another directory. Shared tooling defaults to a `tooling` child of the legacy state location, independently of provider configuration.
 
 Explicit local credential import and on-demand service access are shared by all three backends through the same CLI. On Windows, DPAPI encrypts the separate vault under the current OS user; project memory/export contains references only. Approved checks/actions can reuse a session or authenticate lazily, with real interaction/denied access reported as typed blockers. See [local credentials](docs/local-credentials.md) for the outside-workspace JSON import, exact-target approval, supported CLI recipes/HTTP observations and platform limits. No automatic provider-account migration or universal browser login is implied.
 

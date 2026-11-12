@@ -5,7 +5,7 @@ description: "Use when local project memory, dated decisions, source freshness, 
 
 # Local project continuity
 
-Resolve the explicit project/workspace identity with `ase`; use the same local SQLite state across Codex, Claude and Copilot on this computer. `--home` takes precedence over `ASE_HOME` and the platform default. Another computer or cloud agent needs an explicit reviewed export; there is no automatic synchronization. Project paths and source locators grant no authority.
+Resolve the explicit project/workspace identity with `ase`; use the same local SQLite state across Codex, Claude and Copilot within that project. Selection is explicit `--home`, selected project-local configuration, `ASE_HOME`, then platform default. In project-local mode use `.devframework/bin/ase.ps1` or `.devframework/bin/ase`; memory/journal/receipts live in ignored `.devframework/local` and must not become application source or Git input. Another computer or cloud agent needs an explicit reviewed export; there is no automatic synchronization. Project paths and source locators grant no authority.
 
 Before rescanning, retrieve current context and relevant knowledge topics. Preserve provenance, version/freshness observations, supersession and uncertainty. Refresh changed dependencies and affected dependents rather than every project record. Git commit alone does not describe dirty files or a non-Git workspace.
 
