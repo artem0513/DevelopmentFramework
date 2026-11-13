@@ -4,7 +4,7 @@ Use for an unresolved fact or conflicting requirement that could materially affe
 
 ## Choose evidence for the question
 
-State the uncertainty, the leading explanation and what observation would distinguish plausible alternatives. Retrieve relevant source-backed memory and validate its freshness before repeating work. Start with the smallest authorized check likely to change the decision; record actual observations separately from hypotheses and proposed next checks.
+Check the assignment for obvious gaps first. State the uncertainty, the hypothesis about intended behavior and what observation would distinguish plausible alternatives. Restore fresh relevant project/meeting knowledge before repeating research. Start with the smallest authorized check likely to change the decision; record actual observations separately from the intent hypothesis, recommended solution and proposed next checks. Re-evaluate the remaining gaps after each material finding or owner answer.
 
 Choose relevant sources rather than completing a checklist:
 
@@ -16,24 +16,24 @@ Choose relevant sources rather than completing a checklist:
 
 Source availability is not access authorization. Use existing authorized CLI/API/file tools without requiring MCP; access failures are observations, not permission to expand access. Do not install an integration or contact a team merely to complete this list. If retrieved evidence conflicts, investigate the relevant contradiction instead of counting agreeing sources. Existing behavior can inform a recommendation; it cannot authorize a new business policy.
 
-## Bound the investigation
+## Continue useful investigation
 
-Set an effort bound proportionate to the question and existing task time/cost constraints. Unless a different bound is already agreed or recorded before starting, use one targeted pass and at most one follow-up for the same unresolved question or closely related question group. A pass is a small coherent set of discriminating checks, not a whole-project scan or an unlimited query loop. A follow-up needs a new hypothesis, contradictory evidence or a concrete lead with a useful next check. A synonym search that adds no new evidence is not a useful follow-up.
+There is no default one-pass/one-follow-up cap and no default research cost/time budget. Respect an explicit user/project/task bound already in force. Continue with a small coherent set of discriminating checks when actual new information, contradictory evidence or a credible lead gives the next check a useful prospect of resolving the uncertainty. Follow a precise trace, dependency or rationale reference even after earlier passes. Rephrasing the same search or producing more notes without new information does not justify continuing.
 
-Track effort in the existing root-task checkpoint/notes. Share the bound across delegates, resume and related-question rewording; do not restart it by changing agents, stages or labels. This investigation allowance is separate from implementation repair-cycle limits. A different bound does not expand approved scope, access, time or cost, and reaching the limit does not grant an automatic extension.
+Keep the investigation history in the existing root-task checkpoint/notes. Resume, delegates and related-question rewording share inspected evidence, remaining leads and any explicit limits. Research does not expand approved scope or access. Its information gain is distinct from verified implementation progress under the recovery policy: learning a plausible cause is not itself a satisfied acceptance obligation.
 
 Stop as soon as any of these holds:
 
 - Current evidence sufficiently supports the required decision; further source categories need not be visited.
 - The next targeted check has no useful prospect of resolving the remaining uncertainty, including repeated results without a new lead.
-- Relevant sources within the inspected scope are exhausted, or the required source is unavailable under current access.
-- The agreed investigation bound is reached.
+- Relevant sources within the inspected scope are exhausted, or required access is unavailable and no authorized alternative can resolve the gap.
+- An explicit agreed investigation/time/cost bound is reached, or the user requests a stop.
 - The remaining issue is an unmade business decision that existing evidence cannot settle.
 
-Stopping investigation does not automatically mean asking a question. Choose a safe in-scope default yourself when one is supported by current project rules, contracts or explicitly delegated discretion. A lower-risk hypothesis is a recommendation, not an approved default merely because its alternatives are riskier; do not silently create a new business commitment. Otherwise use the [material-question rule](../../task-orchestrator/references/questions-and-approval.md), and continue already approved independent work while the dependent part waits. A remaining authorized alternative may still be worth a check within the bound if the preferred source is unavailable. Never describe a denied/unread source as inspected or a reached limit as proof that no answer exists anywhere.
+Stopping investigation does not automatically mean asking a question. Choose a safe in-scope default yourself when supported by current project rules, contracts or delegated discretion. A lower-risk hypothesis remains a recommendation; it cannot silently create a business commitment. Otherwise use the [material-question rule](../../task-orchestrator/references/questions-and-approval.md), holding affected stages/dependents while independently approved work continues. An optional unavailable source alone does not block that work. Never describe a denied/unread source as inspected or an explicit reached limit as proof that no answer exists anywhere.
 
 ## Preserve a concise outcome
 
-Keep the unresolved question, inspected source locators and current version/time window, observations versus inference, recommendation and reason, remaining unknowns, stopping reason and passes/budget used. Mark unavailable and uninspected sources explicitly; record a useful next lead if work stops at the bound. Update the existing project knowledge/checkpoint and dated journal when relevant, without storing raw logs, rows, conversations or secrets. Refresh affected conclusions when their sources change; a previously exhausted search is not permanent proof of absence.
+Keep the unresolved question, inspected source locators/current version/time window, observations, intent hypothesis, recommendation and reason, remaining unknowns, next useful lead or stopping reason, and effort actually used. Mark unavailable/uninspected sources and explicit limits. Update existing project knowledge/checkpoint and dated journal without storing raw logs, rows, conversations or secrets. Refresh affected conclusions when their sources or an owner answer change; a previously exhausted search is not permanent proof of absence.
 
-For an owner question use a short sequence: what was checked and found; what remains material; recommended option and why; one concrete decision requested. If team input is needed, route it through the owner under the questions-and-approval workflow.
+Use a roughly 4–6-line owner message: remaining uncertainty; checked evidence; intent hypothesis labeled unconfirmed; recommended solution and why; one concrete decision. Keep the hypothesis distinct from the recommendation. For team input, route the concrete question through the owner under the questions-and-approval workflow.

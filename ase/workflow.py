@@ -14,12 +14,13 @@ import weakref
 
 from .adapters import get_adapter
 from .gates import GateService, source_resources, source_snapshot, stage_checks
-from .profiles import validate_access, validate_evidence_spec, has_software
+from .profiles import validate_access, validate_evidence_spec, has_software, evaluate_contract_profiles
 from .runner import Runner, verify_receipt
 from .state import append_event, encode, hash_value, read_record, text, transaction, write_record
 from .store import now
 from .projects import _safe_state
 from .tasks import TaskService
+from .recovery import initial_history, bind_stage, canonical_failures, progress_tokens, group_tokens, original_case_progress
 
 
 def _object(properties):
@@ -168,16 +169,89 @@ class WorkflowController:
             policy = root["contract"]["execution_policy"]
             record = read_record(db, "budget", root_id)
             value = record["payload"] or {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}}
-            if policy["active_time_budget_seconds"] is not None and value.get("active_seconds", 0) >= policy["active_time_budget_seconds"]:
+            recovery_record, history, groups = self._recovery_context(db, task_id, stage_id)
+            limits = history["hard_limits"]
+            if limits.get("active_time_budget_seconds") is not None and value.get("active_seconds", 0) >= limits["active_time_budget_seconds"]:
                 raise ValueError("Active time budget exhausted")
             key = task_id + ":" + stage_id
-            count = value["stages"].get(key, 0)
-            if count >= policy["max_stage_cycles"] or value["task_cycles"] >= policy["max_task_cycles"]:
+            count = max([value["stages"].get(key, 0)] + [history["groups"][name]["cycles"] for name in groups])
+            if ((limits.get("max_stage_cycles") is not None and count >= limits["max_stage_cycles"])
+                    or (limits.get("max_task_cycles") is not None and value["task_cycles"] >= limits["max_task_cycles"])):
                 raise ValueError("Implementation cycle budget exhausted")
+            if policy.get("recovery_mode", "fixed") == "progress" and any(history["groups"][name]["stopped"] for name in groups):
+                raise ValueError("Corrective probe made no verified progress; automatic mutation is stopped")
+            if any(history["groups"][name].get("probe_inflight") for name in groups):
+                raise ValueError("Corrective probe is already inflight; reconcile its existing candidate before mutation")
+            if any(history["groups"][name].get("diagnostic_inflight") for name in groups):
+                raise ValueError("Diagnostic has no validated completion; fresh original progress is required before mutation")
+            if any(history["groups"][name]["probe_pending"] and not self._probe_authorized(task_id, stage_id, name, history["groups"][name]) for name in groups):
+                raise ValueError("Corrective probe requires a validated diagnostic authorization for the current evidence")
+            if policy.get("recovery_mode", "fixed") == "progress" and any(
+                    history["groups"][name]["stagnation"] >= policy.get("stagnation_limit", 3)
+                    and not history["groups"][name]["probe_pending"] for name in groups):
+                raise ValueError("Stagnation requires reassessment and diagnosis before another candidate")
             value["task_cycles"] += 1
             value["stages"][key] = count + 1
+            candidate_id = uuid.uuid4().hex
+            corrective = any(history["groups"][name]["probe_pending"] for name in groups)
+            for name in groups:
+                history["groups"][name]["cycles"] = count + 1
+                if corrective:
+                    history["groups"][name].update(probe_pending=False, probe_authorization=None, probe_inflight={"candidate_id": candidate_id,
+                        "task_id": task_id, "stage_id": stage_id, "task_cycle": value["task_cycles"]})
+            task = self.tasks.snapshot(task_id)
+            cycle = read_record(db, "cycle", key)
+            write_record(db, "cycle", key, {"phase": "IMPLEMENTING", "candidate_id": candidate_id,
+                "corrective_probe": corrective, "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"]}, expected_revision=cycle["revision"])
+            write_record(db, "recovery", root_id, history, expected_revision=recovery_record["revision"])
             write_record(db, "budget", root_id, value, expected_revision=record["revision"])
-        return {"task_cycles": value["task_cycles"], "stage_cycles": count + 1}
+        return {"task_cycles": value["task_cycles"], "stage_cycles": count + 1, "candidate_id": candidate_id, "corrective_probe": corrective}
+
+    def _recovery_context(self, db, task_id, stage_id):
+        root_id = self._root_task(task_id)
+        record = read_record(db, "recovery", root_id)
+        original = read_record(db, "task_version", root_id + ":1")["payload"]
+        history = record["payload"] or initial_history((original or self.tasks.snapshot(root_id))["contract"])
+        limits = history.setdefault("hard_limits", {})
+        for key, value in self.tasks.snapshot(root_id)["contract"]["execution_policy"].items():
+            if key in {"max_stage_cycles", "max_task_cycles", "max_diagnostic_passes", "active_time_budget_seconds"} and value is not None:
+                limits[key] = min(value, limits.get(key, value))
+        budget = (read_record(db, "budget", root_id)["payload"] or {})
+        for name, group in history["groups"].items():
+            group["cycles"] = max(group["cycles"], budget.get("stages", {}).get(root_id + ":" + name, 0))
+            group["diagnostics"] = max(group["diagnostics"], budget.get("diagnostics", {}).get(root_id + ":" + name, 0))
+
+        def bind(current_id, current_stage):
+            contract = self.tasks.snapshot(current_id)["contract"]
+            parent = contract.get("parent_task_id")
+            inherited = bind(parent, contract["parent_stage_id"]) if parent else None
+            return bind_stage(history, current_id, contract, current_stage, root_id=root_id, parent_groups=inherited)
+
+        groups = bind(task_id, stage_id)
+        if record["payload"] is None:
+            # Old v2 coordinators stored raw stage names and reason hashes only.
+            # Import conservatively once; missing old progress proof earns no reset.
+            imported = {name: {"cycles": 0, "diagnostics": 0, "failures": 0} for name in history["groups"]}
+            for field, target in (("stages", "cycles"), ("diagnostics", "diagnostics"), ("failures", "failures")):
+                for old_key, count in budget.get(field, {}).items():
+                    parts = old_key.split(":")
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        if self._root_task(parts[0]) != root_id:
+                            continue
+                        inherited = bind(parts[0], parts[1])
+                    except (ValueError, KeyError):
+                        inherited = list(history["groups"])
+                    for name in inherited:
+                        imported[name][target] += count
+            for name, counters in imported.items():
+                group = history["groups"][name]
+                group["cycles"] = max(group["cycles"], counters["cycles"])
+                group["diagnostics"] = max(group["diagnostics"], counters["diagnostics"])
+                group["legacy_failures"] = counters["failures"]
+                group["stagnation"] = max(group["stagnation"], counters["failures"])
+        return record, history, groups
 
     def charge_time(self, task_id, seconds):
         if seconds < 0:
@@ -194,6 +268,9 @@ class WorkflowController:
         if read_record(self.store.db, "stop", task_id)["payload"] or read_record(self.store.db, "stop", root["task_id"])["payload"]:
             raise ValueError("Task is paused by a stop request")
         limit = root["contract"]["execution_policy"]["active_time_budget_seconds"]
+        saved_limit = ((read_record(self.store.db, "recovery", root["task_id"])["payload"] or {}).get("hard_limits", {}).get("active_time_budget_seconds"))
+        if saved_limit is not None:
+            limit = min(limit, saved_limit) if limit is not None else saved_limit
         used = (read_record(self.store.db, "budget", root["task_id"])["payload"] or {}).get("active_seconds", 0)
         if limit is not None and used >= limit:
             raise ValueError("Active time budget exhausted")
@@ -309,7 +386,18 @@ class WorkflowController:
                 or (value["exists"] and (not isinstance(value.get("resource_id"), str)
                     or "[REDACTED]" in value["resource_id"]))):
             raise ValueError("Resource observation must prove exists and a nonsecret resource_id")
-        observation = {"exists": value["exists"], "resource_id": value.get("resource_id"), "proof_ref": proof["log"] + "#sha256=" + proof["log_sha256"]}
+        observation = {"exists": value["exists"], "resource_id": value.get("resource_id"), "proof_ref": proof["log"] + "#sha256=" + proof["log_sha256"],
+                       "action_hash": hash_value(action), "observing_task_id": task_id, "observing_stage_id": stage["id"],
+                       "observing_workspace_id": self.store.workspace_id}
+        if "absence_confirmed" in value:
+            if type(value["absence_confirmed"]) is not bool:
+                raise ValueError("Resource absence_confirmed must be boolean")
+            observation["absence_confirmed"] = value["absence_confirmed"]
+        if "provider_attempt_id" in value:
+            text(value["provider_attempt_id"], "Provider attempt ID", limit=2000)
+            if "[REDACTED]" in value["provider_attempt_id"]:
+                raise ValueError("Provider attempt identity must be nonsecret and actual")
+            observation["provider_attempt_id"] = value["provider_attempt_id"]
         if "access" in proof:
             observation["access"] = proof["access"]
         return observation
@@ -325,9 +413,10 @@ class WorkflowController:
         ledger = OperationLedger(self.store)
         results = []
         for action in stage.get("actions", []):
-            intent = {"project_id": self.store.project_id, "workspace_id": self.store.workspace_id, "action": action}
+            intent = {"project_id": self.store.project_id, "workspace_id": self.store.workspace_id, "action": action, "effect_scope": stage["scope"]}
             action_id = hash_value({"task": task_id, "stage": stage["id"], "action": action["id"]})
-            ledger.prepare(task_id, stage["id"], action_id, intent)
+            prepared = ledger.prepare(task_id, stage["id"], action_id, intent)
+            action_id = prepared["action_id"]
             folder = self.store.root / "tasks" / task_id / "actions" / action_id
             _safe_state(folder)
             folder.mkdir(parents=True, exist_ok=True)
@@ -336,12 +425,15 @@ class WorkflowController:
                 return self._observe_action(task_id, stage, action, folder)
 
             observation = observe()
-            ledger.reconcile(action_id, observation)
-            if not observation["exists"]:
+            reconciled = ledger.reconcile(action_id, observation)
+            if reconciled["state"] == "UNKNOWN":
+                raise ValueError("External effect remains UNKNOWN; reconcile authoritative state before retry")
+            if reconciled["state"] == "ABSENT":
                 self._available(task_id, action.get("timeout", 300))
                 ledger.started(action_id)
                 execution = self._call(task_id, lambda timeout: self._execute_command(task_id, action,
                     action["argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"]), action.get("timeout", 300))
+                ledger.record_submission(action_id, execution)
                 observation = observe()
                 ledger.reconcile(action_id, observation)
                 if execution.get("exit_code") != 0 or not observation["exists"]:
@@ -350,15 +442,99 @@ class WorkflowController:
         return results
 
     def record_failure(self, task_id, stage_id, reasons):
+        return self._record_recovery(task_id, stage_id, reasons, failed=True)
+
+    def _record_recovery(self, task_id, stage_id, reasons, *, failed):
         root_id = self._root_task(task_id)
         with transaction(self.store.db) as db:
             record = read_record(db, "budget", root_id)
             value = record["payload"] or {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}}
-            key = task_id + ":" + stage_id + ":" + hash_value(sorted(set(reasons)))
-            value["failures"][key] = value["failures"].get(key, 0) + 1
+            recovery_record, history, groups = self._recovery_context(db, task_id, stage_id)
+            key = ":".join(groups) + ":" + hash_value(canonical_failures(history, groups, reasons))
+            inherited_failures = max(history["groups"][name].get("legacy_failures", 0) for name in groups)
+            value["failures"][key] = value["failures"].get(key, inherited_failures) + int(failed)
+            policy = self.tasks.snapshot(root_id)["contract"]["execution_policy"]
+            tokens = self._verified_progress(task_id, stage_id, history, groups)
+            newly_verified = sorted(set(tokens) - set(history["high_water"]))
+            history["high_water"] = sorted(set(history["high_water"]) | set(tokens))
+            for name in groups:
+                group = history["groups"][name]
+                if set(newly_verified) & group_tokens(name, group):
+                    group.update(stagnation=0, probe_pending=False, probe_inflight=None, diagnostic_inflight=None,
+                                 probe_authorization=None, stopped=False)
+                    group["progress_generation"] = group.get("progress_generation", 0) + 1
+                elif failed:
+                    group["stagnation"] += 1
+                    if group["probe_pending"] or group.get("probe_inflight"):
+                        group.update(stopped=True, probe_pending=False, probe_inflight=None, probe_authorization=None)
+                elif not failed:
+                    group["probe_inflight"] = None
+            stagnation = max(history["groups"][name]["stagnation"] for name in groups)
+            stopped = any(history["groups"][name]["stopped"] for name in groups)
+            history["events"].append({"task_id": task_id, "stage_id": stage_id, "reasons": reasons,
+                "failure_key": key, "newly_verified": newly_verified, "stagnation": stagnation, "stopped": stopped, "timestamp": now()})
+            if newly_verified:
+                history["events"][-1]["proof"] = {"checks": read_record(db, "checks", task_id)["payload"],
+                    "verification": {role: read_record(db, "verification", task_id + ":" + role)["payload"] for role in ("ac", "review")}}
+            write_record(db, "recovery", root_id, history, expected_revision=recovery_record["revision"])
             write_record(db, "budget", root_id, value, expected_revision=record["revision"])
-        limit = self.tasks.snapshot(root_id)["contract"]["execution_policy"]["repeat_failure_limit"]
-        return {"diagnostic_required": value["failures"][key] >= limit, "repetitions": value["failures"][key]}
+        diagnostic = (stagnation >= policy.get("stagnation_limit", 3) and not stopped if policy.get("recovery_mode", "fixed") == "progress"
+                      else value["failures"][key] >= policy["repeat_failure_limit"])
+        return {"diagnostic_required": diagnostic, "repetitions": value["failures"][key],
+                "stagnation": stagnation, "stopped": stopped, "newly_verified": newly_verified}
+
+    def _verified_progress(self, task_id, stage_id, history, groups):
+        """Credit only fresh evaluated original checks and independent judgments."""
+        task = self.tasks.snapshot(task_id)
+        contract, plan = task["contract"], self.tasks.execution_plan(task_id)
+        bundle = read_record(self.store.db, "checks", task_id)["payload"] or {}
+        source = source_snapshot(self.store, contract, task_id=task_id)
+        if (bundle.get("fingerprint") != source["fingerprint"] or bundle.get("contract_hash") != task["contract_hash"]
+                or bundle.get("plan_hash") != plan["plan_hash"] or bundle.get("workspace_id") != self.store.workspace_id
+                or bundle.get("source_changed_during_checks")):
+            return []
+        specs = stage_checks(contract, plan["checks"], stage_id)
+        profile = evaluate_contract_profiles(contract, specs, bundle.get("results", []), stage_id=stage_id)
+        checked = {key for key, result in profile["by_id"].items() if result["status"] == "PASS"}
+        case_tokens = original_case_progress(self.store, self._root_task(task_id), task_id, history, groups,
+                                            contract, stage_id, bundle, source, checked)
+        bindings = {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"],
+            "proposal_sha256": task["proposal_hash"], "plan_sha256": plan["plan_hash"],
+            "check_sha256": hash_value(bundle), "workspace_id": self.store.workspace_id}
+        roles, execution_ids, session_ids = {}, set(), set()
+        implementation = read_record(self.store.db, "implementation", task_id)["payload"] or {}
+        for role in ("ac", "review"):
+            receipt = read_record(self.store.db, "verification", task_id + ":" + role)["payload"] or {}
+            try:
+                if not Path(receipt["artifact_root"]).resolve().is_relative_to(self.store.root.resolve()):
+                    continue
+                verified = verify_receipt(receipt, expected_bindings=bindings)
+                execution_id, session_id = verified["execution_id"], verified["result"].get("session_id")
+                if (verified["evidence_kind"] != "independent_cli" or verified["result"].get("status") != "COMPLETE"
+                        or execution_id in execution_ids or execution_id == implementation.get("execution_id")
+                        or (session_id and session_id in session_ids)):
+                    continue
+                execution_ids.add(execution_id)
+                if session_id:
+                    session_ids.add(session_id)
+                roles[role] = verified["result"]["payload"]
+            except (ValueError, OSError, KeyError, TypeError):
+                continue
+        accepted = set()
+        criteria = roles.get("ac", {}).get("criteria", [])
+        if len({item.get("id") for item in criteria}) == len(criteria):
+            for ac in contract["acceptance"]:
+                matches = [item for item in criteria if item.get("id") == ac["id"]]
+                if len(matches) == 1:
+                    item = matches[0]
+                    if (item.get("status") == "PASS" and item.get("expected") == ac["expected"] and item.get("evidence")
+                            and item.get("method") and not item.get("missing_coverage")
+                            and set(ac["evidence_ids"]).issubset(checked)):
+                        accepted.add(ac["id"])
+        review = roles.get("review", {})
+        clean_review = bool(review.get("summary")) and isinstance(review.get("findings"), list) and all(
+            isinstance(finding, dict) and finding.get("severity") == "P3" for finding in review["findings"])
+        return sorted(set(progress_tokens(history, groups, contract, stage_id, checked, accepted, clean_review)) | case_tokens)
 
     def reserve_diagnostic(self, task_id, stage_id):
         root_id = self._root_task(task_id)
@@ -366,12 +542,110 @@ class WorkflowController:
             record = read_record(db, "budget", root_id)
             value = record["payload"] or {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}}
             key = task_id + ":" + stage_id
-            limit = self.tasks.snapshot(root_id)["contract"]["execution_policy"]["max_diagnostic_passes"]
-            if value["diagnostics"].get(key, 0) >= limit:
+            policy = self.tasks.snapshot(root_id)["contract"]["execution_policy"]
+            recovery_record, history, groups = self._recovery_context(db, task_id, stage_id)
+            count = max([value["diagnostics"].get(key, 0)] + [history["groups"][name]["diagnostics"] for name in groups])
+            limit = history["hard_limits"].get("max_diagnostic_passes")
+            if limit is not None and count >= limit:
                 raise ValueError("diagnostic budget exhausted")
-            value["diagnostics"][key] = value["diagnostics"].get(key, 0) + 1
+            if any(history["groups"][name].get("diagnostic_inflight") for name in groups):
+                raise ValueError("Unresolved diagnostic reservation requires fresh original progress")
+            reservation = {"id": uuid.uuid4().hex, "task_id": task_id, "stage_id": stage_id,
+                           "bindings": self._diagnostic_bindings(task_id), "status": "RUNNING",
+                           "generations": {name: history["groups"][name].get("progress_generation", 0) for name in groups}}
+            if policy.get("recovery_mode", "fixed") == "progress":
+                if any(history["groups"][name]["stopped"] or history["groups"][name]["diagnosed_generation"] == history["groups"][name].get("progress_generation", 0) for name in groups):
+                    raise ValueError("No verified progress since the prior diagnostic; automatic mutation is stopped")
+                for name in groups:
+                    group = history["groups"][name]
+                    group.update(diagnosed_generation=group.get("progress_generation", 0))
+            for name in groups:
+                history["groups"][name].update(diagnostics=count + 1, diagnostic_inflight=reservation,
+                                               probe_pending=False, probe_authorization=None)
+            value["diagnostics"][key] = count + 1
+            write_record(db, "recovery", root_id, history, expected_revision=recovery_record["revision"])
             write_record(db, "budget", root_id, value, expected_revision=record["revision"])
         return value["diagnostics"][key]
+
+    def _diagnostic_bindings(self, task_id):
+        task = self.tasks.snapshot(task_id)
+        checks = read_record(self.store.db, "checks", task_id)["payload"]
+        return {"fingerprint": source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"],
+            "contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"] or "unapproved",
+            "plan_sha256": self.tasks.execution_plan(task_id)["plan_hash"],
+            "check_sha256": hash_value(checks) if checks else "missing", "workspace_id": self.store.workspace_id}
+
+    @staticmethod
+    def _diagnostic_context(reservation):
+        return {"reservation_id": reservation.get("id"), "task_id": reservation.get("task_id"),
+            "stage_id": reservation.get("stage_id"), "groups": sorted(reservation.get("generations", {})),
+            "generations": reservation.get("generations", {})}
+
+    def _diagnostic_supported(self, receipt, bindings, reservation_context):
+        try:
+            if (not reservation_context or not reservation_context.get("reservation_id") or receipt.get("role") != "diagnostic"
+                    or not Path(receipt["artifact_root"]).resolve().is_relative_to(self.store.root.resolve())):
+                return False
+            verified = verify_receipt(receipt, expected_bindings=bindings)
+            captured = receipt["artifacts"]["request"]
+            data = Path(captured["path"]).read_bytes()
+            if hashlib.sha256(data).hexdigest() != captured["sha256"]:
+                return False
+            request = json.loads(data)
+            if (request.get("role") != "diagnostic" or request.get("schema") != DIAGNOSTIC_SCHEMA
+                    or request.get("handoff", {}).get("diagnostic_reservation") != reservation_context):
+                return False
+            result = verified["result"]
+            payload = result.get("payload", {})
+            return (result.get("status") == "COMPLETE" and bool(payload.get("cause", "").strip())
+                    and bool(payload.get("recommendation", "").strip()) and payload.get("requires_new_approval") is False)
+        except (ValueError, OSError, KeyError, TypeError, AttributeError):
+            return False
+
+    def _probe_authorized(self, task_id, stage_id, name, group):
+        permission = group.get("probe_authorization") or {}
+        return (permission.get("task_id") == task_id and permission.get("stage_id") == stage_id
+                and permission.get("generations", {}).get(name) == group.get("progress_generation", 0)
+                and permission.get("bindings") == self._diagnostic_bindings(task_id)
+                and self._diagnostic_supported(permission.get("receipt", {}), permission["bindings"], permission.get("reservation")))
+
+    def _complete_diagnostic(self, task_id, stage_id, diagnosis):
+        """Only captured supported completion can mint one durable probe permission."""
+        root_id = self._root_task(task_id)
+        with transaction(self.store.db) as db:
+            record, history, groups = self._recovery_context(db, task_id, stage_id)
+            reservations = [history["groups"][name].get("diagnostic_inflight") or {} for name in groups]
+            reservation = reservations[0]
+            receipt = diagnosis.get("receipt", {})
+            supported = (bool(reservation.get("id")) and all(item.get("id") == reservation["id"] for item in reservations)
+                and reservation.get("task_id") == task_id and reservation.get("stage_id") == stage_id
+                and reservation.get("status") == "RUNNING" and reservation.get("bindings") == self._diagnostic_bindings(task_id)
+                and all(reservation.get("generations", {}).get(name) == history["groups"][name].get("progress_generation", 0) for name in groups)
+                and self._diagnostic_supported(receipt, reservation["bindings"], self._diagnostic_context(reservation)))
+            permission = {"task_id": task_id, "stage_id": stage_id, "reservation_id": reservation.get("id"),
+                "bindings": reservation.get("bindings"), "receipt": receipt,
+                "generations": reservation.get("generations", {}), "reservation": self._diagnostic_context(reservation)}
+            for name in groups:
+                group = history["groups"][name]
+                if supported:
+                    group.update(diagnostic_inflight=None, probe_pending=True, probe_authorization=permission)
+                else:
+                    group.update(diagnostic_inflight={**reservation, "status": "FAILED"}, probe_pending=False,
+                                 probe_authorization=None, stopped=True)
+            history["events"].append({"task_id": task_id, "stage_id": stage_id, "timestamp": now(),
+                "diagnostic_reservation": reservation.get("id"), "supported": bool(supported), "receipt": receipt})
+            # Permission and its resumable coordinator phase are one commit.
+            # A crash after completion must not leave valid permission hidden
+            # behind the earlier DIAGNOSING checkpoint.
+            cycle_key = task_id + ":" + stage_id
+            cycle = read_record(db, "cycle", cycle_key)
+            task = self.tasks.snapshot(task_id)
+            write_record(db, "cycle", cycle_key, {**(cycle["payload"] or {}),
+                "phase": "REJECTED" if supported else "NEEDS_APPROVAL",
+                "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
+                "diagnostic_reservation_id": reservation.get("id")}, expected_revision=cycle["revision"])
+            write_record(db, "recovery", root_id, history, expected_revision=record["revision"])
+        return bool(supported)
 
     def request_stop(self, task_id, *, reason):
         from .journal import Journal
@@ -433,7 +707,10 @@ class WorkflowController:
                     if "access" not in action:
                         continue
                     action_id = hash_value({"task": task_id, "stage": stage["id"], "action": action["id"]})
-                    if read_record(self.store.db, "operation", action_id)["payload"]:
+                    intent = {"project_id": self.store.project_id, "workspace_id": self.store.workspace_id, "action": action, "effect_scope": stage["scope"]}
+                    operation = ledger.lookup(task_id, stage["id"], action_id, intent)
+                    if operation:
+                        action_id = operation["action_id"]
                         folder = self.store.root / "tasks" / task_id / "actions" / action_id
                         _safe_state(folder)
                         folder.mkdir(parents=True, exist_ok=True)
@@ -604,10 +881,22 @@ class WorkflowController:
         plan = self.tasks.execution_plan(task_id)
         check = read_record(self.store.db, "checks", task_id)["payload"]
         source = source_snapshot(self.store, task["contract"], task_id=task_id)
+        handoff = dict(handoff or {})
+        if role == "diagnostic":
+            history = read_record(self.store.db, "recovery", self._root_task(task_id))["payload"] or {}
+            reservations = {}
+            for group in history.get("groups", {}).values():
+                reservation = group.get("diagnostic_inflight") or {}
+                if (reservation.get("status") == "RUNNING" and reservation.get("task_id") == task_id
+                        and (handoff.get("stage_id") is None or handoff["stage_id"] == reservation.get("stage_id"))):
+                    reservations[reservation["id"]] = reservation
+            if len(reservations) != 1:
+                raise ValueError("Diagnostic request requires one current reservation and stage")
+            handoff["diagnostic_reservation"] = self._diagnostic_context(next(iter(reservations.values())))
         return {"role": role, "project": {"root": str(self.store.repo), "project_id": self.store.project_id}, "schema": schema,
                 "bindings": {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"] or "unapproved",
                              "plan_sha256": plan["plan_hash"], "check_sha256": hash_value(check) if check else "missing", "workspace_id": self.store.workspace_id},
-                "source_packet": self._packet(task_id), "handoff": handoff or {}}
+                "source_packet": self._packet(task_id), "handoff": handoff}
 
     def _runner(self, task_id):
         if self.runner is not None:
@@ -753,54 +1042,130 @@ class WorkflowController:
             ready = next(s for s in pending if set(s["depends_on"]).issubset({x["id"] for x in ordered}))
             ordered.append(ready)
             pending.remove(ready)
+        stage_blockers = {}
+        stage_results = {}
         for stage in ordered:
             stage_id = stage["id"]
+            try:
+                self._available(task_id, 1)
+                current = self.tasks.snapshot(task_id)
+                if current["state"] == "CANCELLED" or self.tasks.snapshot(self._root_task(task_id))["state"] == "CANCELLED":
+                    raise ValueError("Task is cancelled")
+                if current["contract_hash"] != task["contract_hash"] or current["proposal_hash"] != task["proposal_hash"]:
+                    raise ValueError("Approved task context changed; resume against current authority")
+            except ValueError as ex:
+                return {"status": "BLOCKED", "blocked_reasons": [str(ex)], "stage_blockers": stage_blockers, "stage_results": stage_results}
             done = read_record(self.store.db, "stage", task_id + ":" + stage_id)["payload"] or {}
             if done.get("state") == "COMPLETED" and done.get("contract_hash") == task["contract_hash"] and done.get("proposal_hash") == task["proposal_hash"]:
                 continue
             try:
                 self.tasks.require_approval(task_id, stage_id)
-            except ValueError:
+            except ValueError as ex:
+                stage_blockers[stage_id] = [str(ex)]
                 continue
-            if any((read_record(self.store.db, "stage", task_id + ":" + dep)["payload"] or {}).get("state") != "COMPLETED" for dep in stage["depends_on"]):
+            dependencies = {dep: read_record(self.store.db, "stage", task_id + ":" + dep)["payload"] or {} for dep in stage["depends_on"]}
+            missing_dependencies = [dep for dep, proof in dependencies.items() if proof.get("state") != "COMPLETED"
+                or proof.get("contract_hash") != task["contract_hash"] or proof.get("proposal_hash") != task["proposal_hash"]]
+            if missing_dependencies:
+                stage_blockers[stage_id] = ["Uncompleted stage dependencies: " + ", ".join(missing_dependencies)]
                 continue
             child_blockers = GateService(self.store).required_child_blockers(task_id, stage_id)
             if child_blockers:
-                return {"status": "BLOCKED", "blocked_reasons": child_blockers}
-            while True:
-                progress_key = task_id + ":" + stage_id
-                progress = read_record(self.store.db, "cycle", progress_key)["payload"] or {}
-                if (progress.get("phase") in {"DIAGNOSING", "NEEDS_APPROVAL"}
-                        and progress.get("proposal_hash") == task["proposal_hash"]):
-                    return {"status": "BLOCKED", "blocked_reasons": ["Diagnostic was interrupted or requires a revised approved proposal"]}
-                continuing = (resume and progress.get("phase") in {"CHECKING", "VERIFYING"}
-                              and progress.get("contract_hash") == task["contract_hash"]
-                              and progress.get("proposal_hash") == task["proposal_hash"])
-                if not continuing:
-                    try:
-                        self.reserve_cycle(task_id, stage_id)
-                    except ValueError as ex:
-                        return {"status": "BLOCKED", "blocked_reasons": [str(ex)], "task_id": task_id}
+                stage_blockers[stage_id] = child_blockers
+                continue
+            try:
+                verdict = self._run_stage(task, stage, runner, adapter, resume=resume)
+            except (ValueError, OSError, KeyError, TypeError) as ex:
+                from .core import redact
+                verdict = {"status": "BLOCKED", "blocked_reasons": [redact(ex)]}
+            if verdict is not None:
+                stage_results[stage_id] = verdict
+                stage_blockers[stage_id] = list(dict.fromkeys(verdict.get("blocked_reasons", []) + verdict.get("rejected_reasons", []))) or ["Stage did not complete"]
+            else:
+                stage_results[stage_id] = (read_record(self.store.db, "stage", task_id + ":" + stage_id)["payload"] or {}).get("gate", {"status": "APPROVED"})
+        incomplete = [s["id"] for s in ordered if (read_record(self.store.db, "stage", task_id + ":" + s["id"])["payload"] or {}).get("state") != "COMPLETED"]
+        if incomplete:
+            reasons = list(dict.fromkeys(reason for blockers in stage_blockers.values() for reason in blockers))
+            for stage_id, blockers in stage_blockers.items():
+                stage_results.setdefault(stage_id, {"status": "BLOCKED", "blocked_reasons": blockers})
+            original = stage_results.get(ordered[0]["id"], {}) if len(ordered) == 1 else {}
+            reasons += ["Remaining stage obligations: " + ", ".join(incomplete)]
+            return {**original, "status": "BLOCKED", "awaiting_approval": not stage_blockers,
+                    "stage_blockers": stage_blockers, "stage_results": stage_results, "reasons": reasons, "blocked_reasons": reasons}
+        full_gate = GateService(self.store).gate(task_id)
+        if full_gate["status"] == "APPROVED":
+            return full_gate
+        self.check(task_id)
+        return self.verify(task_id)
+
+    def _run_stage(self, task, stage, runner, adapter, *, resume):
+        """Settle one stage; the scheduler retains its blockers and runs independent work."""
+        task_id, stage_id = task["task_id"], stage["id"]
+        while True:
+            progress_key = task_id + ":" + stage_id
+            progress = read_record(self.store.db, "cycle", progress_key)["payload"] or {}
+            resume_verdict = None
+            if resume:
+                _, recovery, recovery_groups = self._recovery_context(self.store.db, task_id, stage_id)
+                stopped = any(recovery["groups"][name]["stopped"] or recovery["groups"][name].get("diagnostic_inflight")
+                    or (recovery["groups"][name]["probe_pending"] and not self._probe_authorized(task_id, stage_id, name, recovery["groups"][name])) for name in recovery_groups)
+                inflight = any(recovery["groups"][name].get("probe_inflight") for name in recovery_groups)
+                if stopped:
+                    # Explicit resume can observe a changed external artifact,
+                    # but does not replay actions or reserve another candidate.
+                    self.check(task_id, stage_id)
+                    progress = {"phase": "VERIFYING", "contract_hash": task["contract_hash"],
+                        "proposal_hash": task["proposal_hash"], "read_only_recovery": True, "resumed_progress": True}
+                    self._save("cycle", progress_key, progress)
                     current = self.tasks.snapshot(task_id)
-                    self.tasks.transition(task_id, "EXECUTING", expected_revision=current["revision"], reason="Executing approved stage " + stage_id)
-                    progress = {"phase": "IMPLEMENTING", "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"]}
+                    self.tasks.transition(task_id, "REVIEWING", expected_revision=current["revision"], reason="Read-only independent reassessment on explicit resume")
+                    resume_verdict = self.verify(task_id, stage_id)
+                    reconciled = self._record_recovery(task_id, stage_id, [], failed=False)
+                    if not reconciled["newly_verified"] and resume_verdict["status"] != "APPROVED":
+                        return {"status": "BLOCKED", "blocked_reasons": ["Corrective probe remains stopped; fresh read-only checks and independent verification established no new original progress",
+                            *resume_verdict.get("blocked_reasons", [])], "previous_gate": resume_verdict}
+                elif inflight or (progress.get("phase") == "IMPLEMENTING"
+                        and progress.get("contract_hash") == task["contract_hash"]
+                        and progress.get("proposal_hash") == task["proposal_hash"]):
+                    # Applying several edits and saving the next checkpoint
+                    # are not atomic. Assess actual artifacts, never resubmit
+                    # the reserved corrective probe after an interruption.
+                    progress.update(phase="VERIFYING", contract_hash=task["contract_hash"],
+                                    proposal_hash=task["proposal_hash"], read_only_recovery=True)
                     self._save("cycle", progress_key, progress)
-                    feedback = read_record(self.store.db, "gate", progress_key)["payload"]
-                    candidate = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "implementation", EDIT_SCHEMA,
-                        {"instruction": "Propose minimal approved-scope edits. Empty before_sha256 means a new file. Do not change requirements or proof state.",
-                         "stage": stage, "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
-                    self._save("implementation", task_id, candidate["receipt"])
-                    if candidate["result"]["status"] != "COMPLETE":
-                        return {"status": "BLOCKED", "blocked_reasons": [candidate["result"]["blocker"]]}
-                    if not read_record(self.store.db, "baseline_implementation", task_id)["payload"]:
-                        self._save("baseline_implementation", task_id, candidate["receipt"])
-                    self.tasks.require_approval(task_id, stage_id)
-                    self._available(task_id, 1)
-                    apply_edits(self.store.repo, stage["scope"], candidate["result"]["payload"]["edits"])
-                    progress.update(phase="CHECKING", fingerprint=source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"])
-                    self._save("cycle", progress_key, progress)
-                if progress["phase"] == "CHECKING":
-                    self.execute_actions(task_id, stage)
+            if (progress.get("phase") in {"DIAGNOSING", "NEEDS_APPROVAL"}
+                    and progress.get("proposal_hash") == task["proposal_hash"]):
+                return {"status": "BLOCKED", "blocked_reasons": ["Diagnostic was interrupted or requires a revised approved proposal"]}
+            continuing = (resume and progress.get("phase") in {"CHECKING", "VERIFYING"}
+                          and progress.get("contract_hash") == task["contract_hash"]
+                          and progress.get("proposal_hash") == task["proposal_hash"])
+            if not continuing:
+                try:
+                    reservation = self.reserve_cycle(task_id, stage_id)
+                except ValueError as ex:
+                    return {"status": "BLOCKED", "blocked_reasons": [str(ex)], "task_id": task_id}
+                current = self.tasks.snapshot(task_id)
+                self.tasks.transition(task_id, "EXECUTING", expected_revision=current["revision"], reason="Executing approved stage " + stage_id)
+                progress = {"phase": "IMPLEMENTING", "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
+                            "candidate_id": reservation["candidate_id"], "corrective_probe": reservation["corrective_probe"]}
+                self._save("cycle", progress_key, progress)
+                feedback = read_record(self.store.db, "gate", progress_key)["payload"]
+                candidate = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "implementation", EDIT_SCHEMA,
+                    {"instruction": "Propose minimal approved-scope edits. Empty before_sha256 means a new file. Do not change requirements or proof state.",
+                     "stage": stage, "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
+                self._save("implementation", task_id, candidate["receipt"])
+                if candidate["result"]["status"] != "COMPLETE":
+                    return {"status": "BLOCKED", "blocked_reasons": [candidate["result"]["blocker"]]}
+                if not read_record(self.store.db, "baseline_implementation", task_id)["payload"]:
+                    self._save("baseline_implementation", task_id, candidate["receipt"])
+                self.tasks.require_approval(task_id, stage_id)
+                self._available(task_id, 1)
+                apply_edits(self.store.repo, stage["scope"], candidate["result"]["payload"]["edits"])
+                progress.update(phase="CHECKING", fingerprint=source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"])
+                self._save("cycle", progress_key, progress)
+            if progress["phase"] == "CHECKING" and not progress.get("read_only_recovery"):
+                self.execute_actions(task_id, stage)
+            if resume_verdict is None:
                 current = self.tasks.snapshot(task_id)
                 self.tasks.transition(task_id, "VALIDATING", expected_revision=current["revision"], reason="Checking actual stage result")
                 # A fresh check also reconciles drift since an interrupted call;
@@ -811,41 +1176,40 @@ class WorkflowController:
                 current = self.tasks.snapshot(task_id)
                 self.tasks.transition(task_id, "REVIEWING", expected_revision=current["revision"], reason="Independent acceptance and review")
                 verdict = self.verify(task_id, stage_id)
-                if verdict["status"] == "APPROVED":
-                    self._capture_stage(task_id, stage_id, verdict)
-                    from .journal import Journal
-                    Journal(self.store).append({"kind": "stage_result", "task_id": task_id, "summary": "Verified stage " + stage_id, "status": "COMPLETED", "evidence_refs": ["stage:" + stage_id]}, event_key=task_id + ":" + stage_id + ":" + task["proposal_hash"])
-                    break
-                if verdict["blocked_reasons"]:
-                    return verdict
+            else:
+                # Rechecking here would invalidate the just-captured AC and
+                # review bindings; use this same read-only observation cycle.
+                verdict = resume_verdict
+            if verdict["status"] == "APPROVED":
+                self._record_recovery(task_id, stage_id, [], failed=False)
+                self._capture_stage(task_id, stage_id, verdict)
+                from .journal import Journal
+                Journal(self.store).append({"kind": "stage_result", "task_id": task_id, "summary": "Verified stage " + stage_id, "status": "COMPLETED", "evidence_refs": ["stage:" + stage_id]}, event_key=task_id + ":" + stage_id + ":" + task["proposal_hash"])
+                break
+            if verdict["blocked_reasons"]:
+                return verdict
+            progress.update(phase="REJECTED")
+            self._save("cycle", progress_key, progress)
+            resume = False
+            failure = self._record_recovery(task_id, stage_id, verdict["rejected_reasons"], failed=not progress.get("resumed_progress", False))
+            if failure["stopped"] and task["contract"]["execution_policy"].get("recovery_mode", "fixed") == "progress":
+                return {"status": "BLOCKED", "blocked_reasons": ["Corrective probe made no verified progress; automatic mutation is stopped"], "previous_gate": verdict}
+            if failure["diagnostic_required"]:
+                try:
+                    self.reserve_diagnostic(task_id, stage_id)
+                except ValueError as ex:
+                    return {"status": "BLOCKED", "blocked_reasons": [str(ex)]}
+                current = self.tasks.snapshot(task_id)
+                self.tasks.transition(task_id, "DIAGNOSING", expected_revision=current["revision"], reason="Repeated failure requires root-cause diagnosis")
+                progress.update(phase="DIAGNOSING")
+                self._save("cycle", progress_key, progress)
+                diagnosis = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "diagnostic", DIAGNOSTIC_SCHEMA,
+                    {"instruction": "Find the root cause from actual proof and prior feedback; do not propose new authority.", "failure": verdict, "stage_id": stage_id}),
+                    timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)), task["contract"]["execution_policy"]["diagnostic_timeout_seconds"])
+                self._save("diagnostic", task_id, diagnosis)
+                if not self._complete_diagnostic(task_id, stage_id, diagnosis):
+                    progress.update(phase="NEEDS_APPROVAL")
+                    self._save("cycle", progress_key, progress)
+                    return {"status": "BLOCKED", "blocked_reasons": ["Diagnostic requires a revised approved proposal"]}
                 progress.update(phase="REJECTED")
                 self._save("cycle", progress_key, progress)
-                resume = False
-                failure = self.record_failure(task_id, stage_id, verdict["rejected_reasons"])
-                if failure["diagnostic_required"]:
-                    try:
-                        self.reserve_diagnostic(task_id, stage_id)
-                    except ValueError as ex:
-                        return {"status": "BLOCKED", "blocked_reasons": [str(ex)]}
-                    current = self.tasks.snapshot(task_id)
-                    self.tasks.transition(task_id, "DIAGNOSING", expected_revision=current["revision"], reason="Repeated failure requires root-cause diagnosis")
-                    progress.update(phase="DIAGNOSING")
-                    self._save("cycle", progress_key, progress)
-                    diagnosis = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "diagnostic", DIAGNOSTIC_SCHEMA,
-                        {"instruction": "Find the root cause from actual proof and prior feedback; do not propose new authority.", "failure": verdict}),
-                        timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)), task["contract"]["execution_policy"]["diagnostic_timeout_seconds"])
-                    self._save("diagnostic", task_id, diagnosis)
-                    if diagnosis["result"]["status"] != "COMPLETE" or diagnosis["result"]["payload"]["requires_new_approval"]:
-                        progress.update(phase="NEEDS_APPROVAL")
-                        self._save("cycle", progress_key, progress)
-                        return {"status": "BLOCKED", "blocked_reasons": ["Diagnostic requires a revised approved proposal"]}
-                    progress.update(phase="REJECTED")
-                    self._save("cycle", progress_key, progress)
-        incomplete = [s["id"] for s in ordered if (read_record(self.store.db, "stage", task_id + ":" + s["id"])["payload"] or {}).get("state") != "COMPLETED"]
-        if incomplete:
-            return {"status": "BLOCKED", "awaiting_approval": True, "blocked_reasons": ["Remaining stage obligations: " + ", ".join(incomplete)]}
-        full_gate = GateService(self.store).gate(task_id)
-        if full_gate["status"] == "APPROVED":
-            return full_gate
-        self.check(task_id)
-        return self.verify(task_id)

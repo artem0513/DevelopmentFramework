@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from ase.credentials import CredentialVault
@@ -122,12 +123,34 @@ class CredentialIntegrationTests(unittest.TestCase):
         self.assertEqual(observation['access'], {'credential_ref':'lab','target':self.target,'revision':1})
         self.assertEqual((self.repo / 'resource.counter').read_text(), '1')
         key = hash_value({'task':task['task_id'],'stage':'work','action':'create-counter'})
-        OperationLedger(self.store).started(key)
+        with self.assertRaisesRegex(ValueError, 'replayed'):
+            OperationLedger(self.store).started(key)
         self.vault.update_secrets('lab',self.target,{'token':'rotated-fixture-secret'},1)
         result = self.controller.execute_actions(task['task_id'], stage)[0]
         self.assertEqual(result['access']['revision'], 2)
         self.assertEqual((self.repo / 'resource.counter').read_text(), '1')
         self.assertEqual(read_record(self.store.db,'operation',key)['payload']['state'], 'APPLIED')
+
+    def test_rotation_reconciles_a_real_lost_ack_without_replaying_effect(self):
+        task=self.create(self.contract('lost-ack-rotation',action=True));stage=task['contract']['stages'][0]
+        real_observe=self.controller._observe_action
+        calls=[]
+        def lost_postcondition(*args,**kwargs):
+            calls.append(1)
+            if len(calls)==2:
+                raise ValueError('Fixture lost postcondition acknowledgement')
+            return real_observe(*args,**kwargs)
+        with patch.object(self.controller,'_observe_action',side_effect=lost_postcondition):
+            with self.assertRaisesRegex(ValueError,'acknowledgement'):
+                self.controller.execute_actions(task['task_id'],stage)
+        key=hash_value({'task':task['task_id'],'stage':'work','action':'create-counter'})
+        self.assertEqual(read_record(self.store.db,'operation',key)['payload']['state'],'UNKNOWN')
+        self.assertEqual((self.repo/'resource.counter').read_text(),'1')
+        self.vault.update_secrets('lab',self.target,{'token':'rotated-fixture-secret'},1)
+        observation=self.controller.execute_actions(task['task_id'],stage)[0]
+        self.assertEqual(observation['access']['revision'],2)
+        self.assertEqual((self.repo/'resource.counter').read_text(),'1')
+        self.assertEqual(read_record(self.store.db,'operation',key)['payload']['state'],'APPLIED')
 
     def test_rejects_forged_stage_action_before_effect(self):
         task = self.create(self.contract('forged-task', action=True))

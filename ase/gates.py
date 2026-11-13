@@ -301,6 +301,8 @@ class GateService:
         current["high_risk_approved"] = bool(high and high.get("fingerprint") == source["fingerprint"] and high.get("contract_hash") == task["contract_hash"])
         result = evaluate_gate(task["contract"], current, receipts, [])
         extra = []
+        readiness = tasks.readiness(task_id, stage_id=stage_id)
+        extra.extend("Unresolved required source gap: " + gap["id"] for gap in readiness["required_source_gaps"])
         extra.extend(self._required_children(task_id, task["contract"], stage_id))
         approval = read_record(self.store.db, "approval", task_id)["payload"]
         if not task["contract"].get("parent_task_id") and (not approval or approval.get("proposal_hash") != task["proposal_hash"] or approval.get("contract_hash") != task["contract_hash"]):
@@ -362,25 +364,43 @@ class GateService:
                     and (stage_id is None or operation.get("stage_id") == stage_id)
                     and operation.get("state") not in {"APPLIED", "ABSENT"}):
                 extra.append("Uncertain external operation: " + operation["action_id"])
+        from .operations import OperationLedger
+        ledger = OperationLedger(self.store)
         for declared_stage in task["contract"]["stages"]:
             if stage_id is not None and declared_stage["id"] != stage_id:
                 continue
             for action in declared_stage.get("actions", []):
                 action_id = hash_value({"task": task_id, "stage": declared_stage["id"], "action": action["id"]})
-                operation = read_record(self.store.db, "operation", action_id)["payload"]
-                if (not operation or operation.get("intent", {}).get("action") != action
-                        or operation.get("intent", {}).get("project_id") != self.store.project_id
-                        or operation.get("intent", {}).get("workspace_id") != self.store.workspace_id):
+                intent = {"project_id": self.store.project_id, "workspace_id": self.store.workspace_id, "action": action, "effect_scope": declared_stage["scope"]}
+                try:
+                    operation = ledger.lookup(task_id, declared_stage["id"], action_id, intent)
+                except ValueError:
+                    operation = None
+                observation = (operation or {}).get("observation", {})
+                legacy_intent = {key: value for key, value in intent.items() if key != "effect_scope"}
+                same_legacy_intent = bool(operation and (operation.get("intent") == intent or (
+                    "effect_scope" not in operation.get("intent", {}) and operation.get("intent") == legacy_intent)))
+                legacy = bool(same_legacy_intent
+                              and operation.get("task_id") == task_id and operation.get("stage_id") == declared_stage["id"]
+                              and "action_hash" not in observation and "observing_workspace_id" not in observation)
+                observer_task = observation.get("observing_task_id", task_id if legacy else None)
+                bound = (observation.get("action_hash") == hash_value(action)
+                         and observation.get("observing_workspace_id") == self.store.workspace_id)
+                try:
+                    same_root = bool(observer_task and ledger.root_task_id(observer_task) == ledger.root_task_id(task_id))
+                except ValueError:
+                    same_root = False
+                if not operation or not (legacy or bound) or not same_root:
                     extra.append("Action evidence is missing or stale: " + action["id"])
-                elif "access" in action:
-                    extra.extend(access_blockers(action["access"], operation.get("observation", {}).get("access"), "action-" + action["id"]))
-                    observation = operation.get("observation", {})
+                else:
+                    if "access" in action:
+                        extra.extend(access_blockers(action["access"], observation.get("access"), "action-" + action["id"]))
                     if operation.get("state") != "APPLIED" or observation.get("exists") is not True:
                         extra.append("Action postcondition is not established: " + action["id"])
                     try:
                         path, expected_hash = observation["proof_ref"].rsplit("#sha256=", 1)
                         path = Path(path)
-                        required = self.store.root / "tasks" / task_id / "actions" / action_id
+                        required = self.store.root / "tasks" / observer_task / "actions" / operation["action_id"]
                         if (path.is_symlink() or not path.resolve().is_relative_to(required.resolve())
                                 or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash):
                             raise ValueError("Invalid observation proof")

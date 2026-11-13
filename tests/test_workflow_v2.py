@@ -31,7 +31,9 @@ class WorkflowTests(unittest.TestCase):
         self.store = Store(work, root / "state")
         self.addCleanup(self.store.close)
         self.tasks = TaskService(self.store)
-        task = self.tasks.create(contract())
+        legacy = contract()
+        legacy["execution_policy"] = {"recovery_mode": "fixed"}
+        task = self.tasks.create(legacy)
         task = self.tasks.propose(task["task_id"], {"summary": "Create guide; publication deferred", "stage_ids": ["draft"]}, expected_revision=task["revision"])
         self.tasks.approve(task["task_id"], proposal_hash=task["proposal_hash"], user_message_ref="chat:approved", approved_stage_ids=["draft"])
         self.controller = WorkflowController(self.store, runner=None)

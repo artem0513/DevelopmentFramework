@@ -1,7 +1,7 @@
 """Deterministic, domain-specific evaluation of recorded evidence."""
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .state import identifier, text
 
@@ -95,6 +95,20 @@ def validate_evidence_spec(spec, profile):
         raise ValueError("Unknown evidence kind: " + str(spec.get("kind")))
     if type(spec.get("required", True)) is not bool:
         raise ValueError("Evidence required must be boolean")
+    if "progress_test_sources" in spec:
+        paths = spec["progress_test_sources"]
+        if (spec["kind"] != "test" or not isinstance(paths, list) or not paths or len(paths) > 1000
+                or any(not isinstance(value, str) for value in paths) or len(set(paths)) != len(paths)):
+            raise ValueError("Case progress requires an explicit nonempty test-source boundary")
+        from .project_local import is_private_path
+        for value in paths:
+            text(value, "test source path", limit=2000)
+            normalized = value.replace("\\", "/")
+            if (normalized.startswith("/") or Path(normalized).is_absolute() or PureWindowsPath(value).drive
+                    or ":" in normalized.split("/", 1)[0] or ".." in Path(normalized).parts
+                    or any(part.lower() == ".git" for part in Path(normalized).parts)
+                    or is_private_path(normalized)):
+                raise ValueError("Progress test sources must remain in public project source")
     evaluator = spec.get("evaluator", spec["kind"])
     if evaluator not in EVIDENCE_KINDS | {"hash", "structured_probe", "command_receipt", "manual_attestation"}:
         raise ValueError("Unknown evidence evaluator: " + str(evaluator))

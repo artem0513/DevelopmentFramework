@@ -68,10 +68,12 @@
   "assumptions": [],
   "sources": [],
   "execution_policy": {
-    "max_stage_cycles": 3,
-    "max_task_cycles": 12,
+    "recovery_mode": "progress",
+    "stagnation_limit": 3,
+    "max_stage_cycles": null,
+    "max_task_cycles": null,
     "repeat_failure_limit": 2,
-    "max_diagnostic_passes": 1,
+    "max_diagnostic_passes": null,
     "diagnostic_timeout_seconds": 1200,
     "active_time_budget_seconds": null,
     "backend": "codex"

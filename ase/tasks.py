@@ -12,8 +12,9 @@ from .projects import _safe_state
 STATES = {"DRAFT", "RESEARCHING", "AWAITING_APPROVAL", "READY", "EXECUTING", "VALIDATING",
           "REVIEWING", "DIAGNOSING", "BLOCKED", "PAUSED", "COMPLETED", "CANCELLED"}
 PROFILES = {"software", "infrastructure", "document", "research", "mixed"}
-DEFAULT_POLICY = {"max_stage_cycles": 3, "max_task_cycles": 12, "repeat_failure_limit": 2,
-                  "max_diagnostic_passes": 1, "diagnostic_timeout_seconds": 1200,
+DEFAULT_POLICY = {"recovery_mode": "progress", "stagnation_limit": 3,
+                  "max_stage_cycles": None, "max_task_cycles": None, "repeat_failure_limit": 2,
+                  "max_diagnostic_passes": None, "diagnostic_timeout_seconds": 1200,
                   "active_time_budget_seconds": None, "backend": "codex"}
 
 
@@ -143,7 +144,18 @@ def validate_contract_v2(value):
     if not isinstance(supplied, dict) or set(supplied) - set(DEFAULT_POLICY):
         raise ValueError("Unknown execution_policy field")
     policy.update(supplied)
-    for key in ("max_stage_cycles", "max_task_cycles", "repeat_failure_limit", "max_diagnostic_passes", "diagnostic_timeout_seconds"):
+    if "recovery_mode" not in supplied and any(supplied.get(key) is not None
+            for key in ("max_stage_cycles", "max_task_cycles", "max_diagnostic_passes")):
+        policy["recovery_mode"] = "fixed"
+    if policy["recovery_mode"] not in {"fixed", "progress"}:
+        raise ValueError("Invalid recovery mode")
+    if policy["recovery_mode"] == "fixed":
+        for key, default in (("max_stage_cycles", 3), ("max_task_cycles", 12), ("max_diagnostic_passes", 1)):
+            if key not in supplied:
+                policy[key] = default
+    for key in ("max_stage_cycles", "max_task_cycles", "repeat_failure_limit", "max_diagnostic_passes", "diagnostic_timeout_seconds", "stagnation_limit"):
+        if key in {"max_stage_cycles", "max_task_cycles", "max_diagnostic_passes"} and policy[key] is None and policy["recovery_mode"] == "progress":
+            continue
         if type(policy[key]) is not int or not 1 <= policy[key] <= (3600 if key.endswith("seconds") else 100):
             raise ValueError("Invalid execution policy " + key)
     budget = policy["active_time_budget_seconds"]
@@ -214,7 +226,17 @@ class TaskService:
 
     def revise(self, task_id, contract, *, expected_revision):
         """A changed goal creates a new version and requires a fresh proposal."""
-        c = validate_contract_v2(contract)
+        if not isinstance(contract, dict) or not isinstance(contract.get("execution_policy", {}), dict):
+            raise ValueError("Task revision and execution policy must be objects")
+        incoming = copy.deepcopy(contract)
+        current = self.snapshot(task_id)
+        if not current["legacy_v1"]:
+            policy = copy.deepcopy(current["contract"]["execution_policy"])
+            policy.update(incoming.get("execution_policy", {}))
+            if "recovery_mode" not in policy:
+                policy["recovery_mode"] = "fixed"
+            incoming["execution_policy"] = policy
+        c = validate_contract_v2(incoming)
         supplied_id = c.pop("id", task_id)
         if supplied_id != task_id:
             raise ValueError("Revision cannot change task identity")
@@ -256,7 +278,11 @@ class TaskService:
                 write_record(db, "budget", task_id, budget, expected_revision=current_budget["revision"])
             if legacy_budget:
                 for key in ("max_stage_cycles", "max_task_cycles"):
-                    c["execution_policy"][key] = min(c["execution_policy"][key], legacy_budget["max_attempts"])
+                    ceiling = c["execution_policy"][key]
+                    c["execution_policy"][key] = min(ceiling, legacy_budget["max_attempts"]) if ceiling is not None else legacy_budget["max_attempts"]
+                c["execution_policy"]["recovery_mode"] = "fixed"
+                if c["execution_policy"]["max_diagnostic_passes"] is None:
+                    c["execution_policy"]["max_diagnostic_passes"] = 1
             if c.get("parent_task_id") != task["contract"].get("parent_task_id") or c.get("parent_stage_id") != task["contract"].get("parent_stage_id"):
                 raise ValueError("Revision cannot change parent authority")
             if c.get("parent_task_id"):
@@ -278,16 +304,41 @@ class TaskService:
             write_record(db, "task_version", task_id + ":" + str(expected_revision + 1), payload, expected_revision=0)
         return self.snapshot(task_id)
 
-    def readiness(self, task_id):
+    def readiness(self, task_id, stage_id=None):
         task = self.snapshot(task_id)
         row = self.store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
         discovery = json.loads(row[0]) if row else None
         intake = (discovery or {}).get("intake", {})
         gaps = [g for g in [*intake.get("gaps", []), *intake.get("contradictions", [])] if g.get("required", True) and g.get("status", "UNRESOLVED").upper() not in {"RESOLVED", "CONFIRMED"}]
         known = {u["id"] for u in task["contract"].get("unknowns", [])}
+        if stage_id is not None:
+            stages = task["contract"]["stages"]
+            if stage_id not in {stage["id"] for stage in stages}:
+                raise ValueError("Unknown readiness stage")
+            relevant = []
+            for gap in gaps:
+                affected = gap.get("blocking_stage_ids")
+                if affected is None:
+                    unknown = next((u for u in task["contract"].get("unknowns", []) if u["id"] == gap["id"]), None)
+                    if unknown and unknown.get("status", "UNRESOLVED") == "UNRESOLVED":
+                        affected = set(unknown.get("blocking_stage_ids", [])) | {
+                            stage["id"] for stage in stages if gap["id"] in stage.get("unknown_ids", [])}
+                if not affected or not set(affected).issubset({stage["id"] for stage in stages}):
+                    relevant.append(gap)
+                    continue
+                affected = set(affected)
+                while True:
+                    expanded = affected | {stage["id"] for stage in stages if set(stage.get("depends_on", [])) & affected}
+                    if expanded == affected:
+                        break
+                    affected = expanded
+                if stage_id in affected:
+                    relevant.append(gap)
+            gaps = relevant
         return {"discovery_present": bool(row), "required_source_gaps": gaps,
                 "untracked_gap_ids": [g["id"] for g in gaps if g["id"] not in known],
-                "clarity": "BLOCKED" if gaps else "SCOPED" if row else "UNASSESSED"}
+                "clarity": "BLOCKED" if gaps else "SCOPED" if row else "UNASSESSED",
+                "semantic_validation": False}
 
     def propose(self, task_id, proposal, *, expected_revision):
         if not isinstance(proposal, dict) or set(proposal) - {"summary", "stage_ids", "business", "technical", "steps", "verification", "limitations", "assumptions"}:
@@ -342,8 +393,18 @@ class TaskService:
 
     @staticmethod
     def _check_unknowns(task, stage):
+        stages = task["contract"]["stages"]
         for unknown in task["contract"]["unknowns"]:
-            if unknown.get("status", "UNRESOLVED") == "UNRESOLVED" and (stage["id"] in unknown.get("blocking_stage_ids", []) or unknown["id"] in stage["unknown_ids"]):
+            affected = set(unknown.get("blocking_stage_ids", [])) | {
+                candidate["id"] for candidate in stages if unknown["id"] in candidate.get("unknown_ids", [])}
+            if not affected or not affected.issubset({candidate["id"] for candidate in stages}):
+                affected = {candidate["id"] for candidate in stages}
+            while True:
+                expanded = affected | {candidate["id"] for candidate in stages if set(candidate.get("depends_on", [])) & affected}
+                if expanded == affected:
+                    break
+                affected = expanded
+            if unknown.get("status", "UNRESOLVED") == "UNRESOLVED" and stage["id"] in affected:
                 raise ValueError("Unresolved unknown blocks stage: " + unknown["id"])
 
     def require_approval(self, task_id, stage_id, *, allow_terminal=False):
@@ -368,13 +429,11 @@ class TaskService:
               or stage_id not in approval["approved_stage_ids"]):
             raise ValueError("Current stage requires explicit approval")
         self._check_unknowns(task, stages[stage_id])
-        readiness = self.readiness(task_id)
+        readiness = self.readiness(task_id, stage_id=stage_id)
         if readiness["untracked_gap_ids"]:
             raise ValueError("Required source gaps need explicit stage obligations: " + ", ".join(readiness["untracked_gap_ids"]))
-        for gap in readiness["required_source_gaps"]:
-            unknown = next(u for u in task["contract"]["unknowns"] if u["id"] == gap["id"])
-            if unknown.get("status", "UNRESOLVED") != "UNRESOLVED" or not unknown.get("blocking_stage_ids"):
-                raise ValueError("An unresolved source gap cannot be silently closed: " + gap["id"])
+        if readiness["required_source_gaps"]:
+            raise ValueError("Unresolved source gaps block stage: " + ", ".join(gap["id"] for gap in readiness["required_source_gaps"]))
         if not allow_terminal and task["state"] in {"CANCELLED", "COMPLETED"}:
             raise ValueError("Task is terminal")
         return task

@@ -6,7 +6,7 @@ from pathlib import Path
 import test_credential_integration as fixtures
 from ase.gates import GateService
 from ase.state import transaction
-from ase.state import hash_value, read_record
+from ase.state import hash_value, read_record, write_record
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires actual Windows DPAPI')
@@ -44,6 +44,31 @@ class CompletedAccessRevalidationTests(unittest.TestCase):
         f.controller.check(task['task_id'])
         reasons = GateService(f.store).gate(task['task_id'])['reasons']
         self.assertFalse(any('Credential evidence' in reason and 'create-counter' in reason for reason in reasons), reasons)
+        self.assertEqual((f.repo / 'resource.counter').read_text(), '1')
+        self.assertEqual(f.tasks.snapshot(task['task_id'])['state'], 'COMPLETED')
+
+    def test_completed_legacy_applied_action_refreshes_after_rotation_without_replay(self):
+        f = self.fixture
+        task = f.create(f.contract('legacy-action', action=True))
+        f.controller.execute_actions(task['task_id'], task['contract']['stages'][0])
+        action_id = hash_value({'task':task['task_id'], 'stage':'work', 'action':'create-counter'})
+        record = read_record(f.store.db, 'operation', action_id)
+        operation = dict(record['payload'])
+        operation.pop('effect_scope', None)
+        operation['intent'] = dict(operation['intent'])
+        operation['intent'].pop('effect_scope', None)
+        operation['intent_hash'] = hash_value(operation['intent'])
+        with transaction(f.store.db) as db:
+            write_record(db, 'operation', action_id, operation, expected_revision=record['revision'])
+        self.completed_fixture(task)
+        f.vault.update_secrets('lab', f.target, {'token':'new-legacy-fixture-token'}, 1)
+        f.controller.check(task['task_id'])
+        reasons = GateService(f.store).gate(task['task_id'])['reasons']
+        self.assertFalse(any('Credential evidence' in reason and 'create-counter' in reason for reason in reasons), reasons)
+        stored = read_record(f.store.db, 'operation', action_id)['payload']
+        self.assertNotEqual(stored['observation']['proof_ref'], operation['observation']['proof_ref'])
+        self.assertNotIn('effect_scope', stored)
+        self.assertNotIn('effect_scope', stored['intent'])
         self.assertEqual((f.repo / 'resource.counter').read_text(), '1')
         self.assertEqual(f.tasks.snapshot(task['task_id'])['state'], 'COMPLETED')
 

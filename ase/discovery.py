@@ -95,7 +95,10 @@ def validate_intake(payload):
     for key in sorted(_INTAKE_LISTS):
         items = value.setdefault(key, [])
         for item in _list(items, key):
-            _object(item, {"id", "text", "source_refs", "required", "timestamp", "status"}, key)
+            allowed = {"id", "text", "source_refs", "required", "timestamp", "status"}
+            if key in {"gaps", "contradictions"}:
+                allowed.add("blocking_stage_ids")
+            _object(item, allowed, key)
             _text(item.get("id"), key + ".id", 200)
             _text(item.get("text"), key + ".text")
             if item["id"] in claim_ids:
@@ -108,6 +111,12 @@ def validate_intake(payload):
                 raise ValueError("required must be boolean")
             if key == "gaps":
                 item.setdefault("required", True)
+            if "blocking_stage_ids" in item:
+                stages = _list(item["blocking_stage_ids"], "blocking_stage_ids")
+                if not stages or any(not isinstance(stage, str) for stage in stages) or len(set(stages)) != len(stages):
+                    raise ValueError("Gap stage mapping requires distinct nonempty stage IDs")
+                for stage in stages:
+                    _text(stage, "gap stage", 200)
             for field in ("timestamp", "status"):
                 if field in item:
                     _text(item[field], key + "." + field, 1000)
@@ -563,6 +572,50 @@ def record_discovery(store, task_id, payload, *, expected_revision):
     try:
         if db.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
             raise ValueError("Unknown task in this project: " + task_id)
+        previous = db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
+        previous_intake = json.loads(previous[0]).get("intake") if previous else None
+        if previous_intake:
+            if "intake" not in value:
+                value["intake"] = copy.deepcopy(previous_intake)
+            else:
+                newer = value["intake"]
+                updated_gaps = {item["id"]: item for item in [*newer.get("gaps", []), *newer.get("contradictions", [])]}
+                old_sources = {source["id"]: source for source in previous_intake["source_refs"]}
+                new_sources = {source["id"]: source for source in newer["source_refs"]}
+                for gap in [*previous_intake.get("gaps", []), *previous_intake.get("contradictions", [])]:
+                    if not gap.get("required", True) or gap.get("status", "UNRESOLVED").upper() in {"RESOLVED", "CONFIRMED"}:
+                        continue
+                    replacement = updated_gaps.get(gap["id"])
+                    if replacement is None:
+                        raise ValueError("An open required source gap cannot be dropped: " + gap["id"])
+                    if not replacement.get("required", True):
+                        raise ValueError("A required source gap needs explicit resolution: " + gap["id"])
+                    resolved = replacement.get("status", "UNRESOLVED").upper() in {"RESOLVED", "CONFIRMED"}
+                    old_mapping, new_mapping = gap.get("blocking_stage_ids"), replacement.get("blocking_stage_ids")
+                    narrowed = new_mapping is not None and (old_mapping is None or not set(old_mapping).issubset(new_mapping))
+                    evidence_changed = any(source_id not in old_sources or any(
+                        old_sources[source_id].get(field) != new_sources[source_id].get(field)
+                        for field in ("kind", "reference", "timestamp", "lines", "status"))
+                        for source_id in replacement["source_refs"])
+                    if (resolved or narrowed) and not evidence_changed:
+                        raise ValueError("Resolving or narrowing a source gap requires new attributed evidence: " + gap["id"])
+        from .tasks import TaskService
+        intake = value.get("intake", {})
+        mapped_gaps = [gap for gap in [*intake.get("gaps", []), *intake.get("contradictions", [])]
+                       if "blocking_stage_ids" in gap]
+        contract = TaskService(store).snapshot(task_id)["contract"] if mapped_gaps else {}
+        stages = contract.get("stages", [])
+        stage_ids = {stage["id"] for stage in stages}
+        for gap in mapped_gaps:
+            mapped = set(gap["blocking_stage_ids"])
+            if not mapped.issubset(stage_ids):
+                raise ValueError("Gap mapping references an unknown stage")
+            unknown = next((u for u in contract.get("unknowns", []) if u["id"] == gap["id"]), None)
+            if unknown:
+                declared = set(unknown.get("blocking_stage_ids", [])) | {
+                    stage["id"] for stage in stages if gap["id"] in stage.get("unknown_ids", [])}
+                if mapped != declared:
+                    raise ValueError("Gap stage mapping conflicts with contract obligations")
         current = db.execute("SELECT COALESCE(MAX(revision),0) FROM task_discoveries WHERE task_id=?", (task_id,)).fetchone()[0]
         if current != expected_revision:
             raise ValueError("Stale discovery revision; reload and reconcile before saving")

@@ -8,8 +8,10 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from ase.access import CredentialAccess
+from ase.access import capture_process as actual_capture_process
 from ase.credentials import CredentialVault, CredentialError
 
 
@@ -204,8 +206,11 @@ else:
 
     def test_http_cancel_stops_owned_worker_and_socket(self):
         disconnected = threading.Event()
+        connected = threading.Event()
+        connected_at = []
         class Slow(BaseHTTPRequestHandler):
             def do_GET(self):
+                connected_at.append(time.monotonic()); connected.set()
                 self.send_response(200); self.send_header('Content-Length', '100000'); self.end_headers()
                 for _ in range(1000):
                     try: self.wfile.write(b'x' * 100); self.wfile.flush(); time.sleep(.01)
@@ -219,14 +224,27 @@ else:
         owner = threading.get_ident(); started = time.monotonic(); callback_threads = []
         def cancel():
             callback_threads.append(threading.get_ident())
-            return time.monotonic() - started > .3
-        with self.assertRaises(CredentialError) as error:
+            return connected.is_set() and time.monotonic() - connected_at[0] > .1
+        def slow_start(*args,**kwargs):
+            time.sleep(.4)
+            return actual_capture_process(*args,**kwargs)
+        with patch('ase.access.capture_process',side_effect=slow_start), self.assertRaises(CredentialError) as error:
             self.access.request('cancel-http', target, timeout=5, cancel_requested=cancel)
         self.assertEqual(error.exception.code, 'cancelled')
         self.assertTrue(callback_threads)
         self.assertEqual(set(callback_threads), {owner})
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertTrue(connected.is_set())
+        self.assertLess(time.monotonic() - connected_at[0], 1.5)
         self.assertTrue(disconnected.wait(2))
+
+    def test_http_cancel_before_start_does_not_require_a_socket(self):
+        target='http://127.0.0.1:1'
+        self.import_profiles([{'id':'pre-cancel','target':target,'kind':'http-bearer','secrets':{'token':'fake-pre-cancel'},'env':{}}])
+        with patch('ase.access.capture_process') as start:
+            with self.assertRaises(CredentialError) as error:
+                self.access.request('pre-cancel',target,timeout=5,cancel_requested=lambda:True)
+        self.assertEqual(error.exception.code,'cancelled')
+        start.assert_not_called()
 
     def test_http_auth_failures_are_typed_without_exposing_response_body(self):
         class Rejected(BaseHTTPRequestHandler):

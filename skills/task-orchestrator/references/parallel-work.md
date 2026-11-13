@@ -18,7 +18,7 @@ A graph may reveal **1 → 4 → 1 → 5** logical ready sets: one prerequisite,
 
 For mutations use separate authorized workspaces with exclusive write ownership, or have agents return proposed edits for the lead to apply. Shared-root runtime mutations remain serialized even for disjoint filenames. Preserve root execution leases, CAS, operation reconciliation and receipt bindings; do not launch conflicting `ase run`/check/verify calls or bypass a root lock. Integrate at dependency barriers and run final affected tests and independent reviews against the combined current result.
 
-Reuse the original approved scope and persisted root/stage budgets. Decomposition, additional agents, new waves and session changes cannot reset limits or create new external authority. New material outcome, resource, cost/risk or authorization changes still follow questions-and-approval.
+Reuse original-assignment authorization, persisted recovery history for each underlying problem and any explicit root/stage limits. Decomposition, aliases, additional agents, new waves and session changes cannot reset unsuccessful-cycle/diagnostic/probe history or create external authority. A delegate's new prose is not verified progress. New material outcome, serious architecture, resource, cost/risk or authorization changes still follow questions-and-approval.
 
 Native advisory answers help investigation and integration. They are not formal acceptance/code-review evidence unless a genuine independent Runner execution captured the required receipt for the current source/contract/plan/check bindings. Optional native delegation and formal independent verification are separate capabilities; serial fallback does not waive mandatory verification.
 

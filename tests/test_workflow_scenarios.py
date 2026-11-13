@@ -51,6 +51,9 @@ class WorkflowScenarioTests(unittest.TestCase):
 
     def test_root_twelve_cycles_cover_children_and_survive_reopen_and_revision(self):
         original = document_contract('root-task')
+        # Isolate the global ceiling: delegates now share the underlying stage
+        # allowance, so this scenario explicitly gives that obligation12 cycles.
+        original['execution_policy'] = {'recovery_mode': 'fixed', 'max_stage_cycles': 12}
         self.approve(original)
         controller = WorkflowController(self.store)
         for child_number in range(4):
