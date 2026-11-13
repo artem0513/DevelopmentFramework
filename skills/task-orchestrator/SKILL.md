@@ -5,6 +5,8 @@ description: "Use when a managed software, infrastructure, document, research or
 
 # Managed task workflow
 
+For comparisons, blockers, dependencies, actionable artifacts, semantic changes or disputed review findings, apply relevant [evidence decisions](references/evidence-decisions.md). Confirm target/reference authority, required readiness and current artifact purpose/version. Preserve required semantics and substantiate findings through actual callees/evidence before repair. Clear tasks need no new questionnaire or approval.
+
 Use only in a project or workspace that explicitly adopted DevelopmentFramework. Adoption covers managed software, infrastructure, documents, research and mixed work; select the profile from the actual action. A financial report with warnings is a document or research task. A requested fix to its generator is software. Ordinary questions use their domain workflow without creating a managed task.
 
 Read task-intake for new assignments and task-discovery before proposing implementation. Its scoped search for existing project examples is the default; an explicit user opt-out skips that search and example reuse, including cached/delegated examples. Preserve that choice before retrieving pattern records; necessary target/dependency inspection remains. Restore an existing task with `ase --project PROJECT restore TASK` before replacing it. Local SQLite records, sources and checkpoints are shared across backends on this computer and isolated by project identity.

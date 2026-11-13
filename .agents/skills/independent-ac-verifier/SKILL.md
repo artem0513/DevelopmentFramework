@@ -5,6 +5,8 @@ description: "Use when a managed task needs a separate acceptance judgment again
 
 # Independent acceptance
 
+Apply relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md): actual target/reference authority, required dependency postconditions and current artifact purpose/version. For migration/optimization assess meaningful equivalence and relevant boundaries/preexisting ambiguity. Metadata or prepared drafts are not consumer/execution evidence. Missing relevant code is a coverage gap to investigate or disclose; it does not establish absent behavior.
+
 Act in a separate session from implementation. Read the original request and sources, approved proposal/stages, acceptance obligations, current artifacts and actual executed evidence. Inspect the delivered result directly; an implementation summary is only a locator.
 
 For each criterion report its ID, expected behavior, source/evidence references, verification method, PASS/FAIL/UNVERIFIED/BLOCKED/NOT_APPLICABLE, limitations and missing coverage. Mandatory unexecuted checks cannot PASS. Do not weaken acceptance to fit the implementation or infer a real resource/document/model run from a fixture.

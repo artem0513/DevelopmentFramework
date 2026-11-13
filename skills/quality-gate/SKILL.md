@@ -5,6 +5,8 @@ description: "Use when current managed-task evidence must determine completion r
 
 # Evidence gate
 
+Apply relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md) in independent judgments: required readiness, current artifact purpose/state/version, bounded claims and meaningful semantic checks. Preparing a script or observing an object is not evidence of execution or required consumer behavior. The runtime gate validates configured evidence; these semantic rules still need actual independent assessment.
+
 Run `ase --project PROJECT gate TASK` and `report TASK`. Only current source/contract/execution-plan evidence can authorize COMPLETED; session closure and process exit zero do not imply approval. Respect the configured acceptance profile and parent coverage for mixed work.
 
 Software retains successful mandatory commands, positive executed test counts, no skipped required tests, independent AC/code review and no P0/P1/P2 findings. P3 is advisory. Other profiles still require executable facts or explicitly specified confirmations and separate substantive judgments, rather than software-shaped placeholders. Reject stale, missing, expired, tampered or forged evidence.

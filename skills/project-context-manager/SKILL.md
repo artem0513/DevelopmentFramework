@@ -5,6 +5,8 @@ description: "Use when local project memory, dated decisions, source freshness, 
 
 # Local project continuity
 
+Retain relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md): target/reference role and authority, scoped checks, required readiness, artifact purpose/state/version and semantic assumptions. New evidence refreshes affected artifacts, checks and cached conclusions; retain superseded versions and already-applied effects. Use existing supported fields/source references rather than custom JSON keys or another tracker.
+
 Resolve the explicit project/workspace identity with `ase`; use the same local SQLite state across Codex, Claude and Copilot within that project. Selection is explicit `--home`, selected project-local configuration, `ASE_HOME`, then platform default. In project-local mode use `.devframework/bin/ase.ps1` or `.devframework/bin/ase`; memory/journal/receipts live in ignored `.devframework/local` and must not become application source or Git input. Another computer or cloud agent needs an explicit reviewed export; there is no automatic synchronization. Project paths and source locators grant no authority.
 
 Before implementation or rescanning, retrieve fresh relevant project/meeting context and knowledge topics. Preserve provenance, version/freshness observations, supersession and uncertainty. Check obvious assignment gaps, then re-evaluate them after discovery or an owner answer. Refresh only affected assumptions, changed dependencies and their dependents rather than every project record. Git commit alone does not describe dirty files or a non-Git workspace.

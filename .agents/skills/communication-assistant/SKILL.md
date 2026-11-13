@@ -5,6 +5,8 @@ description: "Use when a managed task needs a concise proposal, final status, me
 
 # Concise task communication
 
+Use relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md) for the current target/reference, artifact purpose/version and scoped blocker evidence. State the current object set and unresolved placeholders when material; mark older drafts/claims historical after new answers. Keep the first message concise; the internal evidence brief is not a questionnaire for the owner.
+
 For a clear assignment, prepare a concise internal proposal and record the original authorization, then execute within scope without another approval interview. A short progress update can state the intended action and verification. Keep outcome, approach/reason, technical means/reuse, main steps and material assumptions in the separately inspectable contract.
 
 For status read `ase --project PROJECT report TASK`, the current checkpoint and source coverage. Distinguish implemented, executed, independently verified, unavailable, blocked and actually published results. Cite existing artifacts and actual URLs. Empty source inventory is unconfigured, not completed analysis.

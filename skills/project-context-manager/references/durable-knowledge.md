@@ -1,5 +1,7 @@
 # Historical project knowledge
 
+Use [evidence decisions](../../task-orchestrator/references/evidence-decisions.md) for drift-prone claims: target/reference authority, observed scope/check/version, required dependency postcondition and artifact purpose/state/version where relevant. New answers supersede affected claims and require current affected drafts/checks. Changing a date alone does not establish readiness or close a gap. Retain facts in supported statements/source references/dependencies; avoid raw data or custom schema fields.
+
 Use for durable decisions, recurring problems and user corrections that will matter after the current task. Before relying on previous conclusions, run `knowledge-query --topic TOPIC` in the canonical project. Retrieve relevant topics rather than loading every historical claim. Current user instructions, source evidence and repository state retain authority.
 
 Use `knowledge-record --file PATH` with templates/knowledge.json. Each claim carries a topic, statement, timezone-aware observation date and nonempty source_refs. When describing code, include its repository locator and full repository_revision when available; if unknown, state the uncertainty in the claim and do not present the claim as current code truth. Cite evidence instead of copying original chats, logs or transcripts. Do not store credentials.

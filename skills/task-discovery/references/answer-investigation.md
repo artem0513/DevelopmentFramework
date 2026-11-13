@@ -1,5 +1,7 @@
 # Investigate before asking
 
+Apply [evidence decisions](../../task-orchestrator/references/evidence-decisions.md) to the claim: deployed settings are observations rather than automatic correctness references; a denied method is not all access; metadata/readability/data suitability/consumer correctness differ. Record the required postcondition, exact check, safe account/method reference, version and inspected scope. Investigate useful authorized alternatives before declaring required access unavailable. Semantic changes need relevant invariant checks rather than inference from successful execution.
+
 Use for an unresolved fact or conflicting requirement that could materially affect the task. This is a question-driven investigation, not an inventory of the whole environment. Obvious contradictions in the request or a decision only the owner can make can go directly to the owner; do not delay them with irrelevant searches.
 
 ## Choose evidence for the question

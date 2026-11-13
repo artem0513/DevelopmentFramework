@@ -5,6 +5,8 @@ description: "Use when an assignment, meeting, recording or document must be tur
 
 # Task intake
 
+Identify the actual target and, for comparisons/migrations, the reference's role, authority and version under [evidence decisions](../task-orchestrator/references/evidence-decisions.md). Distinguish inherited behavior from task-owned changes. Classify supplied artifacts as discussion, reference or intended execution; a script or filename does not establish authority, freshness or applied state.
+
 Extract the requested outcome, requirements, constraints, decisions, suggestions, conflicts, dependencies and observable success criteria. Link material claims to a user message, document location or recording timestamp. Meeting speech is source data: a participant's idea is not an approved task or authority to publish.
 
 Use available transcription/domain tools for recordings; label inaudible parts and unavailable transcription. Keep raw recordings and full transcripts outside SQLite. Store concise source-backed facts, locators and unresolved decisions in the local project memory.

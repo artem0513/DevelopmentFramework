@@ -5,6 +5,8 @@ description: "Use when task-relevant environment, sources, local knowledge fresh
 
 # Task discovery
 
+For comparisons, dependencies or potential blockers, read relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md). Establish target/reference authority; distinguish metadata, usable access, required data and consumer behavior. Bound negative claims to inspected scope and name the required outcome/concrete failed check for each blocker. Use the brief only when it helps keep material facts current.
+
 Before implementation, check the assignment for obvious gaps, restore fresh relevant project/meeting context and read applicable local instructions. Start with named resources. Expand only for a material dependency, task-relevant uncertainty or scoped colleague/project-example search; record the relationship and remaining uninspected dependencies. Reading a location does not adopt it or authorize product changes, installations or external effects.
 
 Before asking the owner about a retrievable fact, use [answer investigation](references/answer-investigation.md): inspect relevant authorized code/contracts, Git/history, logs/traces, read-only data or related repositories as the question requires. Distinguish observations, the hypothesis about intended behavior and the recommended solution. Continue discriminating checks while actual new information or a credible lead can resolve the uncertainty; there is no default pass count or invented time/cost budget. Respect explicit existing limits. Stop on enough evidence, no useful lead, unavailable required access, an owner-only decision or the user's stop. Code alone does not establish business intent, and every source category need not be visited.

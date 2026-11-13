@@ -1,5 +1,7 @@
 # Questions and approval
 
+Before reporting a blocker, apply relevant [evidence decisions](evidence-decisions.md): required outcome/affected work, concrete failed check, bounded conclusion, useful authorized alternatives or stopping reason. A failed optional method is not itself a required-outcome blocker. Keep purpose/version explicit for draft or reference artifacts.
+
 Use this reference only for a material unresolved decision or a changed authorization boundary.
 
 A clear assignment authorizes its in-scope execution immediately. Record a concise internal proposal and original authorization; do not require another approval of the same work. Choose ordinary internal details and technical taste using project rules and suitable colleague examples. A question is necessary for a genuine unresolved business/access/authority blocker or serious architectural change beyond the approved scope: relevant [answer investigation](../../task-discovery/references/answer-investigation.md) cannot establish the answer, or only the owner can decide; it materially changes outcome, compatibility, cost, risk or authority; and no safe in-scope choice is supported. Existing behavior does not establish a future business decision.
