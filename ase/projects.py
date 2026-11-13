@@ -9,6 +9,7 @@ import sqlite3
 import uuid
 
 from .project_local import find_local_config, validate_local_state
+from .native_paths import state_io
 
 
 def _now():
@@ -49,10 +50,9 @@ def _canonical(root):
 def _safe_state(path):
     """Reject redirected directories and shared file inodes below canonical home."""
     path = Path(path)
-    if (os.path.normcase(str(path.resolve())) != os.path.normcase(str(path))
-            or path.is_symlink() or getattr(path, "is_junction", lambda: False)()
-            or (path.is_file() and path.stat().st_nlink > 1)):
+    if not path.is_absolute():
         raise ValueError("State files must remain inside their project directory; reparse points are not supported")
+    state_io(path)
 
 
 def _outside(home, root):

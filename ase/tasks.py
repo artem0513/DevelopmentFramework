@@ -305,11 +305,23 @@ class TaskService:
         return self.snapshot(task_id)
 
     def readiness(self, task_id, stage_id=None):
+        from .source_coverage import source_availability, availability_gaps, read_persisted_intake
         task = self.snapshot(task_id)
+        if task["legacy_v1"]:
+            if stage_id is not None:
+                raise ValueError("legacy_v1 has no v2 readiness stage; revise the task contract first")
+            present = self.store.db.execute("SELECT 1 FROM task_discoveries WHERE task_id=? LIMIT 1", (task_id,)).fetchone()
+            return {"legacy_v1": True, "discovery_present": bool(present), "required_source_gaps": [],
+                    "source_availability": [], "intake_validation": {"status": "LEGACY_UNASSESSED", "source_statuses": []},
+                    "untracked_gap_ids": [], "clarity": "UNASSESSED", "semantic_validation": False, "execution_authorized": False,
+                    "limitations": ["Legacy history requires a reviewed v2 task contract before new execution"]}
         row = self.store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
         discovery = json.loads(row[0]) if row else None
-        intake = (discovery or {}).get("intake", {})
+        intake_state = read_persisted_intake(discovery)
+        intake = intake_state["intake"]
         gaps = [g for g in [*intake.get("gaps", []), *intake.get("contradictions", [])] if g.get("required", True) and g.get("status", "UNRESOLVED").upper() not in {"RESOLVED", "CONFIRMED"}]
+        availability = source_availability(self.store, task["contract"], discovery, stage_id)
+        gaps.extend(availability_gaps(availability))
         known = {u["id"] for u in task["contract"].get("unknowns", [])}
         if stage_id is not None:
             stages = task["contract"]["stages"]
@@ -335,7 +347,8 @@ class TaskService:
                 if stage_id in affected:
                     relevant.append(gap)
             gaps = relevant
-        return {"discovery_present": bool(row), "required_source_gaps": gaps,
+        gaps.extend(intake_state["compatibility_gaps"])
+        return {"discovery_present": bool(row), "required_source_gaps": gaps, "source_availability": availability, "intake_validation": intake_state["validation"],
                 "untracked_gap_ids": [g["id"] for g in gaps if g["id"] not in known],
                 "clarity": "BLOCKED" if gaps else "SCOPED" if row else "UNASSESSED",
                 "semantic_validation": False}
@@ -407,8 +420,12 @@ class TaskService:
             if unknown.get("status", "UNRESOLVED") == "UNRESOLVED" and stage["id"] in affected:
                 raise ValueError("Unresolved unknown blocks stage: " + unknown["id"])
 
-    def require_approval(self, task_id, stage_id, *, allow_terminal=False):
+    def require_approval(self, task_id, stage_id, *, allow_terminal=False, allow_stopped=False):
         task = self.snapshot(task_id)
+        if not allow_stopped and read_record(self.store.db, "stop", task_id)["payload"]:
+            raise ValueError("Task is paused by a stop request")
+        if task["state"] == "CANCELLED":
+            raise ValueError("Task is cancelled")
         validate_mixed_mapping(task["contract"])
         if task["legacy_v1"]:
             raise ValueError("legacy_v1 has no new execution approval")

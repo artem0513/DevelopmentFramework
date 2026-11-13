@@ -10,6 +10,7 @@ from .runner import verify_receipt
 from .state import hash_value, read_record, transaction, write_record
 from .store import now
 from .tasks import TaskService, _within, validate_child_obligations
+from .native_paths import logical_path, state_io
 
 
 def evaluate_gate(contract, current, receipts, judgments):
@@ -118,12 +119,13 @@ def stage_checks(contract, checks, stage_id=None):
 
 def source_resources(store, contract, task_id=None):
     """The same explicit source/dependency boundaries for hashes and packets."""
-    resources = list(contract["scope"]["resources"])
+    from .source_coverage import declared_source_resources
+    discovery = None
     if task_id is not None:
         row = store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
         if row:
-            resources.extend(r["path"] for r in json.loads(row[0])["resources"] if r.get("status") == "INSPECTED")
-    return list(dict.fromkeys(resources))
+            discovery = json.loads(row[0])
+    return declared_source_resources(contract, discovery)
 
 
 def _directory_sources(root, directory):
@@ -152,31 +154,36 @@ def _directory_sources(root, directory):
 
 def source_snapshot(store, contract, task_id=None):
     from .project_local import is_private_path
+    from .source_coverage import source_path, declared_source_resources, normalized_discovery_policy
+    row = store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone() if task_id is not None else None
+    discovery = json.loads(row[0]) if row else None
+    policy_sha256 = hash_value(normalized_discovery_policy(discovery)) if discovery is not None else None
     base = None
     if has_software(contract):
         from .inspection import safe_snapshot
         base = safe_snapshot(store.repo)
     files, missing = dict(base["files"]) if base else {}, []
+    unavailable = {}
     root = store.repo.resolve()
-    resources = source_resources(store, contract, task_id)
+    resources = declared_source_resources(contract, discovery)
     dependencies = {}
-    for resource in resources:
+
+    def capture(resource):
         if is_private_path(resource):
             raise ValueError("Private project-local state is not project source")
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", resource):
             missing.append(resource)
-            continue
+            return
         path = Path(resource)
         if any(part.lower() == ".git" for part in path.parts):
             raise ValueError("Private Git data is not project source")
         if path.is_absolute():
-            path = path.resolve()
-        else:
-            path = (root / path).resolve()
-        if not path.is_relative_to(root):
-            # External resource identifiers are handled by actual probe evidence.
-            missing.append(resource)
-            continue
+            if not path.is_relative_to(root):
+                # Explicit external resource identifiers use actual probes.
+                missing.append(resource)
+                return
+            path = path.relative_to(root)
+        path = source_path(root, path.as_posix())
         if is_private_path(path.relative_to(root)):
             raise ValueError("Private project-local state is not project source")
         if path.is_file() and path.stat().st_nlink > 1:
@@ -205,10 +212,25 @@ def source_snapshot(store, contract, task_id=None):
                     files[relative] = observed
                 elif base is None:
                     files[relative] = observed
+    for resource in resources:
+        try:
+            capture(resource)
+        except OSError as ex:
+            # Preserve a stable observation without turning optional or deferred
+            # inputs into a global read failure. Packet/readiness apply the
+            # declared stage requirements; path-safety ValueErrors still raise.
+            unavailable[resource] = {"status": "UNAVAILABLE", "error": type(ex).__name__, "errno": ex.errno}
     if base:
-        return {**base, "fingerprint": hash_value({"base": base["fingerprint"], "dependencies": dependencies}) if dependencies else base["fingerprint"], "files": files}
-    return {"fingerprint": hash_value({"files": files, "external_resources": missing}), "files": files,
-            "workspace_id": store.workspace_id, "timestamp": now()}
+        additions = {"dependencies": dependencies, "unavailable": unavailable}
+        observed = {**base, "fingerprint": hash_value({"base": base["fingerprint"], **additions}) if dependencies or unavailable else base["fingerprint"],
+                    "files": files, "unavailable": unavailable}
+    else:
+        observed = {"fingerprint": hash_value({"files": files, "external_resources": missing, "unavailable": unavailable}), "files": files, "unavailable": unavailable,
+                    "workspace_id": store.workspace_id, "timestamp": now()}
+    if policy_sha256 is not None:
+        observed["fingerprint"] = hash_value({"source_fingerprint": observed["fingerprint"], "discovery_policy_sha256": policy_sha256})
+        observed["discovery_policy_sha256"] = policy_sha256
+    return observed
 
 
 class GateService:
@@ -309,7 +331,7 @@ class GateService:
             extra.append("Current proposal approval missing")
         elif stage_id is not None:
             try:
-                tasks.require_approval(task_id, stage_id)
+                tasks.require_approval(task_id, stage_id, allow_terminal=task["state"] == "COMPLETED")
             except ValueError as ex:
                 extra.append(str(ex))
         if task["contract"].get("parent_task_id"):
@@ -346,8 +368,12 @@ class GateService:
                 if declared != captured or not captured.is_relative_to(self.store.repo.resolve()):
                     extra.append("Artifact path differs from approved plan: " + spec["id"])
             elif spec["kind"] != "manual":
-                log = Path(proof.get("log", "")).resolve()
-                if not log.is_relative_to((self.store.root / "tasks" / task_id / "checks").resolve()) or Path(proof.get("cwd", "")).resolve() != self.store.repo.resolve():
+                try:
+                    log = logical_path(Path(proof.get("log", "")))
+                    valid = log.is_relative_to((self.store.root / "tasks" / task_id / "checks").resolve()) and Path(proof.get("cwd", "")).resolve() == self.store.repo.resolve()
+                except (OSError, ValueError, TypeError):
+                    valid = False
+                if not valid:
                     extra.append("Command evidence outside selected task/workspace: " + spec["id"])
         if stage_id is None:
             for s in task["contract"]["stages"]:
@@ -399,10 +425,10 @@ class GateService:
                         extra.append("Action postcondition is not established: " + action["id"])
                     try:
                         path, expected_hash = observation["proof_ref"].rsplit("#sha256=", 1)
-                        path = Path(path)
+                        path = logical_path(path)
                         required = self.store.root / "tasks" / observer_task / "actions" / operation["action_id"]
-                        if (path.is_symlink() or not path.resolve().is_relative_to(required.resolve())
-                                or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash):
+                        if (not path.is_relative_to(required.resolve())
+                                or hashlib.sha256(state_io(path).read_bytes()).hexdigest() != expected_hash):
                             raise ValueError("Invalid observation proof")
                     except (KeyError, ValueError, OSError, TypeError):
                         extra.append("Action observation proof is missing or invalid: " + action["id"])

@@ -27,6 +27,10 @@ _MARKERS = {"AGENTS.md", "package.json", "package-lock.json", "pnpm-lock.yaml", 
             "requirements.txt", "global.json", "Directory.Build.props", "Directory.Build.targets"}
 _MAX_BYTES = 1024 * 1024
 _MAX_RESOURCES = 256
+_SOURCE_STATUSES = {"available", "complete", "inspected", "fully_read", "analyzed",
+                    "discovered", "acquired", "unknown", "unavailable", "missing",
+                    "blocked", "partial", "inaudible"}
+_INCOMPLETE_SOURCE_STATUSES = _SOURCE_STATUSES - {"available", "complete", "inspected", "fully_read", "analyzed"}
 
 
 def _text(value, name, limit=4000):
@@ -91,6 +95,10 @@ def validate_intake(payload):
         for key in ("timestamp", "lines", "status"):
             if key in source:
                 _text(source[key], "source." + key, 1000)
+        if "status" in source:
+            source["status"] = source["status"].strip().lower()
+            if source["status"] not in _SOURCE_STATUSES:
+                raise ValueError("Unsupported source status")
     claim_ids = set()
     for key in sorted(_INTAKE_LISTS):
         items = value.setdefault(key, [])
@@ -123,7 +131,7 @@ def validate_intake(payload):
     if not value["outcomes"] and not value["gaps"]:
         raise ValueError("Incomplete intake requires an explicit gap")
     for source in sources:
-        if source.get("status") in {"unavailable", "blocked", "partial", "inaudible"}:
+        if source.get("status") in _INCOMPLETE_SOURCE_STATUSES:
             if not any(source["id"] in gap["source_refs"] for gap in value["gaps"]):
                 raise ValueError("Incomplete source requires an attributed gap")
     value.update(authorization_granted=False, semantic_validation=False)
@@ -143,19 +151,40 @@ def _scope_path(value):
     return Path(path).as_posix()
 
 
+def _dependency(item, name):
+    _object(item, {"path", "from", "reason", "required", "blocking_stage_ids"}, name)
+    dependency = {"path": _scope_path(item.get("path")), "reason": _text(item.get("reason"), "dependency.reason")}
+    if "from" in item:
+        dependency["from"] = _scope_path(item["from"])
+    if "required" in item:
+        if type(item["required"]) is not bool:
+            raise ValueError("Dependency required must be boolean")
+        dependency["required"] = item["required"]
+    if "blocking_stage_ids" in item:
+        stages = _list(item["blocking_stage_ids"], "dependency stages")
+        if not stages or any(not isinstance(stage, str) for stage in stages) or len(set(stages)) != len(stages):
+            raise ValueError("Dependency stage mapping requires distinct nonempty stage IDs")
+        for stage in stages:
+            _text(stage, "dependency stage", 200)
+        dependency["blocking_stage_ids"] = list(stages)
+    return dependency
+
+
 def _validate_scope(scope):
-    _object(scope, {"resources", "dependencies"}, "scope")
+    _object(scope, {"resources", "dependencies", "outputs"}, "scope")
     resources = [_scope_path(item) for item in _list(scope.get("resources"), "scope.resources")]
     if not resources:
         raise ValueError("Discovery needs explicitly named resources")
     dependencies = []
     for item in _list(scope.get("dependencies", []), "scope.dependencies"):
-        _object(item, {"path", "from", "reason"}, "scope dependency")
-        dependency = {"path": _scope_path(item.get("path")), "reason": _text(item.get("reason"), "dependency.reason")}
-        if "from" in item:
-            dependency["from"] = _scope_path(item["from"])
-        dependencies.append(dependency)
-    return {"resources": list(dict.fromkeys(resources)), "dependencies": dependencies}
+        dependencies.append(_dependency(item, "scope dependency"))
+    value = {"resources": list(dict.fromkeys(resources)), "dependencies": dependencies}
+    if "outputs" in scope:
+        outputs = [_scope_path(item) for item in _list(scope["outputs"], "scope.outputs")]
+        if not set(outputs).issubset(resources) or "." in outputs:
+            raise ValueError("Intentional output/deletion paths must name explicit scoped resources")
+        value["outputs"] = list(dict.fromkeys(outputs))
+    return value
 
 
 def _project_root(project):
@@ -231,9 +260,9 @@ def discover_capabilities(project, *, scope, backend_config):
     root, scope = _project_root(project), _validate_scope(scope)
     tools, skills = _capability_tools(backend_config)
     resources, dependencies, limitations, contents, directories = {}, [], [], {}, set()
-    queue = []
+    queue, inherited_edges = [], []
 
-    def add(path, reason=None, origin=None):
+    def add(path, reason=None, origin=None, requirement=None):
         from .project_local import is_private_path
         candidate = root / path
         try:
@@ -261,18 +290,32 @@ def discover_capabilities(project, *, scope, backend_config):
             raise ValueError("Scope resource escapes project root")
         relative = candidate.relative_to(root).as_posix()
         if reason:
+            inherited_edge = requirement is None and origin is not None
+            if requirement is None and origin:
+                from .source_coverage import dependency_policy
+                inherited = [item for item in dependencies if Path(origin).is_relative_to(Path(item["path"]))]
+                if inherited:
+                    depth = max(len(Path(item["path"]).parts) for item in inherited)
+                    inherited = [item for item in inherited if len(Path(item["path"]).parts) == depth]
+                    requirement = dependency_policy(inherited)
             dependency = {"path": relative, "reason": reason}
             if origin:
                 dependency["from"] = origin
+            if requirement:
+                dependency.update({key: requirement[key] for key in ("required", "blocking_stage_ids") if requirement.get(key) is not None})
             if dependency not in dependencies:
                 dependencies.append(dependency)
+            if inherited_edge:
+                captured = dependencies[dependencies.index(dependency)]
+                if not any(edge is captured for edge in inherited_edges):
+                    inherited_edges.append(captured)
         if relative not in resources and relative not in queue:
             queue.append(relative)
 
     for path in scope["resources"]:
         add(path)
     for item in scope["dependencies"]:
-        add(item["path"], item["reason"], item.get("from"))
+        add(item["path"], item["reason"], item.get("from"), item)
 
     def related_metadata(directory, origin):
         try:
@@ -352,6 +395,39 @@ def discover_capabilities(project, *, scope, backend_config):
                         limitations.append("Uncovered .NET dependency outside project: " + reference)
         except (ValueError, TypeError, AttributeError, ET.ParseError):
             limitations.append("Malformed configuration; dependency coverage unknown: " + relative)
+
+    # Every source body is inspected once, but converging/cyclic reference paths
+    # can strengthen an already inspected node later. Propagate those policies
+    # over the captured graph until stable, without rerunning reads or probes.
+    from .source_coverage import dependency_policy
+    if len(dependencies) > 2000:
+        raise ValueError("Discovery dependency graph exceeds the bounded policy limit")
+    incoming = {}
+    for edge in inherited_edges:
+        origin = edge["from"]
+        if origin not in incoming:
+            candidates = [item for item in dependencies if Path(origin).is_relative_to(Path(item["path"]))]
+            depth = max((len(Path(item["path"]).parts) for item in candidates), default=0)
+            incoming[origin] = [item for item in candidates if len(Path(item["path"]).parts) == depth]
+    node_count = len({item["path"] for item in dependencies} | set(incoming))
+    for _ in range(node_count + 1):
+        changed = False
+        for edge in inherited_edges:
+            parents = incoming[edge["from"]]
+            if not parents:
+                continue
+            merged = dependency_policy([edge, dependency_policy(parents)])
+            if dependency_policy([edge]) != merged:
+                edge["required"] = merged["required"]
+                if merged["blocking_stage_ids"] is None:
+                    edge.pop("blocking_stage_ids", None)
+                else:
+                    edge["blocking_stage_ids"] = merged["blocking_stage_ids"]
+                changed = True
+        if not changed:
+            break
+    else:
+        raise ValueError("Discovery dependency policies did not converge within the bounded graph")
 
     checks, stack = [], set()
     def check(identifier, argv, kind, parser, directory, refs, script=False):
@@ -457,7 +533,7 @@ def discover_capabilities(project, *, scope, backend_config):
 
 def validate_discovery(payload):
     """Validate persistable discovery structure, without interpreting its claims."""
-    allowed = {"root", "generated_at", "git_repository", "scope", "resources", "dependencies", "candidate_checks", "stack", "tools", "skills", "selected_tools", "selected_skills", "limitations", "intake", "authorization_granted", "semantic_validation"}
+    allowed = {"root", "generated_at", "git_repository", "scope", "resources", "dependencies", "candidate_checks", "stack", "tools", "skills", "selected_tools", "selected_skills", "limitations", "intake", "representations", "authorization_granted", "semantic_validation"}
     _object(payload, allowed, "discovery")
     if payload.get("authorization_granted", False) is not False or payload.get("semantic_validation", False) is not False:
         raise ValueError("Discovery cannot grant authorization or semantic validation")
@@ -483,11 +559,24 @@ def validate_discovery(payload):
         if "sha256" in item and not re.fullmatch(r"[a-f0-9]{64}", str(item["sha256"])):
             raise ValueError("Invalid resource hash")
     for item in _list(value.get("dependencies"), "dependencies", 2000):
-        _object(item, {"path", "from", "reason"}, "dependency")
-        _scope_path(item.get("path"))
-        _text(item.get("reason"), "dependency.reason")
-        if "from" in item:
-            _scope_path(item["from"])
+        normalized = _dependency(item, "dependency")
+        item.clear()
+        item.update(normalized)
+    represented = set()
+    for item in _list(value.get("representations", []), "representations"):
+        _object(item, {"artifact_path", "artifact_sha256", "path", "sha256", "method"}, "artifact representation")
+        for key in ("artifact_path", "path"):
+            item[key] = _scope_path(item.get(key))
+        if item["artifact_path"] in represented or item["artifact_path"] == item["path"]:
+            raise ValueError("Artifact representations must have distinct scoped artifacts and readable paths")
+        represented.add(item["artifact_path"])
+        boundaries = [*value["scope"]["resources"], *resource_paths, *[dependency["path"] for dependency in value["dependencies"]]]
+        if not any(Path(item["artifact_path"]).is_relative_to(Path(path)) for path in boundaries):
+            raise ValueError("Representation artifact must be a scoped resource")
+        for key in ("artifact_sha256", "sha256"):
+            if not isinstance(item.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", item[key]):
+                raise ValueError("Invalid artifact representation hash")
+        _text(item.get("method"), "representation.method")
     check_ids = set()
     for item in _list(value.get("candidate_checks"), "candidate_checks"):
         _object(item, {"id", "argv", "kind", "parser", "cwd", "source_refs", "selected", "requires_inspection"}, "candidate check")
@@ -561,19 +650,124 @@ def validate_discovery(payload):
     return value
 
 
+def _contract_at_discovery(store, task_id, created, current_contract):
+    """Use recorded task history to distinguish former outputs from read roots."""
+    prefix = task_id + ":"
+    row = store.db.execute("SELECT payload FROM runtime_records WHERE kind='task_version' "
+                           "AND substr(key,1,?)=? AND updated<=? ORDER BY updated DESC LIMIT 1",
+                           (len(prefix), prefix, created)).fetchone()
+    return json.loads(row[0]).get("contract", current_contract) if row else current_contract
+
+
+def _mutable_source(path, contract, scope):
+    outputs = set(scope.get("outputs", [])) | {item["path"] for item in contract.get("evidence", []) if item["kind"] == "artifact"}
+    if path in outputs:
+        return True
+    return any(Path(path).is_relative_to(Path(resource))
+               for stage in contract.get("stages", [])
+               for resource in stage.get("scope", contract["scope"])["resources"]
+               if set(stage.get("scope", contract["scope"])["effects"]) & {"file_write", "command"})
+
+
+def _declared_dependencies(discovery):
+    # A standalone top-level row is also a supported explicit root. Rows with
+    # an origin are inferred graph edges unless declared in scope explicitly.
+    result = list(discovery["scope"].get("dependencies", []))
+    for item in discovery.get("dependencies", []):
+        if "from" not in item and item not in result:
+            result.append(item)
+    return result
+
+
+def _declared_read_roots(contract, discovery):
+    scope = discovery["scope"]
+    dependencies = {item["path"] for item in _declared_dependencies(discovery)}
+    return [path for path in scope["resources"] if path not in dependencies and not _mutable_source(path, contract, scope)]
+
+
+def _retain_required_scope(contract, previous_contract, previous, scope, declarations=None):
+    """Omission is not reconciliation; explicit same-path policy is."""
+    merged = copy.deepcopy(scope)
+    declared = {item["path"] for item in declarations if declarations is not None} if declarations is not None else {item["path"] for item in merged.get("dependencies", [])}
+    reconciled = declared | set(merged.get("outputs", []))
+    for item in _declared_dependencies(previous):
+        if item.get("required", True) and item["path"] not in reconciled:
+            merged["dependencies"].append(copy.deepcopy(item))
+    for path in _declared_read_roots(previous_contract, previous):
+        if path in reconciled:
+            continue
+        if path not in merged["resources"]:
+            merged["resources"].append(path)
+        if _mutable_source(path, contract, merged):
+            merged["dependencies"].append({"path": path, "reason": "Previously declared scoped read input", "required": True})
+    return merged
+
+
+def discovery_refresh_scope(store, task_id):
+    """Fresh CLI scans current outputs and retained explicitly scoped inputs."""
+    from .tasks import TaskService
+    contract = TaskService(store).snapshot(task_id)["contract"]
+    row = store.db.execute("SELECT payload,created FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
+    scope = {"resources": list(contract["scope"]["resources"]), "dependencies": []}
+    if row:
+        previous = json.loads(row[0])
+        previous_contract = _contract_at_discovery(store, task_id, row[1], contract)
+        scope["dependencies"] = copy.deepcopy(_declared_dependencies(previous))
+        outputs = [path for path in previous["scope"].get("outputs", []) if path in scope["resources"]]
+        if outputs:
+            scope["outputs"] = outputs
+        scope = _retain_required_scope(contract, previous_contract, previous, scope)
+    return scope
+
+
 def record_discovery(store, task_id, payload, *, expected_revision):
     """Append project-local discovery using its own monotonic CAS revision."""
     _text(task_id, "task_id", 200)
     if type(expected_revision) is not int or expected_revision < 0:
         raise ValueError("expected_revision must be a nonnegative integer")
     value = validate_discovery(payload)
+    from .source_coverage import bound_representation
+    for declaration in value.get("representations", []):
+        try:
+            bound_representation(store.repo, declaration)
+        except (OSError, UnicodeError) as ex:
+            raise ValueError("Artifact representation is unavailable: " + str(ex)) from ex
     db = store.db
     db.execute("BEGIN IMMEDIATE")
     try:
-        if db.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+        task_row = db.execute("SELECT contract FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task_row is None:
             raise ValueError("Unknown task in this project: " + task_id)
-        previous = db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
-        previous_intake = json.loads(previous[0]).get("intake") if previous else None
+        current = db.execute("SELECT COALESCE(MAX(revision),0) FROM task_discoveries WHERE task_id=?", (task_id,)).fetchone()[0]
+        if current != expected_revision:
+            raise ValueError("Stale discovery revision; reload and reconcile before saving")
+        task_contract = json.loads(task_row[0])
+        previous = db.execute("SELECT payload,created FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
+        previous_value = json.loads(previous[0]) if previous else None
+        if previous_value:
+            previous_contract = _contract_at_discovery(store, task_id, previous[1], task_contract)
+            scope = _retain_required_scope(task_contract, previous_contract, previous_value, value["scope"], _declared_dependencies(value))
+            if scope != value["scope"]:
+                # Structured callers can omit an old input accidentally too.
+                # Scan the retained boundaries now; never resurrect old hashes
+                # or old inferred imports as if they had just been inspected.
+                fresh = discover_capabilities(store.project, scope=scope, backend_config={})
+                value["scope"] = scope
+                resources = {item["path"]: item for item in value["resources"]}
+                resources.update({item["path"]: item for item in fresh["resources"]})
+                value["resources"] = list(resources.values())
+                for item in fresh["dependencies"]:
+                    if item not in value["dependencies"]:
+                        value["dependencies"].append(item)
+                value["limitations"] = list(dict.fromkeys([*value["limitations"], *fresh["limitations"]]))
+                value = validate_discovery(value)
+            if "representations" not in value:
+                boundaries = [*scope["resources"], *[item["path"] for item in scope["dependencies"]]]
+                retained = [item for item in previous_value.get("representations", [])
+                            if any(Path(item["artifact_path"]).is_relative_to(Path(path)) for path in boundaries)]
+                if retained:
+                    value["representations"] = copy.deepcopy(retained)
+        previous_intake = previous_value.get("intake") if previous_value else None
         if previous_intake:
             if "intake" not in value:
                 value["intake"] = copy.deepcopy(previous_intake)
@@ -599,13 +793,16 @@ def record_discovery(store, task_id, payload, *, expected_revision):
                         for source_id in replacement["source_refs"])
                     if (resolved or narrowed) and not evidence_changed:
                         raise ValueError("Resolving or narrowing a source gap requires new attributed evidence: " + gap["id"])
-        from .tasks import TaskService
         intake = value.get("intake", {})
         mapped_gaps = [gap for gap in [*intake.get("gaps", []), *intake.get("contradictions", [])]
                        if "blocking_stage_ids" in gap]
-        contract = TaskService(store).snapshot(task_id)["contract"] if mapped_gaps else {}
+        mapped_dependencies = [item for item in [*value["scope"]["dependencies"], *value["dependencies"]] if "blocking_stage_ids" in item]
+        contract = task_contract if mapped_gaps or mapped_dependencies else {}
         stages = contract.get("stages", [])
         stage_ids = {stage["id"] for stage in stages}
+        for dependency in mapped_dependencies:
+            if not set(dependency["blocking_stage_ids"]).issubset(stage_ids):
+                raise ValueError("Dependency mapping references an unknown stage")
         for gap in mapped_gaps:
             mapped = set(gap["blocking_stage_ids"])
             if not mapped.issubset(stage_ids):
@@ -616,9 +813,6 @@ def record_discovery(store, task_id, payload, *, expected_revision):
                     stage["id"] for stage in stages if gap["id"] in stage.get("unknown_ids", [])}
                 if mapped != declared:
                     raise ValueError("Gap stage mapping conflicts with contract obligations")
-        current = db.execute("SELECT COALESCE(MAX(revision),0) FROM task_discoveries WHERE task_id=?", (task_id,)).fetchone()[0]
-        if current != expected_revision:
-            raise ValueError("Stale discovery revision; reload and reconcile before saving")
         created, revision = now(), current + 1
         db.execute("INSERT INTO task_discoveries(task_id,revision,payload,created) VALUES(?,?,?,?)", (task_id, revision, json.dumps(value, ensure_ascii=False), created))
         db.commit()

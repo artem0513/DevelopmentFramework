@@ -1,10 +1,13 @@
 """Stable original-obligation identities for durable, conservative recovery."""
 import hashlib
+import os
 from pathlib import Path
+import posixpath
 import re
 
 from .profiles import stage_evidence_specs
 from .state import hash_value, read_record
+from .native_paths import logical_path, state_io
 
 
 def check_identity(spec):
@@ -29,10 +32,20 @@ def initial_history(contract):
             "aliases": {}, "high_water": [], "failures": {}, "events": []}
 
 
+def _resource_key(value):
+    normalized = value.replace("\\", "/").rstrip("/")
+    # URI paths and opaque identifiers retain case. Only local file paths use
+    # platform case rules; lexical aliases must not erase original obligations.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", normalized) and not re.match(r"^[A-Za-z]:/", normalized):
+        return normalized
+    normalized = posixpath.normpath(normalized)
+    return os.path.normcase(normalized).replace("\\", "/") if os.name == "nt" else normalized
+
+
 def _overlap(left, right):
     for first in left:
         for second in right:
-            first, second = first.replace("\\", "/").rstrip("/"), second.replace("\\", "/").rstrip("/")
+            first, second = _resource_key(first), _resource_key(second)
             if first == second or first == "." or second == "." or first.startswith(second + "/") or second.startswith(first + "/"):
                 return True
     return False
@@ -53,15 +66,15 @@ def bind_stage(history, task_id, contract, stage_id, *, root_id, parent_groups=N
         unchanged = (named is not None and stage["scope"] == named["scope"]
                      and {hash_value(ac) for ac in acceptance} == {hash_value(ac) for ac in named["acceptance"]}
                      and identities == {check_identity(spec) for spec in named["checks"]})
-        matched = {stage_id} if unchanged else {name for name, group in groups.items() if any(
-            ac["id"] == original["id"] or ac["expected"] == original["expected"]
-            for ac in acceptance for original in group["acceptance"])}
-        if not matched:
-            matched.update(name for name, group in groups.items()
-                           if identities & {check_identity(spec) for spec in group["checks"]})
-        if not matched:
-            matched.update(name for name, group in groups.items()
-                           if _overlap(stage["scope"]["resources"], group["scope"]["resources"]))
+        # Exact unchanged root stages retain independent allowances even when
+        # they share project-wide checks or resources. For revised obligations,
+        # every credible link counts: a reused criterion ID must never suppress
+        # the original check or resource history. Conflicts reduce allowance.
+        matched = {stage_id} if unchanged else {name for name, group in groups.items() if (
+            any(ac["id"] == original["id"] or ac["expected"] == original["expected"]
+                for ac in acceptance for original in group["acceptance"])
+            or identities & {check_identity(spec) for spec in group["checks"]}
+            or _overlap(stage["scope"]["resources"], group["scope"]["resources"]))}
         # An entirely revised goal cannot erase previously spent root history.
         selected.update(matched or groups)
     history["aliases"][key] = sorted(selected)
@@ -227,15 +240,16 @@ def original_case_progress(store, root_id, task_id, history, groups, contract, s
             continue
         result = matches[0]
         try:
-            log = Path(result["log"])
+            log = logical_path(result["log"])
+            physical = state_io(log)
             if (result.get("kind") != "test" or result.get("configured_argv") != spec["argv"]
                     or not result.get("started") or not result.get("ended")
                     or Path(result["cwd"]).resolve() != store.repo.resolve()
                     or any(result.get(key) for key in ("error", "timed_out", "cancelled", "output_limited"))
-                    or log.is_symlink() or not log.resolve().is_relative_to((store.root / "tasks" / task_id / "checks").resolve())
-                    or log.stat().st_size > 1048576):
+                    or not log.is_relative_to((store.root / "tasks" / task_id / "checks").resolve())
+                    or physical.stat().st_size > 1048576):
                 continue
-            data = log.read_bytes()
+            data = physical.read_bytes()
             if hashlib.sha256(data).hexdigest() != result.get("log_sha256"):
                 continue
             cases = _unittest_cases(data.decode("utf-8"), result.get("exit_code"))

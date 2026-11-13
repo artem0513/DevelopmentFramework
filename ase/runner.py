@@ -5,6 +5,7 @@ executables, environment, working directory, or permissions. Files and hashes
 detect mistakes; they do not constrain another hostile process of the same user.
 """
 from datetime import datetime, timezone
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import signal
@@ -85,7 +86,7 @@ class _WindowsJob:
             self.handle = None
 
 
-def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, extra_output_paths=(), cancel_requested=None, env=None):
+def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, extra_output_paths=(), cancel_requested=None, env=None, launch_guard=None):
     """Run shell=False with an owned input channel; never inherit chat stdin."""
     if type(timeout) not in (int, float) or timeout <= 0 or type(max_output_bytes) is not int or max_output_bytes < 1024:
         raise ValueError("Positive timeout and output cap required")
@@ -95,9 +96,10 @@ def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, e
     code, error, timed_out, limited, cancelled = None, None, False, False, False
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
-            process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-                stdout=stdout, stderr=stderr, shell=False, start_new_session=os.name != "nt",
-                env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"})
+            with launch_guard() if launch_guard is not None else nullcontext():
+                process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                    stdout=stdout, stderr=stderr, shell=False, start_new_session=os.name != "nt",
+                    env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"})
             job = _WindowsJob(process)
             if input_bytes is not None:
                 def send_input():

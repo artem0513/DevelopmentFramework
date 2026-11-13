@@ -18,7 +18,7 @@ from .tasks import TaskService
 from .workflow import WorkflowController
 from .gates import GateService, source_snapshot
 from .journal import Journal
-from .discovery import discover_capabilities, record_discovery
+from .discovery import discover_capabilities, record_discovery, discovery_refresh_scope
 from .transfer import export_project, import_project
 from .publishing import Publisher
 from .state import read_record, text, transaction, write_record
@@ -236,7 +236,7 @@ def _task_command(store, action, args):
         return tasks.approve(args.task_id, **payload)
     if action == "discover":
         payload = load(args.file) if args.file else discover_capabilities(store.project,
-            scope={"resources": task["contract"]["scope"]["resources"]}, backend_config={})
+            scope=discovery_refresh_scope(store, args.task_id), backend_config={})
         return record_discovery(store, args.task_id, payload, expected_revision=args.expected_revision)
     if action == "gate":
         return GateService(store).gate(args.task_id)
@@ -270,7 +270,10 @@ def _task_command(store, action, args):
         if not approved:
             raise ValueError("Current stage requires explicit approval of a reviewed v2 proposal")
         for stage_id in approved:
-            tasks.require_approval(args.task_id, stage_id)
+            # Explicit resume may inspect the current task's paused authority
+            # before the controller clears its own stop. Ancestor stops and all
+            # cancellation/approval checks remain active.
+            tasks.require_approval(args.task_id, stage_id, allow_stopped=action == "resume")
         if action == "verify":
             return controller.verify(args.task_id)
         return controller.run(args.task_id, resume=action == "resume")

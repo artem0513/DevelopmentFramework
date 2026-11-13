@@ -19,6 +19,7 @@ from .runner import Runner, verify_receipt
 from .state import append_event, encode, hash_value, read_record, text, transaction, write_record
 from .store import now
 from .projects import _safe_state
+from .native_paths import logical_path, state_io
 from .tasks import TaskService
 from .recovery import initial_history, bind_stage, canonical_failures, progress_tokens, group_tokens, original_case_progress
 
@@ -45,10 +46,11 @@ DIAGNOSTIC_SCHEMA = _object({"cause": STR, "recommendation": STR, "requires_new_
 def _exclusive(path):
     """OS releases this advisory lock even when the coordinator crashes."""
     _safe_state(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink() or (path.exists() and path.stat().st_nlink > 1):
+    state_io(path.parent).mkdir(parents=True, exist_ok=True)
+    physical = state_io(path)
+    if physical.is_symlink() or (physical.exists() and physical.stat().st_nlink > 1):
         raise ValueError("Invalid execution lock")
-    with path.open("a+b") as stream:
+    with physical.open("a+b") as stream:
         try:
             stream.seek(0)
             if not stream.read(1):
@@ -265,8 +267,8 @@ class WorkflowController:
 
     def _available(self, task_id, timeout):
         root = self.tasks.snapshot(self._root_task(task_id))
-        if read_record(self.store.db, "stop", task_id)["payload"] or read_record(self.store.db, "stop", root["task_id"])["payload"]:
-            raise ValueError("Task is paused by a stop request")
+        if self._stop_requested(task_id):
+            raise ValueError("Task or ancestor is paused or cancelled")
         limit = root["contract"]["execution_policy"]["active_time_budget_seconds"]
         saved_limit = ((read_record(self.store.db, "recovery", root["task_id"])["payload"] or {}).get("hard_limits", {}).get("active_time_budget_seconds"))
         if saved_limit is not None:
@@ -277,8 +279,87 @@ class WorkflowController:
         return min(timeout, limit - used) if limit is not None else timeout
 
     def _stop_requested(self, task_id):
-        return bool(read_record(self.store.db, "stop", task_id)["payload"] or
-                    read_record(self.store.db, "stop", self._root_task(task_id))["payload"])
+        return any(task["state"] == "CANCELLED" or read_record(self.store.db, "stop", task["task_id"])["payload"]
+                   for task in self._ancestry(task_id))
+
+    def _ancestry(self, task_id):
+        tasks, seen = [], set()
+        while task_id:
+            if task_id in seen:
+                raise ValueError("Parent task cycle")
+            seen.add(task_id)
+            task = self.tasks.snapshot(task_id)
+            tasks.append(task)
+            task_id = task["contract"].get("parent_task_id")
+        return tasks
+
+    def _command_authority(self, task_id, spec, stage_id, *, allow_terminal=False):
+        """Current declared recipe and the full inherited authority it relies on."""
+        with transaction(self.store.db):
+            task = self.tasks.require_approval(task_id, stage_id, allow_terminal=allow_terminal)
+            stage = next(s for s in task["contract"]["stages"] if s["id"] == stage_id)
+            plan = self.tasks.execution_plan(task_id)
+            declared = [*stage_checks(task["contract"], plan["checks"], stage_id), *stage.get("actions", [])]
+            if spec not in declared or not self._stage_permits_command(stage, spec):
+                raise ValueError("Command differs from the current approved stage")
+            if self._stop_requested(task_id):
+                raise ValueError("Task or ancestor is paused or cancelled")
+            return self._authority_binding(task_id)
+
+    def _authority_binding(self, task_id):
+        return {"plan_hash": self.tasks.execution_plan(task_id)["plan_hash"], "ancestry": [
+            {"task_id": item["task_id"], "contract_hash": item["contract_hash"], "proposal_hash": item["proposal_hash"],
+             "approval_revision": read_record(self.store.db, "approval", item["task_id"])["revision"],
+             "approval_mode": "inherited" if item.get("inherited_approval") and not item.get("proposal") else "explicit"}
+            for item in self._ancestry(task_id)]}
+
+    def _stage_authority(self, task, stage):
+        with transaction(self.store.db):
+            current = self.tasks.require_approval(task["task_id"], stage["id"])
+            if (current["contract_hash"] != task["contract_hash"] or current["proposal_hash"] != task["proposal_hash"]
+                    or next(s for s in current["contract"]["stages"] if s["id"] == stage["id"]) != stage):
+                raise ValueError("Approved stage context changed; discard the stale candidate")
+            return self._authority_binding(task["task_id"])
+
+    @staticmethod
+    def _stage_permits_command(stage, spec):
+        if "access" in spec and validate_access(spec["access"])["target"] not in stage["scope"]["resources"]:
+            return False
+        if "scope" in spec:
+            from .tasks import _scope, _within
+            if not _within(_scope(spec["scope"]), stage["scope"]):
+                return False
+        return True
+
+    def _command_control(self, task_id, spec, stage_id, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None):
+        current_binding = self._command_authority(task_id, spec, stage_id, allow_terminal=allow_terminal)
+        binding = current_binding if authority_binding is None else authority_binding
+        if current_binding != binding:
+            raise ValueError("Approved command authority changed during preparation")
+
+        def current():
+            return self._command_authority(task_id, spec, stage_id, allow_terminal=allow_terminal) == binding
+
+        def cancelled():
+            try:
+                return not current()
+            except ValueError:
+                return True
+
+        @contextmanager
+        def launch_guard():
+            # Serialize validation + OS process creation with revise/stop/cancel.
+            # Never hold the DB writer while waiting for commands or auth.
+            with transaction(self.store.db):
+                if not current():
+                    raise ValueError("Approved command authority changed before launch")
+                # Check the verified inputs after authentication, immediately
+                # before process creation. Own effects may legitimately change
+                # them afterward, so cancellation keeps checking authority only.
+                self._require_prerequisite_binding(task_id, stage_id, prerequisite_binding)
+                yield
+
+        return cancelled, launch_guard
 
     def _call(self, task_id, function, timeout=1200):
         timeout = self._available(task_id, timeout)
@@ -331,15 +412,22 @@ class WorkflowController:
         from .credentials import CredentialVault
         return CredentialAccess(CredentialVault(self.store.state_home))
 
-    def _execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False):
+    def _execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None):
         from .core import execute
-        cancel = lambda: self._stop_requested(task_id)
+        if stage_id is None:
+            raise ValueError("Command requires its actual approved stage")
+        stage = next(s for s in self.tasks.snapshot(task_id)["contract"]["stages"] if s["id"] == stage_id)
+        if (stage["depends_on"] and spec in stage.get("actions", [])
+                and list(argv) == spec["argv"] and prerequisite_binding is None):
+            raise ValueError("Dependent effect requires current prerequisite evidence binding")
+        cancel, launch_guard = self._command_control(task_id, spec, stage_id, allow_terminal=allow_terminal,
+            prerequisite_binding=prerequisite_binding, authority_binding=authority_binding)
         if "access" not in spec:
-            return execute(argv, self.store.repo, log, timeout, cancel_requested=cancel)
+            return execute(argv, self.store.repo, log, timeout, cancel_requested=cancel, launch_guard=launch_guard)
         self._access_stage(task_id, spec, stage_id, allow_terminal=allow_terminal)
         access = spec["access"]
         receipt = self._access_client().run(access["credential_ref"], access["target"], argv, self.store.repo,
-            log, timeout=timeout, cancel_requested=cancel)
+            log, timeout=timeout, cancel_requested=cancel, launch_guard=launch_guard)
         with transaction(self.store.db) as db:
             append_event(db, "access:" + uuid.uuid4().hex, "access_used", task_id, receipt["access"])
         return receipt
@@ -360,26 +448,51 @@ class WorkflowController:
 
     def ensure_access(self, task_id, stage_id, access):
         with self._ownership(task_id):
-            self._declared_access(task_id, stage_id, access)
+            with transaction(self.store.db):
+                self.tasks.require_approval(task_id, stage_id)
+                authority = self._authority_binding(task_id)
+            spec = self._declared_access(task_id, stage_id, access)
+            cancel, launch_guard = self._command_control(task_id, spec, stage_id, authority_binding=authority)
             return self._call(task_id, lambda timeout: self._access_client().ensure(
                 access["credential_ref"], access["target"], timeout=timeout,
-                cancel_requested=lambda: self._stop_requested(task_id)), 60)
+                cancel_requested=cancel, launch_guard=launch_guard), 60)
 
     def request_access(self, task_id, stage_id, access, path="/", method="GET"):
         with self._ownership(task_id):
-            self._declared_access(task_id, stage_id, access)
+            with transaction(self.store.db):
+                self.tasks.require_approval(task_id, stage_id)
+                authority = self._authority_binding(task_id)
+            spec = self._declared_access(task_id, stage_id, access)
+            cancel, launch_guard = self._command_control(task_id, spec, stage_id, authority_binding=authority)
             return self._call(task_id, lambda timeout: self._access_client().request(
                 access["credential_ref"], access["target"], path=path, method=method, timeout=timeout,
-                cancel_requested=lambda: self._stop_requested(task_id)), 30)
+                cancel_requested=cancel, launch_guard=launch_guard), 30)
 
-    def _observe_action(self, task_id, stage, action, folder, *, allow_terminal=False):
+    def _observe_action(self, task_id, stage, action, folder, *, allow_terminal=False, authority_binding=None):
+        # Capture the observer's declaration before any authentication/process
+        # work. Later aliases must retain this origin rather than relabel it.
+        with transaction(self.store.db):
+            current_authority = self._command_authority(task_id, action, stage["id"], allow_terminal=allow_terminal)
+            authority = current_authority if authority_binding is None else authority_binding
+            if current_authority != authority:
+                raise ValueError("Approved observation authority changed during preparation")
+            task = self.tasks.snapshot(task_id)
+            declared_stage = next(item for item in task["contract"]["stages"] if item["id"] == stage["id"])
+            if "scope" in stage and stage["scope"] != declared_stage["scope"]:
+                raise ValueError("Observation stage scope differs from current declaration")
+            provenance = {"version": 2, "kind": "observation", "task_id": task_id, "stage_id": stage["id"],
+                "project_id": self.store.project_id, "workspace_id": self.store.workspace_id,
+                "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"], "plan_hash": authority["plan_hash"],
+                "action_sha256": hash_value(action), "argv_sha256": hash_value(action["argv"]),
+                "observation_argv_sha256": hash_value(action["observation_argv"]), "declared_stage": declared_stage,
+                "authority": authority, "execution_plan_checks": self.tasks.execution_plan(task_id)["checks"]}
         proof = self._call(task_id, lambda timeout: self._execute_command(task_id, action,
             action["observation_argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"],
-            allow_terminal=allow_terminal), action.get("timeout", 300))
+            allow_terminal=allow_terminal, authority_binding=authority), action.get("timeout", 300))
         if proof.get("exit_code") != 0 or proof.get("error") or proof.get("timed_out") or proof.get("cancelled"):
             raise ValueError("Resource observation failed; effect remains UNKNOWN")
         try:
-            value = json.loads(Path(proof["log"]).read_text(encoding="utf-8"))
+            value = json.loads(state_io(proof["log"]).read_text(encoding="utf-8"))
         except ValueError:
             raise ValueError("Resource observation is not structured JSON; effect remains UNKNOWN") from None
         if (not isinstance(value, dict) or type(value.get("exists")) is not bool
@@ -400,16 +513,18 @@ class WorkflowController:
             observation["provider_attempt_id"] = value["provider_attempt_id"]
         if "access" in proof:
             observation["access"] = proof["access"]
+        provenance["command_receipt"] = proof
+        provenance["command_receipt_sha256"] = hash_value(proof)
+        provenance["sha256"] = hash_value(provenance)
+        observation["provenance"] = provenance
         return observation
 
     def _execute_actions(self, task_id, stage):
         """Probe actual state before every effect, including uncertain resumes."""
         from .core import execute
         from .operations import OperationLedger
-        self.tasks.require_approval(task_id, stage["id"])
-        canonical = next(s for s in self.tasks.snapshot(task_id)["contract"]["stages"] if s["id"] == stage["id"])
-        if canonical != stage:
-            raise ValueError("Action stage differs from the approved contract")
+        task = self.tasks.snapshot(task_id)
+        authority = self._stage_authority(task, stage)
         ledger = OperationLedger(self.store)
         results = []
         for action in stage.get("actions", []):
@@ -419,21 +534,43 @@ class WorkflowController:
             action_id = prepared["action_id"]
             folder = self.store.root / "tasks" / task_id / "actions" / action_id
             _safe_state(folder)
-            folder.mkdir(parents=True, exist_ok=True)
+            state_io(folder).mkdir(parents=True, exist_ok=True)
 
             def observe():
-                return self._observe_action(task_id, stage, action, folder)
+                observation = self._observe_action(task_id, stage, action, folder, authority_binding=authority)
+                if self._stage_authority(task, stage) != authority:
+                    raise ValueError("Approved action authority changed during observation")
+                return observation
 
             observation = observe()
             reconciled = ledger.reconcile(action_id, observation)
             if reconciled["state"] == "UNKNOWN":
                 raise ValueError("External effect remains UNKNOWN; reconcile authoritative state before retry")
             if reconciled["state"] == "ABSENT":
-                self._available(task_id, action.get("timeout", 300))
-                ledger.started(action_id)
+                # A prior action or its observation may have changed a shared
+                # prerequisite since the stage's candidate was checked.
+                prerequisite_blockers, prerequisite_binding = self._revalidate_prerequisites(task, stage)
+                if prerequisite_blockers:
+                    raise ValueError("; ".join(prerequisite_blockers))
+                action_source = source_snapshot(self.store, task["contract"], task_id=task_id)
+                execution_context = {"version": 2, "task_id": task_id, "stage_id": stage["id"], "workspace_id": self.store.workspace_id,
+                    "project_id": self.store.project_id, "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
+                    "plan_hash": authority["plan_hash"], "action_sha256": hash_value(action), "argv_sha256": hash_value(action["argv"]),
+                    "declared_stage": stage, "authority": authority,
+                    "execution_plan_checks": self.tasks.execution_plan(task_id)["checks"],
+                    "source_fingerprint_before": action_source["fingerprint"], "source_files": action_source["files"],
+                    "source_files_sha256": hash_value(action_source["files"])}
+                if len(encode(execution_context).encode()) > 131072:
+                    raise ValueError("Action source evidence exceeds bound before submission")
+                with transaction(self.store.db):
+                    if self._stage_authority(task, stage) != authority:
+                        raise ValueError("Approved action authority changed during prerequisite verification")
+                    self._available(task_id, action.get("timeout", 300))
+                    ledger.started(action_id)
                 execution = self._call(task_id, lambda timeout: self._execute_command(task_id, action,
-                    action["argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"]), action.get("timeout", 300))
-                ledger.record_submission(action_id, execution)
+                    action["argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"],
+                    prerequisite_binding=prerequisite_binding, authority_binding=authority), action.get("timeout", 300))
+                ledger.record_submission(action_id, execution, context=execution_context)
                 observation = observe()
                 ledger.reconcile(action_id, observation)
                 if execution.get("exit_code") != 0 or not observation["exists"]:
@@ -690,18 +827,29 @@ class WorkflowController:
 
     def _check(self, task_id, stage_id=None):
         from .core import execute
-        task = self.tasks.snapshot(task_id)
-        approved = task["approved_stage_ids"] or ([task["contract"]["stages"][0]["id"]] if task["contract"].get("parent_task_id") else [])
-        if not approved:
+        with transaction(self.store.db):
+            task = self.tasks.snapshot(task_id)
+            authority = self._authority_binding(task_id)
+        allowed = []
+        for stage in task["contract"]["stages"]:
+            if stage_id is not None and stage["id"] != stage_id:
+                continue
+            try:
+                self.tasks.require_approval(task_id, stage["id"], allow_terminal=task["state"] == "COMPLETED")
+            except ValueError:
+                if stage_id is not None:
+                    raise
+                continue
+            allowed.append(stage["id"])
+        if not allowed:
             raise ValueError("Checks require current proposal approval")
-        self.tasks.require_approval(task_id, stage_id or approved[0], allow_terminal=task["state"] == "COMPLETED")
         if task["state"] == "COMPLETED":
             # Credential rotation permits fresh observations/checks, never replay
             # a completed resource mutation or reopen its business authority.
             from .operations import OperationLedger
             ledger = OperationLedger(self.store)
             for stage in task["contract"]["stages"]:
-                if stage_id is not None and stage["id"] != stage_id:
+                if stage["id"] not in allowed:
                     continue
                 for action in stage.get("actions", []):
                     if "access" not in action:
@@ -713,15 +861,28 @@ class WorkflowController:
                         action_id = operation["action_id"]
                         folder = self.store.root / "tasks" / task_id / "actions" / action_id
                         _safe_state(folder)
-                        folder.mkdir(parents=True, exist_ok=True)
-                        ledger.reconcile(action_id, self._observe_action(task_id, stage, action, folder, allow_terminal=True))
+                        state_io(folder).mkdir(parents=True, exist_ok=True)
+                        ledger.reconcile(action_id, self._observe_action(task_id, stage, action, folder,
+                            allow_terminal=True, authority_binding=authority))
         plan = self.tasks.execution_plan(task_id)
         before = source_snapshot(self.store, task["contract"], task_id=task_id)
         folder = self.store.root / "tasks" / task_id / "checks" / uuid.uuid4().hex
         _safe_state(folder)
-        folder.mkdir(parents=True)
+        state_io(folder).mkdir(parents=True)
         results = []
-        for raw in stage_checks(task["contract"], plan["checks"], stage_id):
+        check_stages = {}
+        for approved_stage in allowed:
+            stage = next(s for s in task["contract"]["stages"] if s["id"] == approved_stage)
+            for raw in stage_checks(task["contract"], plan["checks"], approved_stage):
+                if self._stage_permits_command(stage, raw):
+                    check_stages.setdefault(raw["id"], approved_stage)
+                elif stage_id is not None:
+                    raise ValueError("Check access or scope exceeds the explicitly selected approved stage")
+        for raw in plan["checks"]:
+            if raw["id"] not in check_stages:
+                continue
+            actual_stage = check_stages[raw["id"]]
+            self.tasks.require_approval(task_id, actual_stage, allow_terminal=task["state"] == "COMPLETED")
             spec = validate_evidence_spec(raw, task["contract"]["profile"])
             if spec["kind"] == "artifact":
                 path = _target(self.store.repo.resolve(), spec["path"])
@@ -731,7 +892,8 @@ class WorkflowController:
                 result = read_record(self.store.db, "manual_evidence", task_id + ":" + spec["id"])["payload"] or {"id": spec["id"], "kind": "manual", "confirmed": False}
             else:
                 result = self._call(task_id, lambda timeout: self._execute_command(task_id, spec, spec["argv"],
-                    folder / (spec["id"] + ".log"), timeout, stage_id, allow_terminal=task["state"] == "COMPLETED"), spec.get("timeout", 300))
+                    folder / (spec["id"] + ".log"), timeout, actual_stage, allow_terminal=task["state"] == "COMPLETED",
+                    authority_binding=authority), spec.get("timeout", 300))
                 result.update(id=spec["id"], kind=spec["kind"], parser=spec.get("parser"), configured_argv=spec["argv"])
             results.append(result)
         after = source_snapshot(self.store, task["contract"], task_id=task_id)
@@ -742,11 +904,51 @@ class WorkflowController:
 
     def _capture_stage(self, task_id, stage_id, verdict):
         task = self.tasks.snapshot(task_id)
-        self._save("stage", task_id + ":" + stage_id, {"state": "COMPLETED", "contract_hash": task["contract_hash"],
-            "proposal_hash": task["proposal_hash"], "fingerprint": verdict["fingerprint"], "gate": verdict, "completed_at": now(),
-            "proof": {"version": 1, "checks": read_record(self.store.db, "checks", task_id)["payload"],
-                      "roles": {role: read_record(self.store.db, "implementation" if role == "implementation" else "verification",
-                          task_id if role == "implementation" else task_id + ":" + role)["payload"] for role in ("implementation", "ac", "review")}}})
+        stage = next(item for item in task["contract"]["stages"] if item["id"] == stage_id)
+        saved = read_record(self.store.db, "stage", task_id + ":" + stage_id)
+        previous = saved["payload"] or {}
+        if previous.get("state") == "COMPLETED" and all(previous.get(key) == task[key] for key in ("contract_hash", "proposal_hash")):
+            raise ValueError("Existing completed stage history cannot be replaced implicitly")
+        kind, key = "stage_implementation", task_id + ":" + stage_id
+        selected = read_record(self.store.db, kind, key)
+        if selected["payload"] is None:
+            kind, key = "implementation", task_id
+            selected = read_record(self.store.db, kind, key)
+        receipt = selected["payload"]
+        if not receipt:
+            raise ValueError("Stage implementation receipt is unavailable")
+        expected = {"contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"],
+            "plan_sha256": self.tasks.execution_plan(task_id)["plan_hash"], "workspace_id": self.store.workspace_id}
+        root = logical_path(receipt["artifact_root"])
+        if not root.is_relative_to(logical_path(self.store.root / "tasks" / task_id / "sessions")):
+            raise ValueError("Stage implementation receipt escapes this task's sessions")
+        if any(receipt.get("bindings", {}).get(name) != value for name, value in expected.items()):
+            raise ValueError("Implementation stage receipt bindings are stale")
+        verify_receipt(receipt)
+        data = state_io(receipt["artifacts"]["request"]["path"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != receipt["artifacts"]["request"]["sha256"]:
+            raise ValueError("Stage implementation request changed after verification")
+        request = json.loads(data)
+        captured = request.get("handoff", {}).get("stage", {})
+        if (receipt.get("role") != "implementation" or request.get("role") != "implementation"
+                or captured.get("id") != stage_id or ("scope" in captured and captured["scope"] != stage["scope"])
+                or request["project"].get("project_id") != self.store.project_id
+                or logical_path(request["project"]["root"]) != logical_path(self.store.repo)):
+            raise ValueError("Stage implementation receipt has another stage/project identity")
+        # Artifact IO/verification stays outside the writer. Publish this exact
+        # prospective capture only if none of its selected identities changed.
+        with transaction(self.store.db):
+            current = self.tasks.snapshot(task_id)
+            if (any(current[name] != task[name] for name in ("contract_hash", "proposal_hash"))
+                    or self.tasks.execution_plan(task_id)["plan_hash"] != expected["plan_sha256"]
+                    or read_record(self.store.db, kind, key) != selected
+                    or read_record(self.store.db, "stage", task_id + ":" + stage_id)["revision"] != saved["revision"]):
+                raise ValueError("Stage capture identities changed during verification")
+            self._save("stage", task_id + ":" + stage_id, {"state": "COMPLETED", "contract_hash": task["contract_hash"],
+                "proposal_hash": task["proposal_hash"], "fingerprint": verdict["fingerprint"], "gate": verdict, "completed_at": now(),
+                "proof": {"version": 1, "checks": read_record(self.store.db, "checks", task_id)["payload"],
+                    "roles": {"implementation": receipt, **{role: read_record(self.store.db, "verification", task_id + ":" + role)["payload"]
+                        for role in ("ac", "review")}}}})
 
     def _stage_history(self, task):
         history, missing = {"historical_only": True, "stages": []}, []
@@ -804,8 +1006,57 @@ class WorkflowController:
                 missing.append("Stage history unavailable: " + stage["id"] + ": " + str(error))
         return history, missing
 
-    def _packet(self, task_id):
+    def _packet(self, task_id, stage_id=None):
+        from .source_coverage import source_availability, availability_gaps, source_bytes, bound_representation, read_persisted_intake
         task = self.tasks.snapshot(task_id)
+        row = self.store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
+        discovery = json.loads(row[0]) if row else None
+        intake_state = read_persisted_intake(discovery)
+        availability = source_availability(self.store, task["contract"], discovery, stage_id)
+        policies = {item["path"]: item for item in availability}
+        representations = {item["artifact_path"]: item for item in (discovery or {}).get("representations", [])}
+        plan = self.tasks.execution_plan(task_id)
+        stage = next((item for item in task["contract"]["stages"] if item["id"] == stage_id), None)
+        if stage_id is not None and stage is None:
+            raise ValueError("Unknown source packet stage")
+        must_review = {Path(item["path"]).as_posix() for item in stage_checks(task["contract"], plan["checks"], stage_id)
+                       if item["kind"] == "artifact" and item.get("required", True)}
+
+        def source_policy(path):
+            matching = [item for resource, item in policies.items() if Path(path).is_relative_to(Path(resource))]
+            return max(matching, key=lambda item: len(Path(item["path"]).parts)) if matching else None
+
+        def coverage_required(path):
+            if body_omission(path) is not None:
+                return False
+            policy = source_policy(path)
+            return path in must_review or policy is None or (policy["relevant"] and (policy["required"] or policy["role"] in {"output", "workspace", "representation"}))
+
+        def direct_body_omission(path):
+            if path in must_review:
+                return None
+            policy = source_policy(path)
+            if policy is not None:
+                if not policy["relevant"]:
+                    return "OMITTED_IRRELEVANT_STAGE"
+                if policy["role"] == "input" and not policy["required"]:
+                    return "OMITTED_OPTIONAL_INPUT"
+            return None
+
+        def body_omission(path):
+            if path in must_review:
+                return None
+            owners = [artifact for artifact, declaration in representations.items() if declaration["path"] == path]
+            if owners:
+                policy = source_policy(path)
+                if policy is not None and policy["role"] != "representation" and direct_body_omission(path) is None:
+                    return None  # Independently required as a source or output.
+                decisions = [direct_body_omission(artifact) for artifact in owners]
+                if all(decisions):
+                    return "OMITTED_OPTIONAL_INPUT" if "OMITTED_OPTIONAL_INPUT" in decisions else "OMITTED_IRRELEVANT_STAGE"
+                return None  # At least one included artifact needs this body.
+            return direct_body_omission(path)
+
         snapshot = source_snapshot(self.store, task["contract"], task_id=task_id)
         baseline = read_record(self.store.db, "baseline", task_id)["payload"]
         changes = None
@@ -819,7 +1070,28 @@ class WorkflowController:
                        "baseline_dirty": baseline.get("dirty"), "coverage": "Actual content/mode hashes from baseline and current source observations; software covers tracked and nonignored untracked files plus declared dependencies",
                        "changes": [{"path": p, "before_sha256": baseline["files"].get(p), "after_sha256": snapshot["files"].get(p)} for p in changed],
                        "unchanged_paths": unchanged[:1000], "unchanged_path_count": len(unchanged), "unchanged_paths_truncated": len(unchanged) > 1000}
-        files, missing = [], []
+            review_scope = stage["scope"] if stage is not None else task["contract"]["scope"]
+            if set(review_scope["effects"]) & {"file_write", "command"}:
+                must_review.update(path for path in changed if any(Path(path).is_relative_to(Path(resource)) for resource in review_scope["resources"]))
+        must_review.update(item["path"] for artifact, item in representations.items() if artifact in must_review)
+        files = []
+        missing = [gap["id"] + ": " + gap["text"] for gap in [*availability_gaps(availability), *intake_state["compatibility_gaps"]]]
+        for path, observation in snapshot.get("unavailable", {}).items():
+            availability.append({"path": path, **observation, "reason": "Source snapshot could not read this declared resource"})
+            if coverage_required(path):
+                missing.append(path + ": source snapshot unavailable (" + observation["error"] + ")")
+        representation_metadata = []
+        for artifact, declaration in representations.items():
+            omission = body_omission(artifact)
+            if omission:
+                artifact_hash = snapshot["files"].get(artifact, "").removesuffix(":x")
+                readable_hash = snapshot["files"].get(declaration["path"], "").removesuffix(":x")
+                current = artifact_hash == declaration["artifact_sha256"] and readable_hash == declaration["sha256"]
+                representation_metadata.append({**declaration, "body_status": omission,
+                                                "observed_artifact_sha256": artifact_hash or None, "observed_representation_sha256": readable_hash or None,
+                                                "integrity": "CURRENT_SNAPSHOT_HASHES" if current else "STALE_OR_UNAVAILABLE_SNAPSHOT_BINDING",
+                                                "limitation": "Artifact/representation bodies were omitted from review; the declared binding and current source hashes remain visible"})
+        omitted_sources = []
         selected = set()
         for resource in source_resources(self.store, task["contract"], task_id):
             candidate = self.store.repo / resource
@@ -836,13 +1108,35 @@ class WorkflowController:
                     raise ValueError("Private Git data is not a source packet")
                 if not candidate.exists():
                     continue
-                data = candidate.read_bytes()
-                if len(data) > 512000:
-                    raise ValueError("source exceeds per-file packet bound")
+                omission = body_omission(path)
+                if omission:
+                    policy = source_policy(path)
+                    observed_hash = snapshot["files"].get(path)
+                    omitted_sources.append({"path": path, "sha256": observed_hash,
+                                            "status": "AVAILABLE" if observed_hash is not None else "UNAVAILABLE",
+                                            "body_status": omission, "required": policy["required"], "relevant": policy["relevant"],
+                                            "blocking_stage_ids": policy["blocking_stage_ids"], "reason": policy["reason"],
+                                            "limitation": "Body was not supplied or reviewed in this packet; current source hashes and declared stage impact remain visible"})
+                    continue
+                if path in representations:
+                    represented = bound_representation(self.store.repo, representations[path])
+                    if not any(item["path"] == represented["path"] for item in files):
+                        files.append(represented)
+                    representation_metadata.append({**representations[path], "integrity": "Current artifact and readable representation bytes match both declared hashes",
+                                                    "limitation": "Representation adequacy requires independent domain judgment; native binary bytes are not interpreted by this transport"})
+                    continue
+                data = source_bytes(self.store.repo, path)
                 content = data.decode("utf-8")
-                files.append({"path": path, "content": content, "sha256": hashlib.sha256(data).hexdigest()})
+                if "\0" in content:
+                    raise ValueError("source contains binary NUL bytes")
+                if not any(item["path"] == path for item in files):
+                    files.append({"path": path, "content": content, "sha256": hashlib.sha256(data).hexdigest()})
             except (UnicodeError, OSError, ValueError) as ex:
-                missing.append(path + ": " + str(ex))
+                if coverage_required(path):
+                    missing.append(path + ": " + str(ex))
+                else:
+                    availability.append({"path": path, "status": "UNCOVERED", "required": False,
+                                         "limitation": str(ex), "reason": "Optional or outside the current stage's source requirement"})
         historical = read_record(self.store.db, "baseline_implementation", task_id)["payload"]
         if historical and changes:
             try:
@@ -852,29 +1146,43 @@ class WorkflowController:
                 original = json.loads(Path(historical["artifacts"]["request"]["path"]).read_bytes())
                 changed_paths = {entry["path"] for entry in changes["changes"]}
                 for before in original["source_packet"]["files"]:
-                    if before["path"] in changed_paths:
+                    if before["path"] in changed_paths and body_omission(before["path"]) is None:
                         files.append({**before, "path": "_ase_before/" + before["path"]})
             except (ValueError, OSError, KeyError, TypeError) as ex:
                 missing.append("Historical source capture unavailable: " + str(ex))
         stage_history, history_missing = self._stage_history(task)
         missing.extend(history_missing)
-        for name, data in (("contract", task["contract"]), ("execution_plan", self.tasks.execution_plan(task_id)), ("source_changes", changes), ("stage_history", stage_history),
+        from .action_evidence import action_packet_evidence
+        action_files, action_missing = action_packet_evidence(self.store, task, plan, snapshot, stage_id=stage_id)
+        files.extend(action_files)
+        missing.extend(action_missing)
+        for name, data in (("contract", task["contract"]), ("execution_plan", plan), ("source_changes", changes), ("stage_history", stage_history),
+                           ("discovery", discovery), ("intake_validation", intake_state["validation"]), ("source_availability", availability), ("artifact_representations", representation_metadata), ("omitted_sources", omitted_sources),
                            ("actual_checks", read_record(self.store.db, "checks", task_id)["payload"])):
             content = encode(data)
             files.append({"path": "_ase_context/" + name + ".json", "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest()})
         check = read_record(self.store.db, "checks", task_id)["payload"]
         for result in (check or {}).get("results", []):
             if result.get("log"):
-                log = Path(result["log"])
-                if not log.resolve().is_relative_to(self.store.root.resolve()) or not log.is_file():
+                try:
+                    log = logical_path(result["log"])
+                    if not log.is_relative_to(self.store.root.resolve()):
+                        raise ValueError("Log is outside project state")
+                    physical = state_io(log)
+                    if not physical.is_file():
+                        raise ValueError("Log is unavailable")
+                    content = physical.read_bytes().decode("utf-8", errors="replace")
+                except (OSError, ValueError):
                     missing.append("Actual check log unavailable: " + result["id"])
                     continue
-                content = log.read_bytes().decode("utf-8", errors="replace")
                 files.append({"path": "_ase_context/logs/" + result["id"] + ".txt", "content": content,
                               "sha256": hashlib.sha256(content.encode()).hexdigest()})
-        return {"requirements": [task["contract"]["request"], *[ac["id"] + ": " + ac["expected"] for ac in task["contract"]["acceptance"]]],
-                "files": files, "coverage": {"scope": "Current declared project source plus task contract and actual check logs; undeclared dependencies are not proven complete",
-                                               "included": [f["path"] for f in files], "missing": missing}}
+        packet = {"requirements": [task["contract"]["request"], *[ac["id"] + ": " + ac["expected"] for ac in task["contract"]["acceptance"]]],
+                "files": files, "coverage": {"scope": "Current stage source plus task contract and actual check logs; known irrelevant/optional bodies are explicitly disclosed in omitted_sources; undeclared dependencies are not proven complete",
+                                               "included": [f["path"] for f in files], "missing": missing,
+                                               "omitted": [item["path"] for item in omitted_sources]}}
+        from .protocol import validate_packet
+        return validate_packet(packet)
 
     def _request(self, task_id, role, schema, handoff=None):
         task = self.tasks.snapshot(task_id)
@@ -896,7 +1204,7 @@ class WorkflowController:
         return {"role": role, "project": {"root": str(self.store.repo), "project_id": self.store.project_id}, "schema": schema,
                 "bindings": {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"] or "unapproved",
                              "plan_sha256": plan["plan_hash"], "check_sha256": hash_value(check) if check else "missing", "workspace_id": self.store.workspace_id},
-                "source_packet": self._packet(task_id), "handoff": handoff}
+                "source_packet": self._packet(task_id, stage_id=handoff.get("stage_id") or handoff.get("stage", {}).get("id")), "handoff": handoff}
 
     def _runner(self, task_id):
         if self.runner is not None:
@@ -1012,6 +1320,69 @@ class WorkflowController:
         self._save("active_workflow", root_id, None)
         return {**verdict, "session_id": session_id, "closure": closure}
 
+    def _revalidate_prerequisites(self, task, stage):
+        """Historical completion cannot authorize a new dependent effect.
+
+        Reassess the complete dependency chain against current checks and fresh
+        independent judgment. Never reserve/replay prerequisite implementation
+        or actions. Keeping the historical marker allows a later explicit resume
+        to reassess repaired artifacts without repeating completed mutations.
+        Return blockers and the common source binding from successful checks
+        and judgments, never a newly sampled baseline after verification.
+        """
+        by_id = {item["id"]: item for item in task["contract"]["stages"]}
+        ordered, selected = [], set()
+        def include(stage_id):
+            if stage_id in selected:
+                return
+            selected.add(stage_id)
+            for dependency in by_id[stage_id]["depends_on"]:
+                include(dependency)
+            ordered.append(stage_id)
+        for stage_id in stage["depends_on"]:
+            include(stage_id)
+        binding = None
+        for stage_id in ordered:
+            try:
+                proof = read_record(self.store.db, "stage", task["task_id"] + ":" + stage_id)["payload"] or {}
+                if (proof.get("state") != "COMPLETED" or proof.get("contract_hash") != task["contract_hash"]
+                        or proof.get("proposal_hash") != task["proposal_hash"]):
+                    raise ValueError("Current completed stage proof is missing")
+                self.tasks.require_approval(task["task_id"], stage_id)
+                checks = self.check(task["task_id"], stage_id)
+                specs = stage_checks(task["contract"], self.tasks.execution_plan(task["task_id"])["checks"], stage_id)
+                profile = evaluate_contract_profiles(task["contract"], specs, checks["results"], stage_id=stage_id)
+                verdict = (self.verify(task["task_id"], stage_id) if profile["status"] == "PASS"
+                           else GateService(self.store).gate(task["task_id"], stage_id=stage_id))
+                if verdict["status"] != "APPROVED":
+                    reasons = list(dict.fromkeys(verdict.get("blocked_reasons", []) + verdict.get("rejected_reasons", [])))
+                    return (["Prerequisite " + stage_id + " requires current verification: " + reason
+                             for reason in (reasons or ["Current independent approval is unavailable"])], None)
+                observed = {"task_id": task["task_id"], "stage_id": stage["id"], "workspace_id": checks["workspace_id"],
+                    "contract_hash": checks["contract_hash"], "proposal_hash": task["proposal_hash"],
+                    "plan_hash": checks["plan_hash"], "fingerprint": checks["fingerprint"]}
+                if checks.get("source_changed_during_checks") or verdict.get("fingerprint") != observed["fingerprint"]:
+                    raise ValueError("Prerequisite source changed during current verification")
+                if binding is not None and binding != observed:
+                    raise ValueError("Prerequisite source changed between dependency observations")
+                binding = observed
+            except (ValueError, OSError, KeyError, TypeError) as ex:
+                from .core import redact
+                return (["Prerequisite " + stage_id + " requires current verification: " + redact(ex)], None)
+        return [], binding
+
+    def _require_prerequisite_binding(self, task_id, stage_id, binding):
+        """Compare verified local inputs only at the final mutation boundary."""
+        if binding is None:
+            return
+        task = self.tasks.snapshot(task_id)
+        current = {"task_id": task_id, "stage_id": stage_id, "workspace_id": self.store.workspace_id,
+            "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
+            "plan_hash": self.tasks.execution_plan(task_id)["plan_hash"],
+            "fingerprint": source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"]}
+        if binding != current:
+            raise ValueError("Prerequisite evidence changed before dependent mutation; reassess current prerequisites")
+
     def _run(self, task_id, *, resume=False):
         task = self.tasks.snapshot(task_id)
         if task["state"] in {"BLOCKED", "PAUSED"} and not resume:
@@ -1102,6 +1473,11 @@ class WorkflowController:
         """Settle one stage; the scheduler retains its blockers and runs independent work."""
         task_id, stage_id = task["task_id"], stage["id"]
         while True:
+            # Every corrective iteration needs current prerequisite proof before
+            # reserving another candidate, including explicit resumes.
+            prerequisite_blockers, _ = self._revalidate_prerequisites(task, stage)
+            if prerequisite_blockers:
+                return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
             progress_key = task_id + ":" + stage_id
             progress = read_record(self.store.db, "cycle", progress_key)["payload"] or {}
             resume_verdict = None
@@ -1150,20 +1526,41 @@ class WorkflowController:
                             "candidate_id": reservation["candidate_id"], "corrective_probe": reservation["corrective_probe"]}
                 self._save("cycle", progress_key, progress)
                 feedback = read_record(self.store.db, "gate", progress_key)["payload"]
+                candidate_authority = self._stage_authority(task, stage)
                 candidate = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "implementation", EDIT_SCHEMA,
                     {"instruction": "Propose minimal approved-scope edits. Empty before_sha256 means a new file. Do not change requirements or proof state.",
                      "stage": stage, "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
                 self._save("implementation", task_id, candidate["receipt"])
+                # Preserve unfinished independent stages before a later stage
+                # replaces the task-wide latest candidate. This is a proposal
+                # receipt, not a checkpoint asserting that edits were applied.
+                self._save("stage_implementation", task_id + ":" + stage_id, candidate["receipt"])
                 if candidate["result"]["status"] != "COMPLETE":
                     return {"status": "BLOCKED", "blocked_reasons": [candidate["result"]["blocker"]]}
                 if not read_record(self.store.db, "baseline_implementation", task_id)["payload"]:
                     self._save("baseline_implementation", task_id, candidate["receipt"])
-                self.tasks.require_approval(task_id, stage_id)
-                self._available(task_id, 1)
-                apply_edits(self.store.repo, stage["scope"], candidate["result"]["payload"]["edits"])
+                # Candidate generation may be long. Renew the actual prerequisite
+                # proof after it returns, before considering any candidate writes.
+                prerequisite_blockers, prerequisite_binding = self._revalidate_prerequisites(task, stage)
+                if prerequisite_blockers:
+                    return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
+                # File writes share the same linearized authority boundary as
+                # process creation. A replacement approval cannot authorize a
+                # candidate generated under the previous scope or ancestry.
+                with transaction(self.store.db):
+                    if self._stage_authority(task, stage) != candidate_authority:
+                        raise ValueError("Candidate authority changed before file mutation")
+                    self._available(task_id, 1)
+                    self._require_prerequisite_binding(task_id, stage_id, prerequisite_binding)
+                    apply_edits(self.store.repo, stage["scope"], candidate["result"]["payload"]["edits"])
                 progress.update(phase="CHECKING", fingerprint=source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"])
                 self._save("cycle", progress_key, progress)
             if progress["phase"] == "CHECKING" and not progress.get("read_only_recovery"):
+                # Approved overlapping edits may regress a prerequisite. Assess
+                # their actual result before any dependent action is launched.
+                prerequisite_blockers, _ = self._revalidate_prerequisites(task, stage)
+                if prerequisite_blockers:
+                    return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
                 self.execute_actions(task_id, stage)
             if resume_verdict is None:
                 current = self.tasks.snapshot(task_id)

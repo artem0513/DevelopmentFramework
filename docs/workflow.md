@@ -28,6 +28,12 @@ Persist the exact proposal hash, contract revision, approved stages, observed or
 
 ## Execution and evidence
 
+Commands are authorized for their actual stage immediately before process creation, including after authentication. Final authority validation and process creation share a short transaction with contract revision, stop and cancellation. Stops and cancellations apply through every ancestor; active commands are cancelled when that authority is withdrawn. Cancellation cannot undo an external effect already applied, so interrupted submissions still require reconciliation before retry. Task-wide checks select currently authorized stages. Completed prerequisite stages require fresh checks and independent verification before dependent work; this never replays their implementation or mutations.
+
+For required/optional source inputs, intentional output absence, and hash-bound readable representations of binary artifacts, see [source availability and artifact evidence](source-evidence.md). Representations prove the identity of reviewed bytes; the independent domain reviewer judges whether they adequately represent the native artifact.
+
+Linked checks belong to the stages whose acceptance criteria name them. A shared check must be linked to each relevant criterion or left unlinked as a common task check; a mandatory test of a deferred stage is never implicitly authorized elsewhere. Check-specific scope and credential targets must fit the selected approved stage. Each software stage still needs positive executed test evidence, and the final gate still requires every mandatory check. Explicit resume may clear only that task's own stop; ancestor stops and cancellation remain effective.
+
 Use the configured local backend adapter and relevant domain skills. Preserve platform permissions. Perform real checks appropriate to the acceptance profile and keep executable facts separate from model judgments:
 
 | Profile | Required evidence |

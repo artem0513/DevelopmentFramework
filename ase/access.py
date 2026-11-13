@@ -120,14 +120,14 @@ class CredentialAccess:
     def __init__(self, vault):
         self.vault = vault
 
-    def _protocol(self, recipe, profile, deadline, cancel):
+    def _protocol(self, recipe, profile, deadline, cancel, launch_guard=None):
         argv = recipe['argv']
         _check_argv(argv, _profile_secrets(profile))
         if not Path(argv[0]).is_absolute():
             raise _failure('CLI_UNAVAILABLE')
         try:
             result = capture_process(argv, self.vault.home, timeout=min(recipe.get('timeout', 60), _remaining(deadline, cancel)),
-                                     max_output_bytes=_MAX_OUTPUT, cancel_requested=cancel, env=_env(profile))
+                                     max_output_bytes=_MAX_OUTPUT, cancel_requested=cancel, env=_env(profile), launch_guard=launch_guard)
         except CredentialError:
             raise
         except (OSError, ValueError):
@@ -148,7 +148,7 @@ class CredentialAccess:
             raise _failure('INVALID_CLI_RESPONSE')
         return payload
 
-    def _ensure(self, ref, target, deadline, cancel):
+    def _ensure(self, ref, target, deadline, cancel, launch_guard=None):
         validate_access_ref(ref)
         target = normalize_target(target)
         with _profile_lock(self.vault, ref, deadline, cancel):
@@ -158,10 +158,10 @@ class CredentialAccess:
             session = profile.get('session')
             status = 'prepared'
             if session:
-                probe = self._protocol(session['probe'], profile, deadline, cancel)
+                probe = self._protocol(session['probe'], profile, deadline, cancel, launch_guard)
                 status = probe['status']
                 if status == 'login_required':
-                    login = self._protocol(session['login'], profile, deadline, cancel)
+                    login = self._protocol(session['login'], profile, deadline, cancel, launch_guard)
                     if login['status'] != 'authenticated':
                         raise _failure({'interaction_required':'INTERACTION_REQUIRED', 'unavailable':'CLI_UNAVAILABLE', 'login_required':'LOGIN_REQUIRED'}[login['status']])
                     changes = login.get('secrets', {})
@@ -171,34 +171,34 @@ class CredentialAccess:
                         self.vault.update_secrets(ref, target, changes, profile['revision'], timeout=_remaining(deadline, cancel), cancel_requested=cancel)
                         profile = self.vault.resolve(ref, target, timeout=_remaining(deadline, cancel), cancel_requested=cancel)
                         sensitive.extend(_profile_secrets(profile))
-                    status = self._protocol(session['probe'], profile, deadline, cancel)['status']
+                    status = self._protocol(session['probe'], profile, deadline, cancel, launch_guard)['status']
                 if status != 'authenticated':
                     raise _failure({'interaction_required':'INTERACTION_REQUIRED', 'unavailable':'CLI_UNAVAILABLE', 'login_required':'LOGIN_REQUIRED'}[status])
             return profile, {'credential_ref': ref, 'target': target, 'revision': profile['revision'], 'status': status}, sensitive
 
-    def ensure(self, ref, target, timeout=60, cancel_requested=None):
+    def ensure(self, ref, target, timeout=60, cancel_requested=None, launch_guard=None):
         if type(timeout) not in (int, float) or timeout <= 0:
             raise _failure('INVALID_TIMEOUT')
-        return self._ensure(ref, target, time.monotonic() + timeout, cancel_requested)[1]
+        return self._ensure(ref, target, time.monotonic() + timeout, cancel_requested, launch_guard)[1]
 
-    def run(self, ref, target, argv, cwd, log, timeout=300, cancel_requested=None):
+    def run(self, ref, target, argv, cwd, log, timeout=300, cancel_requested=None, launch_guard=None):
         if type(timeout) not in (int, float) or timeout <= 0:
             raise _failure('INVALID_TIMEOUT')
         deadline = time.monotonic() + timeout
-        profile, metadata, secrets = self._ensure(ref, target, deadline, cancel_requested)
+        profile, metadata, secrets = self._ensure(ref, target, deadline, cancel_requested, launch_guard)
         _check_argv(argv, secrets)
         receipt = core.execute(argv, cwd, log, timeout=_remaining(deadline, cancel_requested), env=_env(profile),
-                               sensitive_values=secrets, cancel_requested=cancel_requested, max_output_bytes=1048576)
+                               sensitive_values=secrets, cancel_requested=cancel_requested, max_output_bytes=1048576, launch_guard=launch_guard)
         receipt['access'] = {k: metadata[k] for k in ('credential_ref', 'target', 'revision')}
         return receipt
 
-    def request(self, ref, target, path='/', method='GET', timeout=30, cancel_requested=None):
+    def request(self, ref, target, path='/', method='GET', timeout=30, cancel_requested=None, launch_guard=None):
         if type(timeout) not in (int, float) or timeout <= 0:
             raise _failure('INVALID_TIMEOUT')
         if method not in {'GET', 'HEAD'} or not isinstance(path, str) or not path.startswith('/') or path.startswith('//'):
             raise _failure('INVALID_REQUEST')
         deadline = time.monotonic() + timeout
-        profile, metadata, secrets = self._ensure(ref, target, deadline, cancel_requested)
+        profile, metadata, secrets = self._ensure(ref, target, deadline, cancel_requested, launch_guard)
         origin = metadata['target']
         url = urljoin(origin + '/', path)
         parts = urlsplit(url)
@@ -222,7 +222,7 @@ class CredentialAccess:
         worker = Path(__file__).with_name('_http_worker.py').resolve()
         captured = capture_process([sys.executable, '-I', '-S', str(worker)], self.vault.home,
                                    timeout=_remaining(deadline, cancel_requested), max_output_bytes=_MAX_OUTPUT * 6 + 4096,
-                                   input_bytes=worker_input, cancel_requested=cancel_requested)
+                                   input_bytes=worker_input, cancel_requested=cancel_requested, launch_guard=launch_guard)
         if captured['cancelled']:
             raise _failure('CANCELLED')
         if captured['timed_out']:

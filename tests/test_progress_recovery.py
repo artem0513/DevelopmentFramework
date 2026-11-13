@@ -185,9 +185,19 @@ class ProgressRecoveryTests(unittest.TestCase):
     def test_actual_observation_preserves_authoritative_absence(self):
         folder = self.store.root / "observation-test"
         folder.mkdir()
-        observation = self.controller._observe_action("recovery", {"id": "draft"},
-            {"observation_argv": [sys.executable, "-c", "print('{\"exists\":false,\"absence_confirmed\":true}')"]}, folder)
+        stage, action = self.approved_observer({"id": "absence-observer", "argv": ["configured-effect"],
+            "observation_argv": [sys.executable, "-c", "print('{\"exists\":false,\"absence_confirmed\":true}')"]})
+        observation = self.controller._observe_action("recovery", stage, action, folder)
         self.assertIs(observation.get("absence_confirmed"), True)
+
+    def approved_observer(self, action):
+        """Observation transport tests still declare and approve the real recipe."""
+        spec = copy.deepcopy(self.tasks.snapshot("recovery")["contract"])
+        spec["scope"]["effects"].append("command")
+        spec["stages"][0]["scope"]["effects"].append("command")
+        spec["stages"][0]["actions"] = [action]
+        stage = self.approve(spec)["contract"]["stages"][0]
+        return stage, stage["actions"][0]
 
     def loop_fixture(self, *, supported=True, progress_on_probe=False, hard_cap=None):
         """Protocol children test orchestration; a gate double never approves."""
@@ -438,8 +448,9 @@ elif 'cause' in schema['properties']:
     def test_actual_observation_preserves_provider_attempt_identity(self):
         folder = self.store.root / "provider-observation-test"
         folder.mkdir()
-        observation = self.controller._observe_action("recovery", {"id": "draft"},
-            {"observation_argv": [sys.executable, "-c", "print('{\"exists\":false,\"absence_confirmed\":true,\"provider_attempt_id\":\"request-1\"}')"]}, folder)
+        stage, action = self.approved_observer({"id": "provider-observer", "argv": ["configured-effect"],
+            "observation_argv": [sys.executable, "-c", "print('{\"exists\":false,\"absence_confirmed\":true,\"provider_attempt_id\":\"request-1\"}')"]})
+        observation = self.controller._observe_action("recovery", stage, action, folder)
         self.assertEqual(observation.get("provider_attempt_id"), "request-1")
 
     def test_provider_terminal_absence_is_bound_to_captured_submission(self):
@@ -574,7 +585,8 @@ elif 'cause' in schema['properties']:
         folder.mkdir()
         action = {"id": "current-action", "argv": ["configured-effect"], "timeout": 30,
             "observation_argv": [sys.executable, "-c", "print('{\"exists\":false,\"observing_task_id\":\"forged\",\"action_hash\":\"forged\"}')"]}
-        observation = self.controller._observe_action("recovery", {"id": "draft"}, action, folder)
+        stage, action = self.approved_observer(action)
+        observation = self.controller._observe_action("recovery", stage, action, folder)
         self.assertEqual(observation.get("action_hash"), hash_value(action))
         self.assertEqual(observation.get("observing_task_id"), "recovery")
         self.assertEqual(observation.get("observing_stage_id"), "draft")

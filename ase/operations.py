@@ -5,7 +5,8 @@ from pathlib import Path
 import posixpath
 from urllib.parse import urlsplit, urlunsplit
 
-from .state import append_event, hash_value, identifier, read_record, text, transaction, write_record
+from .state import append_event, encode, hash_value, identifier, read_record, text, transaction, write_record
+from .native_paths import state_io
 
 
 class OperationLedger:
@@ -196,6 +197,7 @@ class OperationLedger:
                          attempt_number=previous.get("attempt_number", 0) + 1)
             # A terminal rejection covers the previous attempt, never the next one.
             binding = value.pop("submission_binding", None)
+            value.pop("execution_receipt", None)
             if binding:
                 value["consumed_provider_attempt_ids"] = list(dict.fromkeys(
                     [*value.get("consumed_provider_attempt_ids", []), binding["provider_attempt_id"]]))
@@ -232,7 +234,7 @@ class OperationLedger:
                 and value.get("nonapplication_attempt_number") == value["attempt_number"]
                 and value.get("nonapplication_provider_attempt_id") == value["submission_binding"]["provider_attempt_id"])
 
-    def record_submission(self, action_id, execution):
+    def record_submission(self, action_id, execution, *, context=None):
         """Bind an actual submission receipt to the current local attempt.
 
         A recipe may emit one complete JSON object containing its provider's
@@ -247,9 +249,19 @@ class OperationLedger:
         text(execution.get("log_sha256"), "Submission log hash")
         try:
             log = Path(execution["log"])
+            physical = state_io(log)
             # Large ordinary command output can still reconcile positive effects;
             # it is not a supported structured provider acknowledgement.
-            data = log.read_bytes() if log.stat().st_size <= 1024 * 1024 else None
+            size = physical.stat().st_size
+            data = physical.read_bytes() if size <= 1024 * 1024 else None
+            verified_log = size <= 16 * 1024 * 1024
+            if verified_log:
+                observed_hash = hashlib.sha256()
+                with physical.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(65536), b""):
+                        observed_hash.update(chunk)
+                if observed_hash.hexdigest() != execution["log_sha256"]:
+                    raise ValueError("Submission log does not match its execution receipt")
         except OSError:
             raise ValueError("Submission log is unavailable") from None
         if data is not None and hashlib.sha256(data).hexdigest() != execution["log_sha256"]:
@@ -269,21 +281,38 @@ class OperationLedger:
             if (previous["state"] != "UNKNOWN" or type(previous.get("attempt_number")) is not int
                     or previous["attempt_number"] <= 0):
                 raise ValueError("Submission has no current started attempt")
-            if provider is None:
-                return previous
-            if provider in previous.get("consumed_provider_attempt_ids", []):
+            if provider is not None and provider in previous.get("consumed_provider_attempt_ids", []):
                 raise ValueError("Provider attempt ID was consumed by an earlier submission")
-            binding = {"attempt_number": previous["attempt_number"], "provider_attempt_id": provider,
-                       "proof_ref": execution["log"] + "#sha256=" + execution["log_sha256"]}
+            fields = ("argv", "configured_argv", "launch_normalization", "cwd", "started", "ended", "duration_seconds", "exit_code", "error", "timed_out",
+                      "cancelled", "output_limited", "log", "log_sha256", "access")
+            capture = {"attempt_number": previous["attempt_number"], "execution": {key: execution[key] for key in fields if key in execution},
+                       "context": context, "log_integrity": "VERIFIED" if verified_log else "NOT_VERIFIED_OVER_LIMIT"}
+            capture["sha256"] = hash_value(capture)
+            if previous.get("execution_receipt") is not None and previous["execution_receipt"] != capture:
+                raise ValueError("Submission conflicts with immutable execution receipt for this attempt")
             current = previous.get("submission_binding")
-            if current:
+            if current and provider is not None:
                 if current["provider_attempt_id"] != provider:
                     raise ValueError("Submission conflicts with current provider attempt binding")
                 return previous
-            value = dict(previous, submission_binding=binding)
+            value = dict(previous)
+            fresh_execution = "execution_receipt" not in previous
+            if fresh_execution:
+                if len(encode(capture).encode()) > 262144:
+                    raise ValueError("Execution evidence metadata exceeds bound")
+                value["execution_receipt"] = capture
+            if provider is not None:
+                value["submission_binding"] = {"attempt_number": previous["attempt_number"], "provider_attempt_id": provider,
+                    "proof_ref": execution["log"] + "#sha256=" + execution["log_sha256"]}
+            elif not fresh_execution:
+                return previous
             write_record(db, "operation", action_id, value, expected_revision=record["revision"])
-            append_event(db, "operation:" + action_id + ":submission:" + str(previous["attempt_number"]),
-                         "operation_submission_recorded", value["task_id"], value)
+            if fresh_execution:
+                append_event(db, "operation:" + action_id + ":execution:" + str(previous["attempt_number"]),
+                             "operation_execution_recorded", value["task_id"], value)
+            if provider is not None:
+                append_event(db, "operation:" + action_id + ":submission:" + str(previous["attempt_number"]),
+                             "operation_submission_recorded", value["task_id"], value)
         return value
 
     @staticmethod

@@ -4,14 +4,14 @@ The local user owns this program and its state. This is an error-detection bound
 not protection from a malicious process running with that user's credentials.
 """
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, date as calendar_date, timedelta
 import fnmatch
 import hashlib
 import base64
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -22,6 +22,7 @@ import uuid
 from urllib.parse import quote, quote_plus
 
 from .store import Store, now
+from .native_paths import logical_path, state_io
 
 STATUSES = {"PASS", "FAIL", "UNVERIFIED", "BLOCKED", "NOT_APPLICABLE"}
 PROTECTED = [".github/workflows/*", ".codex/*", ".agents/*", "AGENTS.md", ".gitmodules", ".githooks/*"]
@@ -266,26 +267,93 @@ def test_counts(output, parser):
     return {"total": total, "skipped": skipped, "failed": failed}
 
 
-def execute(argv, cwd, log, timeout=300, *, env=None, cancel_requested=None, sensitive_values=(), max_output_bytes=None):
+_MANAGER_SCRIPTS = {"npm": "node_modules/npm/bin/npm-cli.js", "pnpm": "node_modules/pnpm/bin/pnpm.cjs",
+                    "yarn": "node_modules/yarn/bin/yarn.js"}
+
+
+def _command_hash(value):
+    return digest(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _launch_file(path):
+    path = Path(path).resolve(strict=True)
+    observed = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1048576), b""):
+            observed.update(chunk)
+    return {"path": str(path), "sha256": observed.hexdigest()}
+
+
+def validate_command_argv(receipt, configured):
+    """Validate captured command identity, without resolving today's PATH/files."""
+    expected = [redact(argument) for argument in configured]
+    actual, proof = receipt.get("argv"), receipt.get("launch_normalization")
+    if receipt.get("configured_argv", expected) != expected:
+        raise ValueError("Configured argv differs from approved recipe")
+    if proof is None:
+        if actual != expected:
+            raise ValueError("Execution argv differs from approved recipe without launch proof")
+        return
+    fields = {"version", "kind", "manager", "wrapper", "runtime", "entrypoint", "configured_sha256", "executed_sha256", "sha256"}
+    if (not isinstance(proof, dict) or set(proof) != fields or type(proof.get("version")) is not int or proof.get("version") != 1
+            or proof.get("kind") != "windows_package_manager" or not expected or expected[0] not in _MANAGER_SCRIPTS
+            or proof.get("manager") != expected[0] or receipt.get("configured_argv") != expected
+            or proof["sha256"] != _command_hash({key: value for key, value in proof.items() if key != "sha256"})
+            or proof["configured_sha256"] != _command_hash(expected) or proof["executed_sha256"] != _command_hash(actual)):
+        raise ValueError("Invalid captured launch normalization binding")
+    for key in ("wrapper", "runtime", "entrypoint"):
+        identity = proof[key]
+        if (not isinstance(identity, dict) or set(identity) != {"path", "sha256"}
+                or not isinstance(identity["path"], str) or not PureWindowsPath(identity["path"]).is_absolute()
+                or str(PureWindowsPath(identity["path"])).startswith(("\\\\?\\", "\\\\.\\", "\\??\\"))
+                or ".." in PureWindowsPath(identity["path"]).parts
+                or not isinstance(identity["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", identity["sha256"])):
+            raise ValueError("Invalid captured launch file identity")
+    wrapper, runtime, entry = (PureWindowsPath(proof[key]["path"]) for key in ("wrapper", "runtime", "entrypoint"))
+    if (wrapper.name.lower() not in {expected[0], expected[0] + ".cmd", expected[0] + ".bat", expected[0] + ".exe"}
+            or runtime.name.lower() != "node.exe"
+            or entry != wrapper.parent / _MANAGER_SCRIPTS[expected[0]]
+            or actual != [proof["runtime"]["path"], proof["entrypoint"]["path"], *expected[1:]]):
+        raise ValueError("Unsupported captured package-manager launch shape or argv tail")
+
+
+def execute(argv, cwd, log, timeout=300, *, env=None, cancel_requested=None, sensitive_values=(), max_output_bytes=None, launch_guard=None):
     """shell=False; keep only redacted stdout/stderr; record failures to start."""
     started = now()
     began = time.monotonic()
+    log = logical_path(log)
+    state_io(log.parent).mkdir(parents=True, exist_ok=True)
+    # Open without truncating: old callers may deliberately reuse one log.
+    # Fail before Popen if the eventual capture cannot be written at all.
+    with state_io(log).open("ab"):
+        pass
     code, error, timed_out, cancelled, limited = None, None, False, False, False
     if max_output_bytes is not None and (type(max_output_bytes) is not int or max_output_bytes < 1024):
         raise ValueError("Output limit must be at least 1024 bytes")
     argv = list(argv)
+    configured_argv = [redact(argument, sensitive_values) for argument in argv]
+    normalization = None
     # Windows npm/pnpm/yarn are batch wrappers. Run the CLI's JS entry point
     # directly rather than cmd.exe interpolation of repository-supplied args.
     if os.name == "nt" and argv[0] in {"npm", "pnpm", "yarn"}:
         executable = shutil.which(argv[0])
         if executable:
-            root = Path(executable).parent
-            candidates = {"npm": [root / "node_modules/npm/bin/npm-cli.js"],
-                          "pnpm": [root / "node_modules/pnpm/bin/pnpm.cjs"],
-                          "yarn": [root / "node_modules/yarn/bin/yarn.js"]}
-            script = next((p for p in candidates[argv[0]] if p.exists()), None)
-            if script:
-                argv = [shutil.which("node") or "node", str(script), *argv[1:]]
+            manager = argv[0]
+            script = Path(executable).resolve().parent / _MANAGER_SCRIPTS[manager]
+            node = shutil.which("node")
+            if script.is_file() and node:
+                try:
+                    normalization = {"version": 1, "kind": "windows_package_manager", "manager": manager,
+                                     "wrapper": _launch_file(executable), "runtime": _launch_file(node), "entrypoint": _launch_file(script)}
+                    argv = [normalization["runtime"]["path"], normalization["entrypoint"]["path"], *argv[1:]]
+                    for identity in (normalization[key] for key in ("wrapper", "runtime", "entrypoint")):
+                        identity["path"] = redact(identity["path"], sensitive_values)
+                    normalization.update(configured_sha256=_command_hash(configured_argv),
+                                         executed_sha256=_command_hash([redact(argument, sensitive_values) for argument in argv]))
+                    normalization["sha256"] = _command_hash(normalization)
+                except OSError:
+                    error = "Package manager launch identity unavailable"
+                    normalization = None
             else:
                 error = "Package manager JS entry point unavailable; configure explicit node argv"
     output = ""
@@ -297,9 +365,10 @@ def execute(argv, cwd, log, timeout=300, *, env=None, cancel_requested=None, sen
             # The raw temporary output is removed on close; only redacted logs
             # are retained as evidence.
             with tempfile.TemporaryFile(mode="w+b") as spool:
-                proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=spool, stderr=subprocess.STDOUT,
-                                        shell=False, start_new_session=os.name != "nt",
-                                        env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"})
+                with launch_guard() if launch_guard is not None else nullcontext():
+                    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=spool, stderr=subprocess.STDOUT,
+                                            shell=False, start_new_session=os.name != "nt",
+                                            env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"})
                 job, settled = None, False
                 try:
                     if os.name == "nt":
@@ -358,11 +427,12 @@ def execute(argv, cwd, log, timeout=300, *, env=None, cancel_requested=None, sen
     # A capped stream may end midway through a secret, so literal redaction
     # cannot safely recognize its truncated suffix/prefix.
     output = "[OUTPUT OMITTED: PROCESS_OUTPUT_LIMIT]\n" if limited else redact(output, sensitive_values)
-    Path(log).parent.mkdir(parents=True, exist_ok=True)
-    Path(log).write_text(output, encoding="utf-8")
-    result = {"argv": [redact(a, sensitive_values) for a in argv], "cwd": str(cwd), "started": started, "ended": now(),
+    state_io(log).write_text(output, encoding="utf-8")
+    result = {"argv": [redact(a, sensitive_values) for a in argv], "configured_argv": configured_argv, "cwd": str(cwd), "started": started, "ended": now(),
             "duration_seconds": time.monotonic() - began, "exit_code": code, "error": error,
-            "timed_out": timed_out, "cancelled": cancelled, "log": str(log), "log_sha256": digest(Path(log).read_bytes())}
+            "timed_out": timed_out, "cancelled": cancelled, "log": str(log), "log_sha256": digest(state_io(log).read_bytes())}
+    if normalization is not None:
+        result["launch_normalization"] = normalization
     if max_output_bytes is not None:
         result["output_limited"] = limited
     return result
@@ -454,7 +524,7 @@ class Engine:
             result = execute(cmd["argv"], self.repo, run / (cmd["id"] + ".log"), cmd.get("timeout", 300))
             result.update({"id": cmd["id"], "kind": cmd["kind"], "required": cmd.get("required", True), "parser": cmd.get("parser")})
             result["configured_argv"] = cmd["argv"]
-            result["counts"] = test_counts(Path(result["log"]).read_text(encoding="utf-8"), cmd.get("parser"))
+            result["counts"] = test_counts(state_io(result["log"]).read_text(encoding="utf-8"), cmd.get("parser"))
             counts = result["counts"]
             result["status"] = "BLOCKED" if result["error"] else "FAIL" if result["exit_code"] != 0 or result["timed_out"] else "PASS"
             if cmd["kind"] == "test" and result["status"] == "PASS" and (counts["total"] <= 0 or counts["skipped"] or counts["failed"]):
@@ -655,8 +725,9 @@ class Engine:
                     if r.get("configured_argv") != cmd["argv"] or r.get("kind") != cmd["kind"] or r.get("parser") != cmd.get("parser"):
                         rejected.append("Command receipt differs from confirmed command: " + cmd["id"])
                     try:
-                        log = Path(r["log"])
-                        if not log.resolve().is_relative_to(folder.resolve()) or not log.is_file() or digest(log.read_bytes()) != r.get("log_sha256"):
+                        log = logical_path(r["log"])
+                        physical = state_io(log)
+                        if not log.is_relative_to(folder.resolve()) or not physical.is_file() or digest(physical.read_bytes()) != r.get("log_sha256"):
                             rejected.append("Missing or altered source log: " + cmd["id"])
                             continue
                     except (KeyError, OSError, ValueError):
@@ -672,7 +743,7 @@ class Engine:
                         rejected.append("Required command failed: " + cmd["id"])
                     if cmd["kind"] == "test":
                         required_tests = True
-                        counts = test_counts(log.read_text(encoding="utf-8"), cmd.get("parser"))
+                        counts = test_counts(state_io(log).read_text(encoding="utf-8"), cmd.get("parser"))
                         if counts != r.get("counts"):
                             rejected.append("Test counts differ from source log: " + cmd["id"])
                         if counts["total"] <= 0:
@@ -736,7 +807,7 @@ class Engine:
                         rejected.append("Independent receipt revision mismatch: " + role)
                     raw = folder / (role + ".raw.json")
                     log = folder / (role + ".session.log")
-                    if not raw.is_file() or digest(raw.read_bytes()) != receipt.get("raw_sha256") or not log.is_file() or digest(log.read_bytes()) != receipt.get("log_sha256"):
+                    if not raw.is_file() or digest(raw.read_bytes()) != receipt.get("raw_sha256") or not state_io(log).is_file() or digest(state_io(log).read_bytes()) != receipt.get("log_sha256"):
                         rejected.append("Independent source artifact altered: " + role)
                         continue
                     payload = load(raw)

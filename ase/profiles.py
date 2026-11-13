@@ -4,6 +4,7 @@ import json
 from pathlib import Path, PureWindowsPath
 
 from .state import identifier, text
+from .native_paths import state_io
 
 
 COMMAND_KINDS = {"command", "test", "build", "lint", "security", "smoke", "probe"}
@@ -79,12 +80,12 @@ def stage_evidence_specs(contract, checks, stage_id=None):
         validate_mixed_mapping(contract)
         baseline_ids = {s["id"] for s in contract["evidence"]}
         return [s for s in checks if s["id"] in stage["evidence_ids"] or s["id"] not in baseline_ids]
-    if not stage["acceptance_ids"]:
-        return checks
     evidence_ids = {e for a in contract["acceptance"] if a["id"] in stage["acceptance_ids"] for e in a["evidence_ids"]}
     all_linked = {e for a in contract["acceptance"] for e in a["evidence_ids"]}
-    return [s for s in checks if s["id"] in evidence_ids or s["id"] not in all_linked
-            or (contract["profile"] == "software" and s["kind"] == "test" and s.get("required", True))]
+    # A mandatory final test does not grant its deferred owning stage's command
+    # authority to another stage. Unlinked checks are explicitly task-wide;
+    # shared linked checks name each criterion that relies on them.
+    return [s for s in checks if s["id"] in evidence_ids or s["id"] not in all_linked]
 
 
 def validate_evidence_spec(spec, profile):
@@ -165,7 +166,8 @@ def _evaluate(spec, receipt):
             text(receipt["user_message_ref"], "manual confirmation source")
             return {"status": "PASS", "method": "explicit manual attestation"}
         log = Path(receipt["log"])
-        if (not log.is_file() or log.is_symlink() or hashlib.sha256(log.read_bytes()).hexdigest() != receipt.get("log_sha256")):
+        physical = state_io(log)
+        if (not physical.is_file() or hashlib.sha256(physical.read_bytes()).hexdigest() != receipt.get("log_sha256")):
             return {"status": "FAIL", "reason": "Source log missing or altered: " + spec["id"]}
         if receipt.get("configured_argv") != spec["argv"] or not receipt.get("started") or not receipt.get("ended") or not receipt.get("cwd"):
             return {"status": "FAIL", "reason": "Command receipt differs from plan: " + spec["id"]}
@@ -173,7 +175,7 @@ def _evaluate(spec, receipt):
             return {"status": "BLOCKED", "reason": "Required command failed to start: " + spec["id"]}
         if receipt.get("exit_code") != 0 or receipt.get("timed_out"):
             return {"status": "FAIL", "reason": "Command failed: " + spec["id"]}
-        output = log.read_text(encoding="utf-8", errors="replace")
+        output = physical.read_text(encoding="utf-8", errors="replace")
         if kind == "test":
             from .core import test_counts
             counts = test_counts(output, spec.get("parser"))

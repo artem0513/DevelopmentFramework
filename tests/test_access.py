@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import ase.access as access_module
 from ase.access import CredentialAccess
 from ase.access import capture_process as actual_capture_process
 from ase.credentials import CredentialVault, CredentialError
@@ -145,11 +147,42 @@ else:
         self.assertEqual(count.read_text(), 'x')
 
     def test_run_budget_includes_authentication(self):
-        self.script.write_text("import json,time; time.sleep(.25); print(json.dumps({'status':'authenticated'}))", encoding='utf-8')
-        started = time.monotonic()
-        receipt = self.access.run('test', self.profile['target'], [sys.executable, '-c', 'import time; time.sleep(2)'], self.root, self.root / 'timeout.log', timeout=.5)
+        # Mechanical deadline seam, not authentication evidence. The real
+        # provider timeout is exercised separately below; core still owns a
+        # real child here and keeps its unmodified monotonic clock.
+        profile = self.vault.resolve('test', self.profile['target'])
+        readings = iter([100.0])
+        deadlines, budgets = [], []
+        def auth_boundary(ref, target, deadline, cancel, launch_guard=None):
+            deadlines.append(deadline)
+            return profile, {'credential_ref':ref, 'target':target, 'revision':profile['revision']}, [profile['secrets']['password']]
+        actual_execute = access_module.core.execute
+        def execute(*args, **kwargs):
+            budgets.append(kwargs['timeout'])
+            return actual_execute(*args, **kwargs)
+        completed = self.root / 'command-completed'
+        command = [sys.executable, '-c', "import time; from pathlib import Path; time.sleep(30); Path(" + repr(str(completed)) + ").write_text('late')"]
+        clock = SimpleNamespace(monotonic=lambda: next(readings, 100.25))
+        with patch.object(access_module, 'time', clock), patch.object(self.access, '_ensure', side_effect=auth_boundary), patch.object(access_module.core, 'execute', side_effect=execute):
+            receipt = self.access.run('test', self.profile['target'], command, self.root, self.root / 'timeout.log', timeout=.5)
+        self.assertEqual(deadlines, [100.5])
+        self.assertEqual(budgets, [.25])
         self.assertTrue(receipt['timed_out'])
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIsNotNone(receipt['exit_code'])
+        self.assertFalse(completed.exists())
+
+    def test_run_authentication_timeout_prevents_command_execution(self):
+        self.script.write_text('import time; time.sleep(30)', encoding='utf-8')
+        effect, log = self.root / 'command-ran', self.root / 'auth-timeout.log'
+        command = [sys.executable, '-c', "from pathlib import Path; Path(" + repr(str(effect)) + ").write_text('unexpected')"]
+        actual_execute = access_module.core.execute
+        with patch.object(access_module.core, 'execute', wraps=actual_execute) as execute:
+            with self.assertRaises(CredentialError) as error:
+                self.access.run('test', self.profile['target'], command, self.root, log, timeout=.5)
+        self.assertEqual(error.exception.code, 'timeout')
+        execute.assert_not_called()
+        self.assertFalse(log.exists())
+        self.assertFalse(effect.exists())
 
     def test_http_response_stream_obeys_total_timeout(self):
         class Slow(BaseHTTPRequestHandler):
