@@ -31,6 +31,10 @@ These are separate observations, not an automatic promotion ladder:
 
 Record only the levels needed for the affected obligation, with evidence and unknowns. Installed tools are not usable sessions. Metadata is not a successful SELECT. Readable empty data is valid when the contract allows emptiness; it is not proof of representative data or correct calculations. Probe the relevant intended account/consumer within existing authority; do not broaden access or copy secrets. Once required postconditions are evidenced, proceed without a ceremonial checklist or new approval.
 
+Bind required proof to the phase and action that can produce it. A current gate judges evidence causally attainable before its authorization; a criterion it judges must not require that same AC/review/gate approval or the later effects that approval authorizes. Independent AC/review and the current APPROVED gate remain mandatory authorization checks. If proof depends on the authorized action, retain that obligation as mandatory later work, leave its result pending, and verify it after the action before declaring the overall assignment complete.
+
+If Publisher requires the whole-task gate, moving later proof to another stage of that same task does not remove the cycle. Scope its gated contract to source acceptance and retain the later mandatory obligations in an explicit publication/finish plan or separate delivery task. As applicable, these include actual publication, intended-consumer postconditions, matching remote/local SHA and dated closure. Source approval alone does not complete the overall assignment. Correcting this phase allocation within existing authorized scope needs no new approval; preserve every original obligation, independent verification and the gate, and never label future evidence PASS.
+
 ## 4. Separate artifact purpose, state and version
 
 For an artifact that may be executed, handed off or used as evidence, retain:

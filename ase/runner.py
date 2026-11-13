@@ -212,10 +212,16 @@ class Runner:
         allowed = {"role", "project", "bindings", "schema", "source_packet", "handoff"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("Only transport-neutral request fields are accepted")
+        if request.get('role') not in {'implementation', 'ac', 'review', 'diagnostic'}:
+            raise ValueError('Unknown role')
+        from .runtime_policy import bind_policy
+        request = bind_policy(request)
         request_data = canonical(request)
         input_limit = self.config.get("max_input_bytes", 2097152)
         if len(request_data) > input_limit: raise ValueError("Request exceeds byte limit")
         request = decode_json(request_data)  # immutable snapshot, no caller-owned nested references
+        from .runtime_policy import validate_policy
+        validate_policy(request)  # Validate the exact frozen bytes before probe/spawn.
         if request.get("role") not in {"implementation", "ac", "review", "diagnostic"}: raise ValueError("Unknown role")
         bindings = request.get("bindings")
         required_bindings = {"fingerprint", "contract_sha256", "proposal_sha256", "plan_sha256", "check_sha256"}
@@ -293,7 +299,7 @@ class Runner:
         return {"receipt": receipt, "result": result}
 
 
-def verify_receipt(receipt, *, expected_bindings=None):
+def verify_receipt(receipt, *, expected_bindings=None, require_current_policy=True):
     """Revalidate persisted bytes, terminal/schema and caller-supplied current inputs.
 
     A valid protocol_only receipt is transport evidence, never semantic approval.
@@ -323,9 +329,19 @@ def verify_receipt(receipt, *, expected_bindings=None):
         raise ValueError("Captured request binding mismatch")
     if canonical(decode_json(data["schema"])) != canonical(request["schema"]) or sha256(data["stdin"]) != receipt["stdin_sha256"]:
         raise ValueError("Schema or input mismatch")
+    from .runtime_policy import validate_policy
+    from .protocol import packet_prompt
+    policy = validate_policy(request, require_current=require_current_policy)
+    prompt = packet_prompt(request)
+    if receipt['backend'] == 'codex':
+        delivered = data['stdin'] == prompt.encode('utf-8')
+    else:
+        delivered = not data['stdin'] and receipt.get('argv', [])[-2:] == ['-p', prompt]
+    if not delivered:
+        raise ValueError('Captured policy/request differs from the delivered prompt')
     validate_packet(request["source_packet"], max_bytes=8388608)
     from .adapters import get_adapter
     result = _parse(get_adapter(receipt["backend"]), request, data["stdout"], data.get("final"))
     if result["status"] != "COMPLETE" or canonical(result) != canonical(decode_json(data["result"])) or canonical(result["terminal"]) != canonical(receipt["terminal"]) or result["session_id"] != receipt["session_id"]:
         raise ValueError("Terminal or normalized result mismatch")
-    return {"valid": True, "evidence_kind": receipt["evidence_kind"], "execution_id": receipt["execution_id"], "result": result}
+    return {"valid": True, "evidence_kind": receipt["evidence_kind"], "execution_id": receipt["execution_id"], "result": result, **policy}

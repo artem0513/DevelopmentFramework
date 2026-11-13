@@ -52,7 +52,9 @@ class DirectorySourceTests(unittest.TestCase):
         c, controller = self.task(software=True, resources=["."])
         original = Path.read_bytes
         def guarded(path):
-            if path == ignored or ".git" in path.relative_to(self.repo).parts:
+            # The framework also reads its own bundled policy outside this
+            # client. This guard checks private/ignored client traversal.
+            if path == ignored or (path.is_relative_to(self.repo) and ".git" in path.relative_to(self.repo).parts):
                 raise AssertionError("Private or ignored file bytes were read")
             return original(path)
         with patch.object(Path, "read_bytes", guarded):

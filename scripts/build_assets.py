@@ -7,8 +7,10 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 OWNED_SKILLS = (
     'task-orchestrator', 'task-intake', 'task-discovery', 'project-context-manager',
     'project-bootstrap', 'independent-ac-verifier', 'independent-code-reviewer',
@@ -34,6 +36,8 @@ def descriptions(root=ROOT):
 
 
 def generated_assets(root=ROOT):
+    from ase.runtime_policy import build_bundle
+    from ase.protocol import canonical
     descriptions_by_skill = descriptions(root)
     outputs = {}
     for role, skill in ROLES.items():
@@ -58,6 +62,7 @@ def generated_assets(root=ROOT):
                 content = ('---\nname: ' + role + '\ndescription: ' + json.dumps(description) +
                            '\n---\n\n' + instructions + '\n')
             outputs[path] = content.encode('utf-8')
+    outputs[root / 'ase/data/runtime_policy.json'] = canonical(build_bundle(root)) + b'\n'
     return outputs
 
 

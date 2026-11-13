@@ -74,6 +74,65 @@ def _execution_origin(store, ledger, task, operation, context):
     return actor, stage, action
 
 
+def _superseded_stage(store, task, stage_id, contract_hash, proposal_hash):
+    """Authenticate an older explicit grant; it supplies history, never authority."""
+    failure = "stale contract/proposal history has no verified authorized supersession"
+    current = read_record(store.db, "approval", task["task_id"])
+    grant = current["payload"]
+    if (not isinstance(grant, dict) or not task.get("proposal")
+            or hash_value(task["contract"]) != task["contract_hash"]
+            or hash_value({"contract_hash": task["contract_hash"], "proposal": task["proposal"]}) != task["proposal_hash"]
+            or any(grant.get(key) != task.get(key) for key in ("contract_hash", "proposal_hash", "approved_stage_ids"))):
+        raise ValueError(failure)
+    current_version = read_record(store.db, "approval_version", task["task_id"] + ":" + str(current["revision"]))
+    if current_version["revision"] != 1 or current_version["payload"] != grant:
+        raise ValueError(failure)
+    prefix = task["task_id"] + ":"
+    versions = []
+    for row in store.db.execute("SELECT key,revision,payload FROM runtime_records WHERE kind='task_version' AND substr(key,1,?)=?", (len(prefix), prefix)):
+        value = json.loads(row["payload"])
+        suffix = row["key"][len(prefix):]
+        if (row["revision"] == 1 and suffix.isdigit() and isinstance(value, dict) and value.get("task_id") == task["task_id"]
+                and hash_value(value.get("contract")) == value.get("contract_hash")):
+            versions.append((int(suffix), row["key"], value))
+    events = [(row["sequence"], row["event_key"], row["kind"], json.loads(row["payload"]))
+        for row in store.db.execute("SELECT sequence,event_key,kind,payload FROM runtime_events WHERE task_id=? AND kind IN ('proposal','approval') ORDER BY sequence", (task["task_id"],))]
+    if any(not isinstance(value, dict) for _, _, _, value in events):
+        raise ValueError(failure)
+    current_event = next((sequence for sequence, key, kind, value in events
+        if key == task["task_id"] + ":approval:" + str(current["revision"]) and kind == "approval" and value == grant), None)
+    proposal_events = [(sequence, int(key.rsplit(":", 1)[-1]), value) for sequence, key, kind, value in events
+        if kind == "proposal" and key.startswith(task["task_id"] + ":proposal:") and key.rsplit(":", 1)[-1].isdigit()]
+    current_proposal = next(((sequence, revision) for sequence, revision, value in reversed(proposal_events)
+        if current_event is not None and sequence < current_event and value.get("proposal_hash") == task["proposal_hash"]
+        and value.get("stage_ids") == task["proposal"]["stage_ids"]), None)
+    if (current_proposal is None or not any(revision <= current_proposal[1] and value["contract_hash"] == task["contract_hash"]
+            for revision, _, value in versions)):
+        raise ValueError(failure)
+    for sequence, event_key, kind, original_grant in reversed(events):
+        if (kind != "approval" or sequence >= current_proposal[0]
+                or original_grant.get("contract_hash") != contract_hash or original_grant.get("proposal_hash") != proposal_hash
+                or stage_id not in original_grant.get("approved_stage_ids", [])):
+            continue
+        suffix = event_key.removeprefix(task["task_id"] + ":approval:")
+        original_version = read_record(store.db, "approval_version", prefix + suffix)
+        if not suffix.isdigit() or original_version["revision"] != 1 or original_version["payload"] != original_grant:
+            continue
+        original_proposal = next(((position, revision) for position, revision, value in reversed(proposal_events)
+            if position < sequence and value.get("proposal_hash") == proposal_hash and stage_id in value.get("stage_ids", [])), None)
+        origins = [(key, value) for revision, key, value in versions if original_proposal is not None
+            and revision <= original_proposal[1] and value["contract_hash"] == contract_hash]
+        if origins:
+            key, origin = origins[-1]
+            original_stage = next((item for item in origin["contract"]["stages"] if item["id"] == stage_id), None)
+            if original_stage is not None:
+                return original_stage, {"task_version_key": key,
+                    "approval_version_key": prefix + suffix, "approval_sha256": hash_value(original_grant),
+                    "superseded_by_contract_hash": task["contract_hash"], "superseded_by_proposal_hash": task["proposal_hash"],
+                    "current_approval_revision": current["revision"]}
+    raise ValueError(failure)
+
+
 def _proposal(store, task, plan, stage, snapshot):
     saved = read_record(store.db, "stage", task["task_id"] + ":" + stage["id"])["payload"] or {}
     captured = saved.get("state") == "COMPLETED"
@@ -87,6 +146,16 @@ def _proposal(store, task, plan, stage, snapshot):
         return {"status": "NOT_CAPTURED", "limitation": "No implementation proposal was captured; no edits or application are inferred"}
     expected = {"contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"],
                 "plan_sha256": plan["plan_hash"], "workspace_id": store.workspace_id}
+    historical = None
+    if captured and any(saved.get(key) != task[key] for key in ("contract_hash", "proposal_hash")):
+        original_stage, historical = _superseded_stage(store, task, stage["id"],
+            saved.get("contract_hash"), saved.get("proposal_hash"))
+        if retained and all(retained.get("bindings", {}).get(key) == value for key, value in expected.items()):
+            receipt, captured, source, historical = retained, False, "LATEST_STAGE_CAPTURE", None
+        else:
+            stage = original_stage
+            expected.update(contract_sha256=saved["contract_hash"], proposal_sha256=saved["proposal_hash"],
+                plan_sha256=saved["proof"]["checks"]["plan_hash"])
     if any(receipt.get("bindings", {}).get(key) != value for key, value in expected.items()):
         if not captured:
             return {"status": "NOT_CURRENT", "limitation": "Latest candidate belongs to another approved context"}
@@ -94,7 +163,7 @@ def _proposal(store, task, plan, stage, snapshot):
     root = logical_path(receipt["artifact_root"])
     if not root.is_relative_to(logical_path(store.root / "tasks" / task["task_id"] / "sessions")):
         raise ValueError("Proposal receipt is outside this task's sessions")
-    verified = verify_receipt(receipt)
+    verified = verify_receipt(receipt, require_current_policy=False)
     request_bytes = state_io(receipt["artifacts"]["request"]["path"]).read_bytes()
     if hashlib.sha256(request_bytes).hexdigest() != receipt["artifacts"]["request"]["sha256"]:
         raise ValueError("Proposal request changed after receipt verification")
@@ -112,7 +181,9 @@ def _proposal(store, task, plan, stage, snapshot):
         raise ValueError("Proposal stage scope differs")
     supplied = {item["path"]: item for item in request["source_packet"]["files"]}
     contract = supplied.get("_ase_context/contract.json")
-    if contract and hash_value(json.loads(contract["content"])) != task["contract_hash"]:
+    if historical and contract is None:
+        raise ValueError("Historical proposal contract source is unavailable")
+    if contract and hash_value(json.loads(contract["content"])) != expected["contract_sha256"]:
         raise ValueError("Proposal contract source differs")
     observed = supplied.get("_ase_context/source_changes.json")
     if observed:
@@ -122,8 +193,10 @@ def _proposal(store, task, plan, stage, snapshot):
     captured_plan = supplied.get("_ase_context/execution_plan.json")
     if captured_plan:
         captured_plan = json.loads(captured_plan["content"])
-        if captured_plan.get("plan_hash") != plan["plan_hash"] or hash_value(captured_plan.get("checks")) != plan["plan_hash"]:
+        if captured_plan.get("plan_hash") != expected["plan_sha256"] or hash_value(captured_plan.get("checks")) != expected["plan_sha256"]:
             raise ValueError("Proposal check-plan source differs")
+    elif historical:
+        raise ValueError("Historical proposal check-plan source is unavailable")
     payload = verified["result"].get("payload") or {}
     if not isinstance(payload.get("edits"), list):
         return {"status": "UNSUPPORTED_LEGACY_FORMAT", "execution_id": receipt["execution_id"],
@@ -142,7 +215,8 @@ def _proposal(store, task, plan, stage, snapshot):
             "captured_preimage_sha256": (supplied.get(name) or {}).get("sha256"),
             "after_sha256": None if edit.get("operation") == "delete" else hashlib.sha256(data).hexdigest(),
             "proposed_content_bytes": len(data), "current_source_sha256": snapshot["files"].get(name)})
-    return {"status": "VERIFIED_CAPTURE", "proposal_only": True,
+    return {"status": "HISTORICAL_VERIFIED_CAPTURE" if historical else "VERIFIED_CAPTURE", "proposal_only": True,
+        "current_identity": historical is None, **({"supersession": historical} if historical else {}),
         "limitation": "A proposal is neither proof of applied edits nor the original task baseline; proposed bodies are omitted",
         "execution_id": receipt["execution_id"], "evidence_kind": verified["evidence_kind"], "capture_source": source,
         "receipt_sha256": hash_value(receipt), "request_sha256": receipt["request_sha256"],

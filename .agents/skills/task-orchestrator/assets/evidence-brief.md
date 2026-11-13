@@ -5,6 +5,7 @@ Use only relevant rows for a material comparison, dependency, blocker or actiona
 - Outcome and actual target/environment/account/consumer:
 - Reference, authority/role and current source version; inherited versus task-owned changes:
 - Required dependency postcondition → observed readiness, exact check/source version and remaining unknown:
+- Proof boundary → current gate/action and causally attainable evidence; later mandatory proof → producing action/phase, pending check and publication/finish plan before overall completion:
 - Claim/blocker → affected outcome/stages, operation and safe access reference, observed result/scope, next useful lead or stopping reason:
 - Artifact → purpose, state, path/version/hash, target and input versions, unresolved placeholders; next authorized action:
 - Semantic change → required invariant, meaningful comparison evidence, preexisting ambiguity/new regression:

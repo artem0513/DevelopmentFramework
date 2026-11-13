@@ -230,6 +230,10 @@ def source_snapshot(store, contract, task_id=None):
     if policy_sha256 is not None:
         observed["fingerprint"] = hash_value({"source_fingerprint": observed["fingerprint"], "discovery_policy_sha256": policy_sha256})
         observed["discovery_policy_sha256"] = policy_sha256
+    from .runtime_policy import policy_fingerprint
+    observed['runtime_policy_sha256'] = policy_fingerprint()
+    observed['fingerprint'] = hash_value({'source_fingerprint': observed['fingerprint'],
+        'runtime_policy_sha256': observed['runtime_policy_sha256']})
     return observed
 
 

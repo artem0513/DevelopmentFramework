@@ -16,4 +16,4 @@ ase = "ase.__main__:main"
 packages = ["ase", "ase.adapters"]
 
 [tool.setuptools.package-data]
-ase = ["data/timezones/*", "data/timezones/**/*"]
+ase = ["data/timezones/*", "data/timezones/**/*", "data/runtime_policy.json"]

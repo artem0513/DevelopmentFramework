@@ -32,7 +32,9 @@ STR = {"type": "string"}
 STRINGS = {"type": "array", "items": STR}
 AC_SCHEMA = _object({"criteria": {"type": "array", "items": _object({
     "id": STR, "status": {"type": "string", "enum": ["PASS", "FAIL", "UNVERIFIED", "BLOCKED", "NOT_APPLICABLE"]},
-    "expected": STR, "evidence": STRINGS, "method": STR, "limitations": STRINGS, "missing_coverage": STRINGS})}})
+    "expected": STR, "evidence": STRINGS, "method": STR,
+    "limitations": {**STRINGS, "description": "Nonblocking limits and explicitly pending later delivery obligations. They do not establish overall completion."},
+    "missing_coverage": {**STRINGS, "description": "Unmet proof required by THIS criterion at THIS gate only. Any nonempty value blocks a mandatory criterion, including status PASS. Put nonblocking limits and later-phase delivery prerequisites in limitations."}})}})
 REVIEW_SCHEMA = _object({"findings": {"type": "array", "items": _object({
     "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]}, "path": STR,
     "line": {"type": "integer", "minimum": 1}, "message": STR})}, "summary": STR})
@@ -924,7 +926,7 @@ class WorkflowController:
             raise ValueError("Stage implementation receipt escapes this task's sessions")
         if any(receipt.get("bindings", {}).get(name) != value for name, value in expected.items()):
             raise ValueError("Implementation stage receipt bindings are stale")
-        verify_receipt(receipt)
+        verify_receipt(receipt, require_current_policy=False)
         data = state_io(receipt["artifacts"]["request"]["path"]).read_bytes()
         if hashlib.sha256(data).hexdigest() != receipt["artifacts"]["request"]["sha256"]:
             raise ValueError("Stage implementation request changed after verification")
@@ -957,17 +959,21 @@ class WorkflowController:
             if not saved or saved.get("state") != "COMPLETED":
                 continue
             try:
+                supersession = None
                 if saved.get("contract_hash") != task["contract_hash"] or saved.get("proposal_hash") != task["proposal_hash"]:
-                    raise ValueError("stale contract/proposal stage history")
+                    from .action_evidence import _superseded_stage
+                    original_stage, supersession = _superseded_stage(self.store, task, stage["id"],
+                        saved.get("contract_hash"), saved.get("proposal_hash"))
                 proof = saved["proof"]
                 if proof.get("version") != 1 or not saved.get("completed_at"):
                     raise ValueError("stage has no prospective proof capture")
                 checks = proof["checks"]
-                bindings = {"fingerprint": checks["fingerprint"], "contract_sha256": task["contract_hash"],
-                    "proposal_sha256": task["proposal_hash"], "plan_sha256": checks["plan_hash"],
+                bindings = {"fingerprint": checks["fingerprint"], "contract_sha256": saved["contract_hash"],
+                    "proposal_sha256": saved["proposal_hash"], "plan_sha256": checks["plan_hash"],
                     "check_sha256": hash_value(checks), "workspace_id": self.store.workspace_id}
                 entry = {"stage_id": stage["id"], "completed_at": saved["completed_at"], "contract_hash": saved["contract_hash"],
-                    "proposal_hash": saved["proposal_hash"], "gate": saved["gate"], "checks": checks, "roles": {}, "observations": []}
+                    "proposal_hash": saved["proposal_hash"], "gate": saved["gate"], "checks": checks, "roles": {}, "observations": [],
+                    "current_identity": supersession is None, **({"supersession": supersession} if supersession else {})}
                 observations = {}
                 for role in ("implementation", "ac", "review"):
                     receipt = proof["roles"][role]
@@ -975,7 +981,8 @@ class WorkflowController:
                     _safe_state(root)
                     if not root.resolve().is_relative_to(self.store.root.resolve()):
                         raise ValueError("historical receipt escapes project state")
-                    verified = verify_receipt(receipt, expected_bindings=bindings if role != "implementation" else None)
+                    verified = verify_receipt(receipt, expected_bindings=bindings if role != "implementation" else None,
+                        require_current_policy=False)
                     if any(receipt["bindings"].get(key) != bindings[key] for key in ("contract_sha256", "proposal_sha256", "workspace_id", "plan_sha256")):
                         raise ValueError("historical receipt identity differs")
                     request = json.loads(Path(receipt["artifacts"]["request"]["path"]).read_bytes())
@@ -985,9 +992,21 @@ class WorkflowController:
                     captured_stage = handoff.get("stage", {}).get("id") if role == "implementation" else handoff.get("stage_id")
                     if captured_stage != stage["id"]:
                         raise ValueError("historical stage boundary mismatch")
+                    if supersession:
+                        supplied = {item["path"]: item for item in request["source_packet"]["files"]}
+                        contract = json.loads(supplied["_ase_context/contract.json"]["content"])
+                        plan = json.loads(supplied["_ase_context/execution_plan.json"]["content"])
+                        if (hash_value(contract) != saved["contract_hash"] or plan["plan_hash"] != checks["plan_hash"]
+                                or hash_value(plan["checks"]) != checks["plan_hash"]
+                                or (role == "implementation" and "scope" in handoff.get("stage", {})
+                                    and handoff["stage"]["scope"] != original_stage["scope"])
+                                or request["project"].get("project_id") != self.store.project_id
+                                or logical_path(request["project"]["root"]) != logical_path(self.store.repo)):
+                            raise ValueError("superseded history origin differs")
                     entry["roles"][role] = {"execution_id": verified["execution_id"], "evidence_kind": verified["evidence_kind"],
                         "bindings": receipt["bindings"], "started_at_utc": receipt.get("started_at_utc"), "ended_at_utc": receipt.get("ended_at_utc"),
-                        "session_id": receipt.get("session_id"), "receipt_sha256": hash_value(receipt)}
+                        "session_id": receipt.get("session_id"), "receipt_sha256": hash_value(receipt),
+                        "policy_current": verified['policy_current'], "policy_status": verified['policy_status']}
                     for item in request["source_packet"]["files"]:
                         if item["path"] not in {"_ase_context/source_changes.json", "_ase_context/actual_checks.json"} and not item["path"].startswith("_ase_context/logs/"):
                             continue
@@ -998,7 +1017,8 @@ class WorkflowController:
                             observations[key] = {**item, "roles": []}
                         observations[key]["roles"].append(role)
                 entry["observations"] = list(observations.values())
-                entry["semantic_approval"] = saved["gate"].get("status") == "APPROVED" and all(entry["roles"][role]["evidence_kind"] == "independent_cli" for role in ("ac", "review"))
+                entry['policy_current'] = all(entry['roles'][role]['policy_current'] for role in ('ac', 'review'))
+                entry["semantic_approval"] = supersession is None and saved["gate"].get("status") == "APPROVED" and entry['policy_current'] and all(entry["roles"][role]["evidence_kind"] == "independent_cli" for role in ("ac", "review"))
                 if len(encode({"stages": history["stages"] + [entry]}).encode("utf-8")) > 262144:
                     raise ValueError("stage history exceeds bounded packet budget")
                 history["stages"].append(entry)
@@ -1142,7 +1162,7 @@ class WorkflowController:
             try:
                 if not Path(historical["artifact_root"]).resolve().is_relative_to(self.store.root.resolve()):
                     raise ValueError("Historical source capture escapes project state")
-                verify_receipt(historical)
+                verify_receipt(historical, require_current_policy=False)
                 original = json.loads(Path(historical["artifacts"]["request"]["path"]).read_bytes())
                 changed_paths = {entry["path"] for entry in changes["changes"]}
                 for before in original["source_packet"]["files"]:
@@ -1190,6 +1210,10 @@ class WorkflowController:
         check = read_record(self.store.db, "checks", task_id)["payload"]
         source = source_snapshot(self.store, task["contract"], task_id=task_id)
         handoff = dict(handoff or {})
+        if 'runtime_policy' in handoff:
+            raise ValueError('runtime_policy is reserved for the trusted host')
+        from .runtime_policy import current_policy
+        handoff['runtime_policy'] = current_policy(role)
         if role == "diagnostic":
             history = read_record(self.store.db, "recovery", self._root_task(task_id))["payload"] or {}
             reservations = {}

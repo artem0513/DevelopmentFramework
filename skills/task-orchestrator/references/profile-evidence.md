@@ -2,6 +2,8 @@
 
 Select a profile by the requested action. A finance report's data warnings are not software debugging; changing the generating code is software. Mixed tasks map every obligation to stages and child tasks without weakening parent coverage.
 
+Apply the [readiness proof boundary](evidence-decisions.md#3-check-the-readiness-the-obligation-actually-needs) when allocating profile evidence. Current acceptance uses proof causally attainable before its gate; later authorized effects remain mandatory in the publication/finish plan or delivery task and pending until checked. A whole-task publication gate includes all its stages, so stage reassignment alone cannot separate future proof. Phase-local source approval does not establish publication, postconditions or overall completion.
+
 | Profile | Evidence to collect |
 | --- | --- |
 | software | Executed mandatory commands, positive test counts, no skipped required tests, independent AC and code review, current source/contract/plan fingerprints |
