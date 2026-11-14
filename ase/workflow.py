@@ -720,26 +720,33 @@ class WorkflowController:
             "stage_id": reservation.get("stage_id"), "groups": sorted(reservation.get("generations", {})),
             "generations": reservation.get("generations", {})}
 
-    def _diagnostic_supported(self, receipt, bindings, reservation_context):
+    def _diagnostic_payload(self, receipt, bindings, reservation_context):
+        """Return only an authenticated, complete diagnostic for this reservation."""
         try:
             if (not reservation_context or not reservation_context.get("reservation_id") or receipt.get("role") != "diagnostic"
                     or not Path(receipt["artifact_root"]).resolve().is_relative_to(self.store.root.resolve())):
-                return False
+                return None
             verified = verify_receipt(receipt, expected_bindings=bindings)
             captured = receipt["artifacts"]["request"]
             data = Path(captured["path"]).read_bytes()
             if hashlib.sha256(data).hexdigest() != captured["sha256"]:
-                return False
+                return None
             request = json.loads(data)
             if (request.get("role") != "diagnostic" or request.get("schema") != DIAGNOSTIC_SCHEMA
                     or request.get("handoff", {}).get("diagnostic_reservation") != reservation_context):
-                return False
+                return None
             result = verified["result"]
             payload = result.get("payload", {})
-            return (result.get("status") == "COMPLETE" and bool(payload.get("cause", "").strip())
-                    and bool(payload.get("recommendation", "").strip()) and payload.get("requires_new_approval") is False)
+            if (result.get("status") == "COMPLETE" and bool(payload.get("cause", "").strip())
+                    and bool(payload.get("recommendation", "").strip())):
+                return payload
         except (ValueError, OSError, KeyError, TypeError, AttributeError):
-            return False
+            pass
+        return None
+
+    def _diagnostic_supported(self, receipt, bindings, reservation_context):
+        payload = self._diagnostic_payload(receipt, bindings, reservation_context)
+        return payload is not None and payload.get("requires_new_approval") is False
 
     def _probe_authorized(self, task_id, stage_id, name, group):
         permission = group.get("probe_authorization") or {}
@@ -748,7 +755,7 @@ class WorkflowController:
                 and permission.get("bindings") == self._diagnostic_bindings(task_id)
                 and self._diagnostic_supported(permission.get("receipt", {}), permission["bindings"], permission.get("reservation")))
 
-    def _complete_diagnostic(self, task_id, stage_id, diagnosis):
+    def _complete_diagnostic(self, task_id, stage_id, diagnosis, *, interrupted=False):
         """Only captured supported completion can mint one durable probe permission."""
         root_id = self._root_task(task_id)
         with transaction(self.store.db) as db:
@@ -756,11 +763,14 @@ class WorkflowController:
             reservations = [history["groups"][name].get("diagnostic_inflight") or {} for name in groups]
             reservation = reservations[0]
             receipt = diagnosis.get("receipt", {})
-            supported = (bool(reservation.get("id")) and all(item.get("id") == reservation["id"] for item in reservations)
+            current = (bool(reservation.get("id")) and all(item.get("id") == reservation["id"] for item in reservations)
                 and reservation.get("task_id") == task_id and reservation.get("stage_id") == stage_id
                 and reservation.get("status") == "RUNNING" and reservation.get("bindings") == self._diagnostic_bindings(task_id)
-                and all(reservation.get("generations", {}).get(name) == history["groups"][name].get("progress_generation", 0) for name in groups)
-                and self._diagnostic_supported(receipt, reservation["bindings"], self._diagnostic_context(reservation)))
+                and all(reservation.get("generations", {}).get(name) == history["groups"][name].get("progress_generation", 0) for name in groups))
+            payload = self._diagnostic_payload(receipt, reservation["bindings"], self._diagnostic_context(reservation)) if current and not interrupted else None
+            supported = payload is not None and payload.get("requires_new_approval") is False
+            approval_required = payload is not None and payload.get("requires_new_approval") is True
+            outcome = "SUPPORTED" if supported else "APPROVAL_REQUIRED" if approval_required else "INTERRUPTED" if interrupted else "FAILED"
             permission = {"task_id": task_id, "stage_id": stage_id, "reservation_id": reservation.get("id"),
                 "bindings": reservation.get("bindings"), "receipt": receipt,
                 "generations": reservation.get("generations", {}), "reservation": self._diagnostic_context(reservation)}
@@ -769,10 +779,10 @@ class WorkflowController:
                 if supported:
                     group.update(diagnostic_inflight=None, probe_pending=True, probe_authorization=permission)
                 else:
-                    group.update(diagnostic_inflight={**reservation, "status": "FAILED"}, probe_pending=False,
+                    group.update(diagnostic_inflight={**reservation, "status": outcome}, probe_pending=False,
                                  probe_authorization=None, stopped=True)
             history["events"].append({"task_id": task_id, "stage_id": stage_id, "timestamp": now(),
-                "diagnostic_reservation": reservation.get("id"), "supported": bool(supported), "receipt": receipt})
+                "diagnostic_reservation": reservation.get("id"), "supported": bool(supported), "outcome": outcome, "receipt": receipt})
             # Permission and its resumable coordinator phase are one commit.
             # A crash after completion must not leave valid permission hidden
             # behind the earlier DIAGNOSING checkpoint.
@@ -780,11 +790,24 @@ class WorkflowController:
             cycle = read_record(db, "cycle", cycle_key)
             task = self.tasks.snapshot(task_id)
             write_record(db, "cycle", cycle_key, {**(cycle["payload"] or {}),
-                "phase": "REJECTED" if supported else "NEEDS_APPROVAL",
+                "phase": "REJECTED" if supported else "NEEDS_APPROVAL" if approval_required else "DIAGNOSTIC_INTERRUPTED" if interrupted else "DIAGNOSTIC_BLOCKED",
+                "diagnostic_outcome": outcome,
                 "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
                 "diagnostic_reservation_id": reservation.get("id")}, expected_revision=cycle["revision"])
             write_record(db, "recovery", root_id, history, expected_revision=record["revision"])
         return bool(supported)
+
+    @staticmethod
+    def _diagnostic_stop_reason(progress):
+        phase = progress.get("phase")
+        if phase == "NEEDS_APPROVAL" and progress.get("diagnostic_outcome") == "APPROVAL_REQUIRED":
+            return "Verified diagnostic requires a revised approved proposal"
+        if phase in {"DIAGNOSING", "DIAGNOSTIC_INTERRUPTED"}:
+            return "Diagnostic was interrupted without a validated completion; automatic mutation is stopped"
+        if phase in {"NEEDS_APPROVAL", "DIAGNOSTIC_BLOCKED"}:
+            # Legacy NEEDS_APPROVAL also represented missing/failed evidence.
+            return "Diagnostic has no validated corrective evidence; automatic mutation is stopped"
+        return progress.get("diagnostic_blocker")
 
     def request_stop(self, task_id, *, reason):
         from .journal import Journal
@@ -909,7 +932,10 @@ class WorkflowController:
         stage = next(item for item in task["contract"]["stages"] if item["id"] == stage_id)
         saved = read_record(self.store.db, "stage", task_id + ":" + stage_id)
         previous = saved["payload"] or {}
-        if previous.get("state") == "COMPLETED" and all(previous.get(key) == task[key] for key in ("contract_hash", "proposal_hash")):
+        plan_hash = self.tasks.execution_plan(task_id)["plan_hash"]
+        previous_plan = previous.get("proof", {}).get("checks", {}).get("plan_hash")
+        if (previous.get("state") == "COMPLETED" and all(previous.get(key) == task[key] for key in ("contract_hash", "proposal_hash"))
+                and previous_plan in {None, plan_hash}):
             raise ValueError("Existing completed stage history cannot be replaced implicitly")
         kind, key = "stage_implementation", task_id + ":" + stage_id
         selected = read_record(self.store.db, kind, key)
@@ -920,7 +946,7 @@ class WorkflowController:
         if not receipt:
             raise ValueError("Stage implementation receipt is unavailable")
         expected = {"contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"],
-            "plan_sha256": self.tasks.execution_plan(task_id)["plan_hash"], "workspace_id": self.store.workspace_id}
+            "plan_sha256": plan_hash, "workspace_id": self.store.workspace_id}
         root = logical_path(receipt["artifact_root"])
         if not root.is_relative_to(logical_path(self.store.root / "tasks" / task_id / "sessions")):
             raise ValueError("Stage implementation receipt escapes this task's sessions")
@@ -963,17 +989,23 @@ class WorkflowController:
                 if saved.get("contract_hash") != task["contract_hash"] or saved.get("proposal_hash") != task["proposal_hash"]:
                     from .action_evidence import _superseded_stage
                     original_stage, supersession = _superseded_stage(self.store, task, stage["id"],
-                        saved.get("contract_hash"), saved.get("proposal_hash"))
+                        saved.get("contract_hash"), saved.get("proposal_hash"),
+                        captured_at=saved.get("proof", {}).get("roles", {}).get("implementation", {}).get("started_at_utc"))
                 proof = saved["proof"]
                 if proof.get("version") != 1 or not saved.get("completed_at"):
                     raise ValueError("stage has no prospective proof capture")
                 checks = proof["checks"]
+                current_plan_hash = self.tasks.execution_plan(task["task_id"])["plan_hash"]
+                plan_supersession = ({"original_plan_hash": checks["plan_hash"], "current_plan_hash": current_plan_hash}
+                    if checks["plan_hash"] != current_plan_hash else None)
                 bindings = {"fingerprint": checks["fingerprint"], "contract_sha256": saved["contract_hash"],
                     "proposal_sha256": saved["proposal_hash"], "plan_sha256": checks["plan_hash"],
                     "check_sha256": hash_value(checks), "workspace_id": self.store.workspace_id}
                 entry = {"stage_id": stage["id"], "completed_at": saved["completed_at"], "contract_hash": saved["contract_hash"],
                     "proposal_hash": saved["proposal_hash"], "gate": saved["gate"], "checks": checks, "roles": {}, "observations": [],
-                    "current_identity": supersession is None, **({"supersession": supersession} if supersession else {})}
+                    "current_identity": supersession is None and plan_supersession is None,
+                    **({"supersession": supersession} if supersession else {}),
+                    **({"plan_supersession": plan_supersession} if plan_supersession else {})}
                 observations = {}
                 for role in ("implementation", "ac", "review"):
                     receipt = proof["roles"][role]
@@ -992,14 +1024,14 @@ class WorkflowController:
                     captured_stage = handoff.get("stage", {}).get("id") if role == "implementation" else handoff.get("stage_id")
                     if captured_stage != stage["id"]:
                         raise ValueError("historical stage boundary mismatch")
-                    if supersession:
+                    if supersession or plan_supersession:
                         supplied = {item["path"]: item for item in request["source_packet"]["files"]}
                         contract = json.loads(supplied["_ase_context/contract.json"]["content"])
                         plan = json.loads(supplied["_ase_context/execution_plan.json"]["content"])
                         if (hash_value(contract) != saved["contract_hash"] or plan["plan_hash"] != checks["plan_hash"]
                                 or hash_value(plan["checks"]) != checks["plan_hash"]
                                 or (role == "implementation" and "scope" in handoff.get("stage", {})
-                                    and handoff["stage"]["scope"] != original_stage["scope"])
+                                    and handoff["stage"]["scope"] != (original_stage if supersession else stage)["scope"])
                                 or request["project"].get("project_id") != self.store.project_id
                                 or logical_path(request["project"]["root"]) != logical_path(self.store.repo)):
                             raise ValueError("superseded history origin differs")
@@ -1018,7 +1050,7 @@ class WorkflowController:
                         observations[key]["roles"].append(role)
                 entry["observations"] = list(observations.values())
                 entry['policy_current'] = all(entry['roles'][role]['policy_current'] for role in ('ac', 'review'))
-                entry["semantic_approval"] = supersession is None and saved["gate"].get("status") == "APPROVED" and entry['policy_current'] and all(entry["roles"][role]["evidence_kind"] == "independent_cli" for role in ("ac", "review"))
+                entry["semantic_approval"] = entry["current_identity"] and saved["gate"].get("status") == "APPROVED" and entry['policy_current'] and all(entry["roles"][role]["evidence_kind"] == "independent_cli" for role in ("ac", "review"))
                 if len(encode({"stages": history["stages"] + [entry]}).encode("utf-8")) > 262144:
                     raise ValueError("stage history exceeds bounded packet budget")
                 history["stages"].append(entry)
@@ -1451,7 +1483,11 @@ class WorkflowController:
             except ValueError as ex:
                 return {"status": "BLOCKED", "blocked_reasons": [str(ex)], "stage_blockers": stage_blockers, "stage_results": stage_results}
             done = read_record(self.store.db, "stage", task_id + ":" + stage_id)["payload"] or {}
-            if done.get("state") == "COMPLETED" and done.get("contract_hash") == task["contract_hash"] and done.get("proposal_hash") == task["proposal_hash"]:
+            completed_identity = (done.get("state") == "COMPLETED" and done.get("contract_hash") == task["contract_hash"]
+                and done.get("proposal_hash") == task["proposal_hash"])
+            revalidate_completed = (completed_identity and done.get("proof", {}).get("checks", {}).get("plan_hash")
+                != self.tasks.execution_plan(task_id)["plan_hash"])
+            if completed_identity and not revalidate_completed:
                 continue
             try:
                 self.tasks.require_approval(task_id, stage_id)
@@ -1469,7 +1505,22 @@ class WorkflowController:
                 stage_blockers[stage_id] = child_blockers
                 continue
             try:
-                verdict = self._run_stage(task, stage, runner, adapter, resume=resume)
+                if revalidate_completed:
+                    # A stronger plan needs fresh proof, not a repeated effect
+                    # or a new implementation author for unchanged artifacts.
+                    blockers, _ = self._revalidate_prerequisites(task, stage)
+                    if blockers:
+                        verdict = {"status": "BLOCKED", "blocked_reasons": blockers}
+                    else:
+                        self.check(task_id, stage_id)
+                        verdict = self.verify(task_id, stage_id)
+                    if verdict["status"] == "APPROVED":
+                        stage_results[stage_id] = verdict
+                        continue
+                    if not verdict.get("blocked_reasons"):
+                        verdict = self._run_stage(task, stage, runner, adapter, resume=False)
+                else:
+                    verdict = self._run_stage(task, stage, runner, adapter, resume=resume)
             except (ValueError, OSError, KeyError, TypeError) as ex:
                 from .core import redact
                 verdict = {"status": "BLOCKED", "blocked_reasons": [redact(ex)]}
@@ -1478,7 +1529,8 @@ class WorkflowController:
                 stage_blockers[stage_id] = list(dict.fromkeys(verdict.get("blocked_reasons", []) + verdict.get("rejected_reasons", []))) or ["Stage did not complete"]
             else:
                 stage_results[stage_id] = (read_record(self.store.db, "stage", task_id + ":" + stage_id)["payload"] or {}).get("gate", {"status": "APPROVED"})
-        incomplete = [s["id"] for s in ordered if (read_record(self.store.db, "stage", task_id + ":" + s["id"])["payload"] or {}).get("state") != "COMPLETED"]
+        incomplete = [s["id"] for s in ordered if s["id"] in stage_blockers
+            or (read_record(self.store.db, "stage", task_id + ":" + s["id"])["payload"] or {}).get("state") != "COMPLETED"]
         if incomplete:
             reasons = list(dict.fromkeys(reason for blockers in stage_blockers.values() for reason in blockers))
             for stage_id, blockers in stage_blockers.items():
@@ -1504,6 +1556,7 @@ class WorkflowController:
                 return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
             progress_key = task_id + ":" + stage_id
             progress = read_record(self.store.db, "cycle", progress_key)["payload"] or {}
+            diagnostic_blocker = self._diagnostic_stop_reason(progress)
             resume_verdict = None
             if resume:
                 _, recovery, recovery_groups = self._recovery_context(self.store.db, task_id, stage_id)
@@ -1515,14 +1568,15 @@ class WorkflowController:
                     # but does not replay actions or reserve another candidate.
                     self.check(task_id, stage_id)
                     progress = {"phase": "VERIFYING", "contract_hash": task["contract_hash"],
-                        "proposal_hash": task["proposal_hash"], "read_only_recovery": True, "resumed_progress": True}
+                        "proposal_hash": task["proposal_hash"], "read_only_recovery": True, "resumed_progress": True,
+                        **({"diagnostic_blocker": diagnostic_blocker} if diagnostic_blocker else {})}
                     self._save("cycle", progress_key, progress)
                     current = self.tasks.snapshot(task_id)
                     self.tasks.transition(task_id, "REVIEWING", expected_revision=current["revision"], reason="Read-only independent reassessment on explicit resume")
                     resume_verdict = self.verify(task_id, stage_id)
                     reconciled = self._record_recovery(task_id, stage_id, [], failed=False)
                     if not reconciled["newly_verified"] and resume_verdict["status"] != "APPROVED":
-                        return {"status": "BLOCKED", "blocked_reasons": ["Corrective probe remains stopped; fresh read-only checks and independent verification established no new original progress",
+                        return {"status": "BLOCKED", "blocked_reasons": [diagnostic_blocker or "Corrective probe remains stopped; fresh read-only checks and independent verification established no new original progress",
                             *resume_verdict.get("blocked_reasons", [])], "previous_gate": resume_verdict}
                 elif inflight or (progress.get("phase") == "IMPLEMENTING"
                         and progress.get("contract_hash") == task["contract_hash"]
@@ -1533,9 +1587,9 @@ class WorkflowController:
                     progress.update(phase="VERIFYING", contract_hash=task["contract_hash"],
                                     proposal_hash=task["proposal_hash"], read_only_recovery=True)
                     self._save("cycle", progress_key, progress)
-            if (progress.get("phase") in {"DIAGNOSING", "NEEDS_APPROVAL"}
+            if (progress.get("phase") in {"DIAGNOSING", "NEEDS_APPROVAL", "DIAGNOSTIC_BLOCKED", "DIAGNOSTIC_INTERRUPTED"}
                     and progress.get("proposal_hash") == task["proposal_hash"]):
-                return {"status": "BLOCKED", "blocked_reasons": ["Diagnostic was interrupted or requires a revised approved proposal"]}
+                return {"status": "BLOCKED", "blocked_reasons": [self._diagnostic_stop_reason(progress)]}
             continuing = (resume and progress.get("phase") in {"CHECKING", "VERIFYING"}
                           and progress.get("contract_hash") == task["contract_hash"]
                           and progress.get("proposal_hash") == task["proposal_hash"])
@@ -1624,13 +1678,19 @@ class WorkflowController:
                 self.tasks.transition(task_id, "DIAGNOSING", expected_revision=current["revision"], reason="Repeated failure requires root-cause diagnosis")
                 progress.update(phase="DIAGNOSING")
                 self._save("cycle", progress_key, progress)
-                diagnosis = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "diagnostic", DIAGNOSTIC_SCHEMA,
-                    {"instruction": "Find the root cause from actual proof and prior feedback; do not propose new authority.", "failure": verdict, "stage_id": stage_id}),
-                    timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)), task["contract"]["execution_policy"]["diagnostic_timeout_seconds"])
+                try:
+                    diagnosis = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "diagnostic", DIAGNOSTIC_SCHEMA,
+                        {"instruction": "Find the root cause from actual proof and prior feedback; do not propose new authority.", "failure": verdict, "stage_id": stage_id}),
+                        timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)), task["contract"]["execution_policy"]["diagnostic_timeout_seconds"])
+                except KeyboardInterrupt:
+                    self._complete_diagnostic(task_id, stage_id, {}, interrupted=True)
+                    raise
+                except (ValueError, OSError, KeyError, TypeError):
+                    self._complete_diagnostic(task_id, stage_id, {})
+                    raise
                 self._save("diagnostic", task_id, diagnosis)
                 if not self._complete_diagnostic(task_id, stage_id, diagnosis):
-                    progress.update(phase="NEEDS_APPROVAL")
-                    self._save("cycle", progress_key, progress)
-                    return {"status": "BLOCKED", "blocked_reasons": ["Diagnostic requires a revised approved proposal"]}
+                    stopped = read_record(self.store.db, "cycle", progress_key)["payload"]
+                    return {"status": "BLOCKED", "blocked_reasons": [self._diagnostic_stop_reason(stopped)]}
                 progress.update(phase="REJECTED")
                 self._save("cycle", progress_key, progress)

@@ -199,7 +199,7 @@ class ProgressRecoveryTests(unittest.TestCase):
         stage = self.approve(spec)["contract"]["stages"][0]
         return stage, stage["actions"][0]
 
-    def loop_fixture(self, *, supported=True, progress_on_probe=False, hard_cap=None):
+    def loop_fixture(self, *, supported=True, progress_on_probe=False, hard_cap=None, approval_required=False):
         """Protocol children test orchestration; a gate double never approves."""
         spec = contract("loop")
         spec["unknowns"], spec["stages"] = [], spec["stages"][:1]
@@ -217,8 +217,8 @@ if 'edits' in schema['properties']:
  edits = [{'path':'guide.md','operation':'write','before_sha256':'','content':'Verified original artifact'}] if count == 4 and PROGRESS else []
  payload = {'edits':edits,'summary':'Controlled candidate'}
 elif 'cause' in schema['properties']:
- payload = {'cause':'Actual evidence supports this cause' if SUPPORTED else '', 'recommendation':'Run a corrective probe' if SUPPORTED else '', 'requires_new_approval':False}
-""".replace("PROGRESS", repr(progress_on_probe)).replace("SUPPORTED", repr(supported))
+ payload = {'cause':'Actual evidence supports this cause' if SUPPORTED else '', 'recommendation':'Run a corrective probe' if SUPPORTED else '', 'requires_new_approval':APPROVAL}
+""".replace("PROGRESS", repr(progress_on_probe)).replace("SUPPORTED", repr(supported)).replace("APPROVAL", repr(approval_required))
         fixture = folder / "provider.py"
         fixture.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}", "payload = {'verdict':'PASS'}\n" + body))
         runner = Runner({"executable": sys.executable, "executable_args": [str(fixture), "success", "codex"],
@@ -252,6 +252,85 @@ elif 'cause' in schema['properties']:
             result = controller.run("loop")
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(read_record(self.store.db, "budget", "loop")["payload"]["task_cycles"], 3)
+
+    def diagnostic_stop_result(self, kind):
+        """Actual transport captures isolate stop classification from gate judgment."""
+        controller, rejected = self.loop_fixture(supported=kind != "unsupported", approval_required=kind == "approval")
+        before = self.tasks.snapshot("loop")
+        approval = read_record(self.store.db, "approval", "loop")
+        run = controller.runner.run
+
+        def diagnostic_outcome(adapter, request, **kwargs):
+            if request["role"] != "diagnostic":
+                return run(adapter, request, **kwargs)
+            if kind == "interrupted":
+                raise KeyboardInterrupt()
+            if kind == "failed":
+                previous = controller.runner.config["executable_args"][1]
+                controller.runner.config["executable_args"][1] = "exit"
+                try:
+                    return run(adapter, request, **kwargs)
+                finally:
+                    controller.runner.config["executable_args"][1] = previous
+            result = run(adapter, request, **kwargs)
+            if kind == "tampered":
+                Path(result["receipt"]["artifacts"]["result"]["path"]).write_text("{}")
+                result["result"]["payload"]["requires_new_approval"] = True
+            if kind == "approval":
+                # The wrapper is not authority: the captured payload says True.
+                result["result"]["payload"]["requires_new_approval"] = False
+            return result
+
+        with patch.object(controller, "verify", return_value=rejected), patch.object(controller.runner, "run", side_effect=diagnostic_outcome):
+            result = controller.run("loop")
+        phase = read_record(self.store.db, "cycle", "loop:draft")["payload"]["phase"]
+        after = self.tasks.snapshot("loop")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(before["contract_hash"], after["contract_hash"])
+        self.assertEqual(before["proposal_hash"], after["proposal_hash"])
+        self.assertEqual(approval, read_record(self.store.db, "approval", "loop"))
+        with self.assertRaisesRegex(ValueError, "diagnos|progress"):
+            controller.reserve_cycle("loop", "draft")
+        with patch.object(controller, "verify", return_value=rejected):
+            resumed = controller.run("loop", resume=True)
+        self.assertEqual(resumed["status"], "BLOCKED")
+        self.assertEqual(read_record(self.store.db, "budget", "loop")["payload"]["task_cycles"], 3)
+        self.assertEqual(read_record(self.store.db, "budget", "loop")["payload"]["diagnostics"], {"loop:draft": 1})
+        return result, resumed, phase
+
+    def test_unsupported_diagnostic_does_not_request_scope_reapproval(self):
+        result, resumed, phase = self.diagnostic_stop_result("unsupported")
+        self.assertEqual(phase, "DIAGNOSTIC_BLOCKED")
+        for outcome in (result, resumed):
+            reasons = " ".join(outcome["blocked_reasons"]).lower()
+            self.assertIn("diagnostic", reasons)
+            self.assertNotIn("approved proposal", reasons)
+
+    def test_failed_diagnostic_does_not_request_scope_reapproval(self):
+        result, resumed, phase = self.diagnostic_stop_result("failed")
+        self.assertEqual(phase, "DIAGNOSTIC_BLOCKED")
+        for outcome in (result, resumed):
+            self.assertNotIn("approved proposal", " ".join(outcome["blocked_reasons"]).lower())
+
+    def test_tampered_diagnostic_cannot_claim_owner_approval_is_required(self):
+        result, resumed, phase = self.diagnostic_stop_result("tampered")
+        self.assertEqual(phase, "DIAGNOSTIC_BLOCKED")
+        for outcome in (result, resumed):
+            self.assertNotIn("approved proposal", " ".join(outcome["blocked_reasons"]).lower())
+
+    def test_captured_approval_required_diagnostic_preserves_owner_decision(self):
+        result, resumed, phase = self.diagnostic_stop_result("approval")
+        self.assertEqual(phase, "NEEDS_APPROVAL")
+        for outcome in (result, resumed):
+            self.assertIn("revised approved proposal", " ".join(outcome["blocked_reasons"]).lower())
+
+    def test_interrupted_diagnostic_has_its_own_durable_stop_reason(self):
+        result, resumed, phase = self.diagnostic_stop_result("interrupted")
+        self.assertEqual(phase, "DIAGNOSTIC_INTERRUPTED")
+        for outcome in (result, resumed):
+            reasons = " ".join(outcome["blocked_reasons"]).lower()
+            self.assertIn("interrupted", reasons)
+            self.assertNotIn("approved proposal", reasons)
 
     def test_approved_stage_commits_original_check_high_water(self):
         controller, _ = self.loop_fixture(progress_on_probe=True)
@@ -876,6 +955,53 @@ elif 'cause' in schema['properties']:
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(result.get("stage_results", {}).get("blocked", {}).get("profile_evidence", {}).get("by_id", {}).get("blocked", {}).get("status"), "FAIL")
         self.assertEqual(result["stage_results"]["independent"]["status"], "APPROVED")
+
+    def test_stronger_plan_revalidates_completed_stage_without_replaying_implementation(self):
+        controller, verification = self.scheduling_fixture()
+        with patch.object(controller, "verify", side_effect=verification):
+            controller.run("schedule")
+        original_proof = read_record(self.store.db, "stage", "schedule:independent")
+        original_budget = read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"]
+        original_candidates = self.implementation_stages()
+        plan = self.tasks.execution_plan("schedule")
+        updated = self.tasks.update_execution_plan("schedule", {"checks": [*plan["checks"],
+            {"id": "additional-check", "kind": "artifact", "path": "independent.md", "required": True}]}, expected_revision=plan["revision"])
+        checked = []
+
+        def current_verification(task_id, stage_id):
+            if stage_id == "independent":
+                checked.append(read_record(self.store.db, "checks", task_id)["payload"])
+            return verification(task_id, stage_id)
+
+        with patch.object(controller, "verify", side_effect=current_verification):
+            result = controller.run("schedule", resume=True)
+        self.assertEqual(result["stage_results"].get("independent", {}).get("status"), "APPROVED")
+        self.assertEqual(len(checked), 1)
+        self.assertEqual(checked[0]["plan_hash"], updated["plan_hash"])
+        self.assertEqual({item["id"] for item in checked[0]["results"]}, {"independent", "additional-check"})
+        self.assertEqual(self.implementation_stages(), original_candidates)
+        self.assertEqual(read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"], original_budget)
+        self.assertEqual(read_record(self.store.db, "stage", "schedule:independent"), original_proof)
+
+    def test_stronger_plan_rejection_preserves_original_repair_cycle_cap(self):
+        controller, verification = self.scheduling_fixture()
+        with patch.object(controller, "verify", side_effect=verification):
+            controller.run("schedule")
+        plan = self.tasks.execution_plan("schedule")
+        self.tasks.update_execution_plan("schedule", {"checks": [*plan["checks"],
+            {"id": "additional-check", "kind": "artifact", "path": "independent.md", "required": True}]}, expected_revision=plan["revision"])
+        original_candidates = self.implementation_stages()
+
+        def newly_rejected(task_id, stage_id):
+            if stage_id == "independent":
+                return {"status": "REJECTED", "blocked_reasons": [], "rejected_reasons": ["P2: Newly exposed actual failure"]}
+            return verification(task_id, stage_id)
+
+        with patch.object(controller, "verify", side_effect=newly_rejected):
+            result = controller.run("schedule", resume=True)
+        self.assertTrue(any("cycle budget exhausted" in reason.lower() for reason in result["stage_blockers"].get("independent", [])))
+        self.assertEqual(self.implementation_stages(), original_candidates)
+        self.assertEqual(read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"], 2)
 
 
 if __name__ == "__main__":

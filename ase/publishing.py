@@ -584,9 +584,29 @@ class Publisher:
                                  commit=commit, publication_state="UNKNOWN" if observed.get("exit_code") != 0 else "NOT_CONFIRMED", evidence_root=str(folder))
         proof.update(remote_commit=remote_commit, reconciled_push_error=pushed.get("exit_code") != 0,
                      confirmed_at_utc=now())
-        artifact = self._proof(folder, "published", task_id, proof)
+        # A hook can change local source or HEAD while the pinned commit is
+        # successfully pushed. Keep that actual effect, but observe the local
+        # postconditions before carrying forward the earlier approval.
+        post_push = {"head": None, "branch": None, "dirty": None, "fingerprint": None,
+                     "observed_at_utc": now(), "reasons": []}
+        observations = {"head": lambda: self._git("rev-parse", "HEAD"),
+                        "branch": lambda: self._git("branch", "--show-current"),
+                        "dirty": lambda: self._git("status", "--porcelain"),
+                        "fingerprint": lambda: source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"]}
+        expected = {"head": commit, "branch": branch, "dirty": "", "fingerprint": fresh["fingerprint"]}
+        for name, observe in observations.items():
+            try:
+                post_push[name] = observe()
+                if post_push[name] != expected[name]:
+                    post_push["reasons"].append("Publication confirmed; local " + name + " differs from the reviewed publication inputs")
+            except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+                post_push["reasons"].append("Publication confirmed; local " + name + " observation unavailable: " + redact(error))
+        post_push["status"] = "BLOCKED" if post_push["reasons"] else "PASS"
         authority_current = not cancelled()
-        return {**plan, "status": plan["status"] if authority_current else "BLOCKED",
-                **({} if authority_current else {"reasons": ["Publication confirmed; original authority changed after launch"]}),
+        reasons = [*post_push["reasons"], *([] if authority_current else ["Publication confirmed; original authority changed after launch"])]
+        proof.update(post_push=post_push, authority_current=authority_current, reasons=reasons)
+        artifact = self._proof(folder, "published", task_id, proof)
+        return {**plan, "status": "BLOCKED" if reasons else plan["status"],
+                **({"reasons": reasons} if reasons else {}), "post_push": post_push,
                 "published": True, "authority_current": authority_current, "commit": commit, "remote_commit": remote_commit,
                 "reconciled_push_error": proof["reconciled_push_error"], "proof": artifact}

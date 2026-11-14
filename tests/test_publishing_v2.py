@@ -15,7 +15,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from ase.discovery import discover_capabilities, record_discovery
 from ase.gates import source_snapshot
+import ase.publishing as publishing_module
 from ase.publishing import Publisher
 from ase.state import read_record, transaction, write_record
 from ase.store import Store, now
@@ -63,7 +65,7 @@ class PublishingV2Tests(unittest.TestCase):
     def protocol_gate(self, *_args, **_kwargs):
         task = self.tasks.snapshot("publish")
         return {"status": "APPROVED", "reasons": [], "blocked_reasons": [], "rejected_reasons": [],
-            "fingerprint": source_snapshot(self.store, task["contract"])["fingerprint"],
+            "fingerprint": source_snapshot(self.store, task["contract"], task_id="publish")["fingerprint"],
             "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
             "plan_hash": self.tasks.execution_plan("publish")["plan_hash"]}
 
@@ -123,6 +125,11 @@ class PublishingV2Tests(unittest.TestCase):
         with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate):
             result = self.publisher.publish("publish", execute_push=True, commit_message="Reviewed app change")
         self.assertTrue(result["published"])
+        self.assertEqual(result["status"], "APPROVED")
+        self.assertEqual(result["post_push"]["status"], "PASS")
+        self.assertEqual(result["post_push"]["head"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(result["post_push"]["branch"], "feature/publishing")
+        self.assertEqual(result["post_push"]["dirty"], "")
         self.assertEqual(self.remote_commit(), self.git("rev-parse", "HEAD"))
         self.assertEqual(markers.read_text(encoding="utf-8").splitlines(), ["commit", "push"])
         self.assertEqual(self.tasks.snapshot("publish")["state"], "COMPLETED")
@@ -396,6 +403,91 @@ class PublishingV2Tests(unittest.TestCase):
         self.assertFalse(result["published"])
         self.assertFalse(self.remote_commit())
         self.assertFalse(self.journal("published"))
+
+    def assert_confirmed_push_with_unmet_postconditions(self, result):
+        self.assertTrue(result["published"], result)
+        self.assertEqual(result["remote_commit"], self.remote_commit())
+        self.assertEqual(result["commit"], result["remote_commit"])
+        self.assertEqual(result["status"], "BLOCKED", result)
+        self.assertTrue(result["authority_current"])
+        self.assertEqual(result["post_push"]["status"], "BLOCKED")
+        self.assertTrue(result["post_push"]["reasons"])
+        proof = Path(result["proof"]["path"])
+        self.assertEqual(hashlib.sha256(proof.read_bytes()).hexdigest(), result["proof"]["sha256"])
+        saved = json.loads(proof.read_bytes())
+        self.assertEqual(saved["post_push"], result["post_push"])
+        self.assertEqual(saved["remote_commit"], self.remote_commit())
+        self.assertEqual(len(self.journal("published")), 1)
+
+    def test_pre_push_hook_committed_drift_preserves_publication_but_blocks_completion(self):
+        self.publisher.authorize()
+        (self.repo / "app.py").write_text("value = 2\n", encoding="utf-8")
+        self.hook("pre-push", "printf 'value = 3\\n' > app.py\ngit add app.py\ngit commit -m 'Hook generated change'")
+        with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate):
+            result = self.publisher.publish("publish", execute_push=True, commit_message="Reviewed source")
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), result["remote_commit"])
+        self.assert_confirmed_push_with_unmet_postconditions(result)
+        self.assertEqual(result["post_push"]["head"], self.git("rev-parse", "HEAD"))
+        self.assertEqual((self.repo / "app.py").read_text(), "value = 3\n")
+
+    def test_pre_push_hook_branch_switch_is_recorded_after_confirmed_push(self):
+        self.publisher.authorize()
+        self.hook("pre-push", "git checkout -b bugfix/hook-local")
+        with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate):
+            result = self.publisher.publish("publish", execute_push=True)
+        self.assert_confirmed_push_with_unmet_postconditions(result)
+        self.assertEqual(result["post_push"]["branch"], "bugfix/hook-local")
+        self.assertEqual(result["post_push"]["head"], result["remote_commit"])
+
+    def test_pre_push_hook_dirty_source_is_recorded_after_confirmed_push(self):
+        self.publisher.authorize()
+        self.hook("pre-push", "printf 'value = 3\\n' > app.py")
+        with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate):
+            result = self.publisher.publish("publish", execute_push=True)
+        self.assert_confirmed_push_with_unmet_postconditions(result)
+        self.assertTrue(result["post_push"]["dirty"])
+        self.assertEqual(result["post_push"]["head"], result["remote_commit"])
+
+    def test_pre_push_hook_ignored_input_drift_is_not_mistaken_for_current_approval(self):
+        self.publisher.authorize()
+        (self.repo / ".gitignore").write_text("observations/\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "Ignore read-only observations")
+        self.refresh_baseline()
+        dependency = self.repo / "observations/current.txt"
+        dependency.parent.mkdir()
+        dependency.write_text("Original input\n", encoding="utf-8")
+        discovery = discover_capabilities(self.store.project, scope={"resources": ["app.py"],
+            "dependencies": [{"path": "observations/current.txt", "reason": "Required read-only input"}]}, backend_config={})
+        record_discovery(self.store, "publish", discovery, expected_revision=0)
+        before = source_snapshot(self.store, self.tasks.snapshot("publish")["contract"], task_id="publish")["fingerprint"]
+        self.hook("pre-push", "printf 'Changed input\\n' > observations/current.txt")
+        with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate):
+            result = self.publisher.publish("publish", execute_push=True)
+        self.assert_confirmed_push_with_unmet_postconditions(result)
+        self.assertEqual(result["post_push"]["dirty"], "")
+        self.assertEqual(result["post_push"]["head"], result["remote_commit"])
+        self.assertNotEqual(result["post_push"]["fingerprint"], before)
+
+    def test_unavailable_local_postcondition_does_not_erase_confirmed_publication(self):
+        self.publisher.authorize()
+        actual_execute, actual_git = publishing_module.execute, self.publisher._git
+        confirmed = []
+        def execute(argv, *args, **kwargs):
+            result = actual_execute(argv, *args, **kwargs)
+            if argv[5] == "ls-remote" and result["exit_code"] == 0:
+                confirmed.append(True)
+            return result
+        def git(*args, **kwargs):
+            if confirmed and args == ("rev-parse", "HEAD"):
+                raise ValueError("Local HEAD observation unavailable after push")
+            return actual_git(*args, **kwargs)
+        with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate), \
+                patch("ase.publishing.execute", side_effect=execute), patch.object(self.publisher, "_git", side_effect=git):
+            result = self.publisher.publish("publish", execute_push=True)
+        self.assert_confirmed_push_with_unmet_postconditions(result)
+        self.assertIsNone(result["post_push"]["head"])
+        self.assertTrue(any("HEAD" in reason for reason in result["post_push"]["reasons"]))
 
 
 if __name__ == "__main__":

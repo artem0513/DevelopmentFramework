@@ -12,7 +12,7 @@ import unittest
 from ase.adapters.codex import CodexAdapter
 from ase.gates import GateService, source_snapshot
 from ase.runner import Runner
-from ase.state import read_record, write_record
+from ase.state import hash_value, read_record, write_record
 from ase.store import Store
 from ase.tasks import TaskService
 from ase.workflow import EDIT_SCHEMA, WorkflowController
@@ -20,7 +20,7 @@ import test_runner as transport
 from test_journal import contract
 
 
-class RevisionHistoryTests(unittest.TestCase):
+class _RevisionHistoryFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="ase-revision-history-")
         self.addCleanup(temporary.cleanup)
@@ -38,8 +38,7 @@ class RevisionHistoryTests(unittest.TestCase):
         spec["stages"][0]["scope"] = {"resources": ["guide.txt"], "effects": ["file_write"]}
         spec["stages"].append({"id": "deliver", "scope": {"resources": ["delivery.txt"], "effects": ["file_write"]},
             "acceptance_ids": ["DELIVERY"], "depends_on": ["draft"]})
-        task = self.tasks.create(spec)
-        self.approve(task, "Original draft")
+        self.create_task(spec)
         self.controller = WorkflowController(self.store)
         self.controller._save("baseline", "revision", source_snapshot(self.store, self.task["contract"], task_id="revision"))
         self.controller.check("revision", "draft")
@@ -58,6 +57,9 @@ class RevisionHistoryTests(unittest.TestCase):
             self.controller._save("verification", "revision:" + role, result["receipt"])
         self.controller._capture_stage("revision", "draft", {"status": "APPROVED", "fingerprint": "protocol-scheduler-fixture"})
         self.original = copy.deepcopy(self.task)
+
+    def create_task(self, spec):
+        self.approve(self.tasks.create(spec), "Original draft")
 
     def approve(self, task, summary):
         task = self.tasks.propose("revision", {"summary": summary, "stage_ids": ["draft"]}, expected_revision=task["revision"])
@@ -91,6 +93,77 @@ class RevisionHistoryTests(unittest.TestCase):
         history = json.loads(supplied["_ase_context/stage_history.json"])
         manifest = json.loads(supplied["_ase_context/action_evidence.json"])
         return packet, supplied, history, manifest["stages"][0]["implementation_proposal"]
+
+
+class RevisionHistoryTests(_RevisionHistoryFixture):
+    def test_additive_check_plan_keeps_old_capture_historical_and_allows_fresh_checks(self):
+        original_plan = self.tasks.execution_plan("revision")
+        extra = {"id": "extra-guide-check", "kind": "artifact", "path": "guide.txt", "required": True}
+        plan = self.tasks.update_execution_plan("revision", {"checks": [*original_plan["checks"], extra]},
+            expected_revision=original_plan["revision"])
+        packet, _, history, proposal = self.packet()
+        self.assertEqual(packet["coverage"]["missing"], [])
+        self.assertEqual(proposal["status"], "HISTORICAL_VERIFIED_CAPTURE")
+        self.assertFalse(proposal["current_identity"])
+        self.assertEqual(proposal["bindings"]["plan_sha256"], original_plan["plan_hash"])
+        self.assertEqual(proposal["plan_supersession"], {
+            "original_plan_hash": original_plan["plan_hash"], "current_plan_hash": plan["plan_hash"]})
+        self.assertFalse(history["stages"][0]["current_identity"])
+        self.assertFalse(history["stages"][0]["semantic_approval"])
+        self.assertEqual(history["stages"][0]["plan_supersession"], proposal["plan_supersession"])
+        gate = GateService(self.store).gate("revision", "draft")
+        self.assertIn("Stale check evidence: plan_hash", gate["reasons"])
+        checks = self.controller.check("revision", "draft")
+        self.assertEqual({item["id"] for item in checks["results"]}, {"guide", "extra-guide-check"})
+        self.assertIn("Independent ac receipt invalid: Receipt inputs are stale",
+            GateService(self.store).gate("revision", "draft")["reasons"])
+        self.fixture.write_text(transport.FIXTURE)
+        request = self.controller._request("revision", "ac", transport.SCHEMA, {"stage_id": "draft"})
+        fresh = self.runner.run(CodexAdapter(), request, timeout=5)
+        self.assertEqual(fresh["result"]["status"], "COMPLETE")
+        self.controller._save("verification", "revision:ac", fresh["receipt"])
+        request = self.controller._request("revision", "review", transport.SCHEMA, {"stage_id": "draft"})
+        fresh_review = self.runner.run(CodexAdapter(), request, timeout=5)
+        self.controller._save("verification", "revision:review", fresh_review["receipt"])
+        self.capture_implementation()
+        self.controller._capture_stage("revision", "draft", {"status": "APPROVED", "fingerprint": "protocol-new-plan-fixture"})
+        captured = read_record(self.store.db, "stage", "revision:draft")["payload"]
+        self.assertEqual(captured["proof"]["checks"]["plan_hash"], plan["plan_hash"])
+        with self.assertRaisesRegex(ValueError, "cannot be replaced"):
+            self.controller._capture_stage("revision", "draft", {"status": "APPROVED", "fingerprint": "protocol-duplicate-fixture"})
+        self.assertFalse((self.repo / "delivery.txt").exists())
+
+    def test_changed_weakened_or_bad_hash_plan_cannot_authorize_old_capture(self):
+        saved = read_record(self.store.db, "execution_plan", "revision")
+        for change in ("changed", "weakened", "bad-hash"):
+            with self.subTest(change=change):
+                changed = copy.deepcopy(saved["payload"])
+                if change == "changed":
+                    changed["checks"][0]["path"] = "delivery.txt"
+                elif change == "weakened":
+                    changed["checks"][0]["required"] = False
+                changed["plan_hash"] = "0" * 64 if change == "bad-hash" else hash_value(changed["checks"])
+                record = read_record(self.store.db, "execution_plan", "revision")
+                with self.store.db:
+                    write_record(self.store.db, "execution_plan", "revision", changed, expected_revision=record["revision"])
+                packet, _, _, proposal = self.packet()
+                self.assertEqual(proposal["status"], "INVALID")
+                self.assertTrue(packet["coverage"]["missing"])
+        record = read_record(self.store.db, "execution_plan", "revision")
+        with self.store.db:
+            write_record(self.store.db, "execution_plan", "revision", saved["payload"], expected_revision=record["revision"])
+
+    def test_new_current_candidate_replaces_old_plan_candidate_in_verifier_packet(self):
+        original = self.tasks.execution_plan("revision")
+        extra = {"id": "extra-guide-check", "kind": "artifact", "path": "guide.txt", "required": True}
+        self.tasks.update_execution_plan("revision", {"checks": [*original["checks"], extra]}, expected_revision=original["revision"])
+        latest = self.capture_implementation()
+        packet, _, history, proposal = self.packet()
+        self.assertEqual(packet["coverage"]["missing"], [])
+        self.assertEqual(proposal["status"], "VERIFIED_CAPTURE")
+        self.assertEqual(proposal["execution_id"], latest["execution_id"])
+        self.assertNotEqual(proposal["execution_id"], self.original_implementation["execution_id"])
+        self.assertFalse(history["stages"][0]["current_identity"])
 
     def test_approved_revision_transports_old_proof_as_history_without_current_approval(self):
         self.revise()
@@ -176,6 +249,105 @@ class RevisionHistoryTests(unittest.TestCase):
                     self.store.db.execute("INSERT INTO " + table + " VALUES(" + placeholders + ")", tuple(row))
         request = Path(self.original_implementation["artifacts"]["request"]["path"])
         request.write_text("tampered historical request")
+        packet, _, history, proposal = self.packet()
+        self.assertEqual(history["stages"], [])
+        self.assertEqual(proposal["status"], "INVALID")
+        self.assertTrue(packet["coverage"]["missing"])
+
+
+class InheritedRevisionHistoryTests(_RevisionHistoryFixture):
+    def create_task(self, spec):
+        ancestor = copy.deepcopy(spec)
+        ancestor["id"] = "ancestor"
+        ancestor["stages"] = [{"id": "parent-stage", "acceptance_ids": [ac["id"] for ac in ancestor["acceptance"]], "depends_on": []}]
+        task = self.tasks.create(ancestor)
+        task = self.tasks.propose("ancestor", {"summary": "Authorized parent work", "stage_ids": ["parent-stage"]},
+            expected_revision=task["revision"])
+        self.tasks.approve("ancestor", proposal_hash=task["proposal_hash"], user_message_ref="test:ancestor",
+            approved_stage_ids=["parent-stage"])
+        parent = {**ancestor, "id": "parent", "parent_task_id": "ancestor", "parent_stage_id": "parent-stage"}
+        self.tasks.create(parent)
+        self.task = self.tasks.create({**spec, "parent_task_id": "parent", "parent_stage_id": "parent-stage"})
+
+    def test_revised_inherited_child_keeps_verified_original_ancestry_without_replay(self):
+        self.assertEqual(self.packet()[0]["coverage"]["missing"], [])
+        self.assertIsNone(read_record(self.store.db, "approval", "revision")["payload"])
+        self.revise()
+        self.assertEqual(self.tasks.require_approval("revision", "draft")["state"], "READY")
+        self.store.close()
+        self.store = Store(self.repo, self.base / "state")
+        self.tasks, self.controller = TaskService(self.store), WorkflowController(self.store)
+        packet, _, history, proposal = self.packet()
+        self.assertEqual(packet["coverage"]["missing"], [])
+        self.assertEqual(proposal["status"], "HISTORICAL_VERIFIED_CAPTURE")
+        self.assertFalse(proposal["current_identity"])
+        self.assertFalse(history["stages"][0]["semantic_approval"])
+        self.assertEqual(proposal["execution_id"], self.original_implementation["execution_id"])
+        self.capture_implementation()
+        self.assertEqual(self.packet()[3]["status"], "VERIFIED_CAPTURE")
+        self.assertNotEqual(GateService(self.store).gate("revision", "draft")["status"], "APPROVED")
+        self.assertFalse((self.repo / "delivery.txt").exists())
+
+    def test_inherited_history_requires_archived_versions_and_original_ancestor_grant(self):
+        self.revise()
+        selectors = (("runtime_records", "kind='task_version' AND key='revision:1'"),
+            ("runtime_records", "kind='task_version' AND key='parent:1'"),
+            ("runtime_records", "kind='task_version' AND key='ancestor:1'"),
+            ("runtime_records", "kind='approval_version' AND key='ancestor:2'"),
+            ("runtime_events", "event_key='ancestor:proposal:2'"),
+            ("runtime_events", "event_key='ancestor:approval:2'"))
+        for table, selector in selectors:
+            with self.subTest(table=table, selector=selector):
+                row = self.store.db.execute("SELECT * FROM " + table + " WHERE " + selector).fetchone()
+                self.assertIsNotNone(row)
+                with self.store.db:
+                    self.store.db.execute("DELETE FROM " + table + " WHERE " + selector)
+                packet, _, history, proposal = self.packet()
+                self.assertEqual(history["stages"], [])
+                self.assertEqual(proposal["status"], "INVALID")
+                self.assertTrue(packet["coverage"]["missing"])
+                with self.store.db:
+                    placeholders = ",".join("?" for _ in row)
+                    self.store.db.execute("INSERT INTO " + table + " VALUES(" + placeholders + ")", tuple(row))
+
+    def test_inherited_history_rejects_unknown_parent_identity_scope_and_late_grant(self):
+        self.revise()
+        selectors = (("runtime_records", "kind='task_version' AND key='revision:1'", "parent-hash"),
+            ("runtime_records", "kind='task_version' AND key='parent:1'", "scope"),
+            ("runtime_events", "event_key='ancestor:approval:2'", "late-grant"))
+        for table, selector, change in selectors:
+            with self.subTest(change=change):
+                row = self.store.db.execute("SELECT * FROM " + table + " WHERE " + selector).fetchone()
+                value = json.loads(row["payload"])
+                grant_archive = None
+                if change == "parent-hash":
+                    value["parent_proposal_hash"] = "0" * 64
+                elif change == "scope":
+                    value["contract"]["stages"][0]["scope"]["resources"] = ["delivery.txt"]
+                    value["contract_hash"] = hash_value(value["contract"])
+                    value["proposal_hash"] = hash_value({"parent_proposal_hash": value["parent_proposal_hash"],
+                        "contract_hash": value["contract_hash"]})
+                else:
+                    value["approved_at_utc"] = "2099-01-01T00:00:00+00:00"
+                    grant_archive = self.store.db.execute("SELECT payload FROM runtime_records WHERE kind='approval_version' AND key='ancestor:2'").fetchone()[0]
+                with self.store.db:
+                    self.store.db.execute("UPDATE " + table + " SET payload=? WHERE " + selector, (json.dumps(value),))
+                    if grant_archive is not None:
+                        self.store.db.execute("UPDATE runtime_records SET payload=? WHERE kind='approval_version' AND key='ancestor:2'", (json.dumps(value),))
+                packet, _, history, proposal = self.packet()
+                self.assertEqual(history["stages"], [])
+                self.assertEqual(proposal["status"], "INVALID")
+                self.assertTrue(packet["coverage"]["missing"])
+                with self.store.db:
+                    self.store.db.execute("UPDATE " + table + " SET payload=? WHERE " + selector, (row["payload"],))
+                    if grant_archive is not None:
+                        self.store.db.execute("UPDATE runtime_records SET payload=? WHERE kind='approval_version' AND key='ancestor:2'", (grant_archive,))
+
+    def test_current_parent_revocation_does_not_reuse_original_inherited_grant(self):
+        self.revise()
+        parent = self.tasks.snapshot("ancestor")
+        self.tasks.propose("ancestor", {"summary": "Changed parent authority awaits owner approval", "stage_ids": ["parent-stage"]},
+            expected_revision=parent["revision"])
         packet, _, history, proposal = self.packet()
         self.assertEqual(history["stages"], [])
         self.assertEqual(proposal["status"], "INVALID")
