@@ -52,6 +52,16 @@ def worker(base, mode, ordinal=None):
             save(base / ('claim-result-' + ordinal + '.json'), value)
             return
         value = service.register('delegated', fixture.spec('crash'))
+        if mode == 'outer':
+            store.db.execute('BEGIN IMMEDIATE')
+            try:
+                ticket = service.dispatch('delegated', 'crash', expected_revision=value['revision'],
+                    coordinator='lead', backend='codex')
+            except ValueError as error:
+                hold(base, {'boundary': 'outer-transaction-before-commit', 'handoff_returned': False, 'reason': str(error)})
+            else:
+                hold(base, {'boundary': 'outer-transaction-before-commit', 'handoff_returned': True,
+                    'attempt_id': ticket['payload']['attempt']['id']})
         dispatched = service.dispatch('delegated', 'crash', expected_revision=value['revision'],
             coordinator='lead', backend='codex')
         attempt = dispatched['payload']['attempt']['id']
@@ -170,6 +180,18 @@ class DelegationCrashTests(unittest.TestCase):
                     service.dispatch('delegated', 'crash', expected_revision=current['revision'], coordinator='lead', backend='codex')
                 self.assertTrue(service.closure_blockers('delegated'))
             self.assertEqual(store.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_outer_transaction_kill_never_exposes_an_uncommitted_launch_ticket(self):
+        ready = self.kill_ready('outer')
+        self.assertFalse(ready['handoff_returned'], 'A caller could launch native work from a ticket lost by rollback')
+        self.assertIn('transaction', ready['reason'])
+        with closing(Store(self.base / 'work', self.base / 'state')) as store:
+            service = fixture.registry(store)
+            pending = service.get('delegated', 'crash')
+            self.assertEqual(pending['payload']['state'], 'PENDING')
+            self.assertIsNone(pending['payload']['attempt'])
+            first = service.dispatch('delegated', 'crash', expected_revision=pending['revision'], coordinator='lead', backend='codex')
+            self.assertEqual(first['payload']['state'], 'DISPATCHING')
 
     def test_hard_kill_after_result_seal_recovers_exact_uncommitted_result(self):
         ready = self.kill_ready('seal')

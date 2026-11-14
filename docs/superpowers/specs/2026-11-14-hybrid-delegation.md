@@ -10,6 +10,10 @@ Use existing SQLite transactions/CAS and concise events, not the parent's execut
 
 ## Lifecycle and recovery
 
+Readiness and dispatch apply the same duplicate/uncertain-overlap checks. Before a dependent dispatch or acceptance, validate the entire prerequisite DAG, including each accepted node's current authority, artifact integrity and retained dependency-result bindings. Shared prerequisites are checked once per traversal; the ticket still records its direct dependencies.
+
+Dispatch must own its SQLite transaction so its returned launch ticket is already committed. Embedded callers must commit their outer transaction before requesting dispatch; releasing a nested savepoint is not durable permission to start a native worker. Other metadata operations retain their existing transaction behavior.
+
 `PENDING -> DISPATCHING -> RUNNING -> RESULT_READY -> ACCEPTED`.
 
 Commit one exact attempt ID, backend, coordinator, handoff context and dependency-result bindings before the bot calls its native spawn tool. Return a portable ticket including the attempt ID and a private output directory. `attach` records the exact observed native handle; it never starts a process. A missing acknowledgement or interrupted coordinator produces `UNKNOWN`, never an automatic replacement attempt based on timeout, PID absence or elapsed time. The bot reconciles the native worker; a positive matching result or observed handle can restore that same attempt. This version has no blind retry/reset API.

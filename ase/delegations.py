@@ -152,18 +152,46 @@ class DelegationRegistry:
             return self._save(old, value)
 
     def _dependencies(self, value):
-        selected = {}
-        for dependency in value['spec']['depends_on']:
-            key = self.root_task_id(value['task_id']) + ':' + dependency
-            record = read_record(self.store.db, 'delegation', key)
+        root = self.root_task_id(value['task_id'])
+        records, bindings, verified, visiting = {}, {}, set(), set()
+
+        def reference(work):
+            record = records[work]
+            return {'revision': record['revision'], 'result_sha256': record['payload']['result']['sha256']}
+
+        # Iterative postorder keeps deep DAGs off Python's call stack and checks
+        # each shared prerequisite once per traversal, including its provenance.
+        pending = [(work, False) for work in value['spec']['depends_on']]
+        while pending:
+            work, expanded = pending.pop()
+            if work in verified:
+                continue
+            if expanded:
+                parent = records[work]['payload']
+                current = {dependency: reference(dependency) for dependency in parent['spec']['depends_on']}
+                if current != parent['attempt']['dependencies']:
+                    raise ValueError('Delegation prerequisite bindings changed: ' + work)
+                visiting.remove(work)
+                verified.add(work)
+                continue
+            if work in visiting:
+                raise ValueError('Delegation dependency cycle')
+            record = read_record(self.store.db, 'delegation', root + ':' + work)
             parent = record['payload']
             if not parent or parent['state'] != 'ACCEPTED':
-                raise ValueError('Delegation dependency is not accepted: ' + dependency)
-            if self._binding(parent['task_id'], parent['stage_id'], allow_completed=True) != parent['binding']:
-                raise ValueError('Delegation dependency context is stale: ' + dependency)
+                raise ValueError('Delegation dependency is not accepted: ' + work)
+            record = self.get(parent['task_id'], work)
+            context = (parent['task_id'], parent['stage_id'])
+            if context not in bindings:
+                bindings[context] = self._binding(*context, allow_completed=True)
+            if bindings[context] != parent['binding']:
+                raise ValueError('Delegation dependency context is stale: ' + work)
             load_result(self.store, parent)
-            selected[dependency] = {'revision': record['revision'], 'result_sha256': parent['result']['sha256']}
-        return selected
+            records[work] = record
+            visiting.add(work)
+            pending.append((work, True))
+            pending.extend((dependency, False) for dependency in parent['spec']['depends_on'])
+        return {work: reference(work) for work in value['spec']['depends_on']}
 
     def _guard(self, value):
         if self._binding(value['task_id'], value['stage_id']) != value['binding']:
@@ -175,7 +203,24 @@ class DelegationRegistry:
         return {**{key: item for key, item in spec.items() if key not in {'id', 'resources', 'depends_on'}},
             'resources': sorted(spec['resources']), 'depends_on': sorted(spec['depends_on'])}
 
+    def _dispatch_dependencies(self, value):
+        dependencies = self._guard(value)
+        # A ready-wave observation and the transactional dispatch must agree.
+        # Known distinct RUNNING analyses may still share read-only inputs.
+        for item in self._entries(value['task_id']):
+            other = item['payload']
+            if (other['state'] in {'DISPATCHING', 'RUNNING', 'RESULT_READY', 'UNKNOWN'}
+                    and self._intent(other['spec']) == self._intent(value['spec'])):
+                raise ValueError('Another unsettled assignment has the same delegated intent')
+            if other['state'] in {'DISPATCHING', 'UNKNOWN'} and OperationLedger._scopes_overlap(
+                    OperationLedger._scope({'resources': value['spec']['resources']}),
+                    OperationLedger._scope({'resources': other['spec']['resources']})):
+                raise ValueError('Overlapping native delegation has an unresolved launch')
+        return dependencies
+
     def dispatch(self, task_id, work_id, *, expected_revision, coordinator, backend):
+        if self.store.db.in_transaction:
+            raise ValueError('Native dispatch must own its transaction; commit the caller transaction before requesting a launch ticket')
         text(coordinator, 'delegation coordinator', limit=300)
         if backend not in {'codex', 'claude', 'copilot'}:
             raise ValueError('Unknown native delegation backend')
@@ -185,19 +230,7 @@ class DelegationRegistry:
             value = copy.deepcopy(record['payload'])
             if value['state'] != 'PENDING' or value['attempt'] is not None:
                 raise ValueError('Native delegation already dispatched; reconcile its original attempt')
-            dependencies = self._guard(value)
-            # DISPATCHING is already uncertain before recover labels UNKNOWN.
-            # Known RUNNING analyses may share inputs for distinct purposes;
-            # the same immutable intent cannot be relaunched under a new ID.
-            for item in self._entries(task_id):
-                other = item['payload']
-                if (other['state'] in {'DISPATCHING', 'RUNNING', 'RESULT_READY', 'UNKNOWN'}
-                        and self._intent(other['spec']) == self._intent(value['spec'])):
-                    raise ValueError('Another unsettled assignment has the same delegated intent')
-                if other['state'] in {'DISPATCHING', 'UNKNOWN'} and OperationLedger._scopes_overlap(
-                        OperationLedger._scope({'resources': value['spec']['resources']}),
-                        OperationLedger._scope({'resources': other['spec']['resources']})):
-                    raise ValueError('Overlapping native delegation has an unresolved launch')
+            dependencies = self._dispatch_dependencies(value)
             context = {'project': {'project_id': self.store.project_id, 'workspace_id': self.store.workspace_id,
                 'root': str(self.store.repo)}, 'spec_sha256': value['spec_sha256'], 'binding': value['binding'], 'dependencies': dependencies}
             value['attempt'] = {'id': uuid.uuid4().hex, 'backend': backend, 'coordinator': coordinator,
@@ -404,7 +437,7 @@ class DelegationRegistry:
             value = item['payload']
             if value['state'] == 'PENDING':
                 try:
-                    self._guard(value)
+                    self._dispatch_dependencies(value)
                 except (ValueError, OSError, TypeError, KeyError) as ex:
                     from .core import redact
                     blocked[value['id']] = [redact(ex)]

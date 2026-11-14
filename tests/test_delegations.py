@@ -397,5 +397,87 @@ class DelegationTests(unittest.TestCase):
             service.dispatch('child', 'child-analysis', expected_revision=value['revision'], coordinator='lead', backend='codex')
 
 
+    def test_snapshot_excludes_overlapping_unacknowledged_dispatch(self):
+        self.start('original')
+        self.reg().register('delegated', spec('alias'))
+        current = self.reg().snapshot('delegated')
+        self.assertNotIn('alias', current['ready'])
+        self.assertIn('unresolved launch', ' '.join(current['blocked']['alias']))
+
+    def test_snapshot_excludes_exact_intent_of_running_worker(self):
+        original = self.start('original')
+        service = self.reg()
+        service.attach('delegated', 'original', original['payload']['attempt']['id'],
+            {'backend': 'codex', 'agent_id': 'original-native'}, expected_revision=original['revision'])
+        service.register('delegated', dict(original['payload']['spec'], id='alias'))
+        current = service.snapshot('delegated')
+        self.assertNotIn('alias', current['ready'])
+        self.assertIn('same delegated intent', ' '.join(current['blocked']['alias']))
+
+    def test_broken_transitive_artifact_blocks_readiness_and_dispatch(self):
+        _, artifact = self.accepted('b')
+        self.accepted('a', depends_on=['b'])
+        pending = self.reg().register('delegated', spec('c', depends_on=['a']))
+        artifact.write_bytes(b'Accidentally replaced after the intermediate result was accepted')
+        with self.assertRaises(ValueError):
+            self.reg().dispatch('delegated', 'c', expected_revision=pending['revision'], coordinator='lead', backend='codex')
+        self.assertNotIn('c', self.reg().snapshot('delegated')['ready'])
+
+    def test_broken_transitive_artifact_blocks_acceptance_after_dispatch(self):
+        _, artifact = self.accepted('b')
+        self.accepted('a', depends_on=['b'])
+        dispatched = self.start('c', depends_on=['a'])
+        recorded, _, _ = self.result(dispatched, 'c')
+        artifact.write_bytes(b'Accidental upstream change while the final worker was running')
+        with self.assertRaises(ValueError):
+            self.reg().accept('delegated', 'c', dispatched['payload']['attempt']['id'],
+                expected_revision=recorded['revision'], coordinator='lead', summary='Upstream provenance is no longer valid')
+        self.assertEqual(self.reg().get('delegated', 'c')['payload']['state'], 'RESULT_READY')
+
+    def test_intact_diamond_retains_direct_dependency_ticket_shape(self):
+        self.accepted('b')
+        self.accepted('a', depends_on=['b'])
+        self.accepted('d', depends_on=['b'])
+        dispatched = self.start('c', depends_on=['a', 'd'])
+        self.assertEqual(set(dispatched['handoff']['dependencies']), {'a', 'd'})
+        recorded, _, _ = self.result(dispatched, 'c')
+        accepted = self.reg().accept('delegated', 'c', dispatched['payload']['attempt']['id'],
+            expected_revision=recorded['revision'], coordinator='lead', summary='Checked the intact shared prerequisite chain')
+        self.assertEqual(accepted['payload']['state'], 'ACCEPTED')
+
+    def test_stopped_transitive_dependency_owner_blocks_downstream_dispatch(self):
+        parent = self.tasks.snapshot('delegated')
+        self.tasks.create(dict(copy.deepcopy(parent['contract']), id='child',
+            parent_task_id='delegated', parent_stage_id='draft'))
+        record_discovery(self.store, 'child', discover_capabilities(self.store.project,
+            scope={'resources': ['inputs', 'guide.md']}, backend_config={}), expected_revision=0)
+        service = self.reg()
+        pending = service.register('child', spec('child-b'))
+        dispatched = service.dispatch('child', 'child-b', expected_revision=pending['revision'], coordinator='lead', backend='codex')
+        attempt = dispatched['payload']['attempt']['id']
+        result = service.result('child', 'child-b', attempt, {'attempt_id': attempt, 'agent_id': 'child-native',
+            'status': 'COMPLETE', 'summary': 'Bounded advisory child facts', 'artifacts': []}, expected_revision=dispatched['revision'])
+        service.accept('child', 'child-b', attempt, expected_revision=result['revision'], coordinator='lead', summary='Original child facts')
+        self.accepted('a', depends_on=['child-b'])
+        pending = service.register('delegated', spec('c', depends_on=['a']))
+        WorkflowController(self.store).request_stop('child', reason='Owner stopped the prerequisite task')
+        with self.assertRaises(ValueError):
+            service.dispatch('delegated', 'c', expected_revision=pending['revision'], coordinator='lead', backend='codex')
+
+    def test_dispatch_cannot_return_a_ticket_inside_caller_transaction(self):
+        service = self.reg()
+        pending = service.register('delegated', spec('nested'))
+        self.store.db.execute('BEGIN IMMEDIATE')
+        try:
+            with self.assertRaisesRegex(ValueError, 'transaction'):
+                service.dispatch('delegated', 'nested', expected_revision=pending['revision'], coordinator='lead', backend='codex')
+            self.assertTrue(self.store.db.in_transaction, 'The registry must not commit its caller transaction')
+        finally:
+            self.store.db.rollback()
+        self.assertEqual(service.get('delegated', 'nested'), pending)
+        first = service.dispatch('delegated', 'nested', expected_revision=pending['revision'], coordinator='lead', backend='codex')
+        self.assertEqual(first['payload']['state'], 'DISPATCHING')
+
+
 if __name__ == '__main__':
     unittest.main()
