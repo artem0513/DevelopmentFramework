@@ -92,42 +92,10 @@ def _target(root, value):
     return candidate
 
 
-def apply_edits(root, scope, edits):
-    root = Path(root).resolve()
-    if "file_write" not in scope["effects"] and edits:
-        raise ValueError("File mutation exceeds approved scope effects")
-    checked, seen = [], set()
-    for edit in edits:
-        path = _target(root, edit.get("path"))
-        allowed = False
-        for resource in scope["resources"]:
-            boundary = _target(root, resource)
-            if path == boundary or (boundary.is_dir() and path.is_relative_to(boundary)):
-                allowed = True
-        if not allowed or path in seen:
-            raise ValueError("Edit exceeds approved scope or duplicates a path")
-        seen.add(path)
-        before = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-        if (edit.get("before_sha256") or None) != before:
-            raise ValueError("Edit preimage is stale")
-        if edit.get("operation", "write") not in {"write", "delete"} or not isinstance(edit.get("content"), str):
-            raise ValueError("Invalid edit operation")
-        if path.exists() and not path.is_file():
-            raise ValueError("Edit target is not a file")
-        checked.append((path, edit))
-    for path, edit in checked:
-        if edit.get("operation", "write") == "delete":
-            if path.exists():
-                path.unlink()
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(path.name + ".ase-" + uuid.uuid4().hex + ".tmp")
-            try:
-                temporary.write_text(edit["content"], encoding="utf-8", newline="")
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
-    return [str(path.relative_to(root)).replace("\\", "/") for path, _ in checked]
+def apply_edits(root, scope, edits, *, application=None):
+    from .edit_application import plan_edits, apply_planned_edits
+    plan = application if application is not None else plan_edits(root, scope, edits, uuid.uuid4().hex, _target)
+    return apply_planned_edits(root, scope, edits, plan, _target)
 
 
 class WorkflowController:
@@ -1551,13 +1519,32 @@ class WorkflowController:
         while True:
             # Every corrective iteration needs current prerequisite proof before
             # reserving another candidate, including explicit resumes.
-            prerequisite_blockers, _ = self._revalidate_prerequisites(task, stage)
+            prerequisite_blockers, prerequisite_binding = self._revalidate_prerequisites(task, stage)
             if prerequisite_blockers:
                 return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
             progress_key = task_id + ":" + stage_id
             progress = read_record(self.store.db, "cycle", progress_key)["payload"] or {}
             diagnostic_blocker = self._diagnostic_stop_reason(progress)
             resume_verdict = None
+            recovered_application = False
+            if resume and progress.get("local_edit_application_id") and progress.get("phase") == "APPLYING":
+                from .local_edit_intent import finish_local_edits
+                progress = finish_local_edits(self, task, stage, progress, prerequisite_binding, _target, apply_edits, EDIT_SCHEMA)
+                recovered_application = True
+            elif resume and progress.get("local_edit_application_id") and progress.get("phase") == "CHECKING":
+                from .local_edit_intent import finish_local_edits
+                try:
+                    progress = finish_local_edits(self, task, stage, progress, prerequisite_binding,
+                        _target, apply_edits, EDIT_SCHEMA, require_applied=True)
+                    recovered_application = True
+                except (ValueError, OSError, KeyError, TypeError) as ex:
+                    # An earlier action may legitimately have changed source.
+                    # Keep the conservative observation-only recovery route;
+                    # a completed local intent never authorizes file replay.
+                    from .core import redact
+                    progress.update(phase="VERIFYING", read_only_recovery=True,
+                        local_edit_continuation_blocker="Saved local edit continuation requires reconciliation: " + redact(ex))
+                    self._save("cycle", progress_key, progress)
             if resume:
                 _, recovery, recovery_groups = self._recovery_context(self.store.db, task_id, stage_id)
                 stopped = any(recovery["groups"][name]["stopped"] or recovery["groups"][name].get("diagnostic_inflight")
@@ -1578,7 +1565,7 @@ class WorkflowController:
                     if not reconciled["newly_verified"] and resume_verdict["status"] != "APPROVED":
                         return {"status": "BLOCKED", "blocked_reasons": [diagnostic_blocker or "Corrective probe remains stopped; fresh read-only checks and independent verification established no new original progress",
                             *resume_verdict.get("blocked_reasons", [])], "previous_gate": resume_verdict}
-                elif inflight or (progress.get("phase") == "IMPLEMENTING"
+                elif (inflight and not recovered_application) or (progress.get("phase") == "IMPLEMENTING"
                         and progress.get("contract_hash") == task["contract_hash"]
                         and progress.get("proposal_hash") == task["proposal_hash"]):
                     # Applying several edits and saving the next checkpoint
@@ -1605,9 +1592,11 @@ class WorkflowController:
                 self._save("cycle", progress_key, progress)
                 feedback = read_record(self.store.db, "gate", progress_key)["payload"]
                 candidate_authority = self._stage_authority(task, stage)
+                progress["candidate_authority"] = candidate_authority
+                self._save("cycle", progress_key, progress)
                 candidate = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "implementation", EDIT_SCHEMA,
                     {"instruction": "Propose minimal approved-scope edits. Empty before_sha256 means a new file. Do not change requirements or proof state.",
-                     "stage": stage, "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
+                     "stage": stage, "candidate_id": reservation["candidate_id"], "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
                 self._save("implementation", task_id, candidate["receipt"])
                 # Preserve unfinished independent stages before a later stage
                 # replaces the task-wide latest candidate. This is a proposal
@@ -1625,14 +1614,11 @@ class WorkflowController:
                 # File writes share the same linearized authority boundary as
                 # process creation. A replacement approval cannot authorize a
                 # candidate generated under the previous scope or ancestry.
-                with transaction(self.store.db):
-                    if self._stage_authority(task, stage) != candidate_authority:
-                        raise ValueError("Candidate authority changed before file mutation")
-                    self._available(task_id, 1)
-                    self._require_prerequisite_binding(task_id, stage_id, prerequisite_binding)
-                    apply_edits(self.store.repo, stage["scope"], candidate["result"]["payload"]["edits"])
-                progress.update(phase="CHECKING", fingerprint=source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"])
-                self._save("cycle", progress_key, progress)
+                from .local_edit_intent import prepare_local_edits, finish_local_edits
+                progress = prepare_local_edits(self, task, stage, progress, candidate["receipt"],
+                    candidate_authority, prerequisite_binding, _target, EDIT_SCHEMA)
+                progress = finish_local_edits(self, task, stage, progress, prerequisite_binding,
+                    _target, apply_edits, EDIT_SCHEMA)
             if progress["phase"] == "CHECKING" and not progress.get("read_only_recovery"):
                 # Approved overlapping edits may regress a prerequisite. Assess
                 # their actual result before any dependent action is launched.
@@ -1661,6 +1647,9 @@ class WorkflowController:
                 from .journal import Journal
                 Journal(self.store).append({"kind": "stage_result", "task_id": task_id, "summary": "Verified stage " + stage_id, "status": "COMPLETED", "evidence_refs": ["stage:" + stage_id]}, event_key=task_id + ":" + stage_id + ":" + task["proposal_hash"])
                 break
+            if progress.get("local_edit_continuation_blocker"):
+                return {"status": "BLOCKED", "blocked_reasons": [progress["local_edit_continuation_blocker"],
+                    *verdict.get("blocked_reasons", []), *verdict.get("rejected_reasons", [])], "previous_gate": verdict}
             if verdict["blocked_reasons"]:
                 return verdict
             progress.update(phase="REJECTED")

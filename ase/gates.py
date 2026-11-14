@@ -128,13 +128,15 @@ def source_resources(store, contract, task_id=None):
     return declared_source_resources(contract, discovery)
 
 
-def _directory_sources(root, directory):
+def _directory_sources(root, directory, excluded_files=()):
     """Bound generic directory inventory without traversing private Git data."""
     from .project_local import is_private_path
     pending, count = [directory], 0
     while pending:
         for candidate in pending.pop().iterdir():
             if candidate.name.lower() == ".git" or is_private_path(candidate.relative_to(root)):
+                continue
+            if candidate.relative_to(root).as_posix() in excluded_files:
                 continue
             count += 1
             if count > 1000:
@@ -152,7 +154,7 @@ def _directory_sources(root, directory):
                 yield candidate
 
 
-def source_snapshot(store, contract, task_id=None):
+def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
     from .project_local import is_private_path
     from .source_coverage import source_path, declared_source_resources, normalized_discovery_policy
     row = store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone() if task_id is not None else None
@@ -161,7 +163,8 @@ def source_snapshot(store, contract, task_id=None):
     base = None
     if has_software(contract):
         from .inspection import safe_snapshot
-        base = safe_snapshot(store.repo)
+        base = (safe_snapshot(store.repo, _excluded_files=_excluded_files)
+                if _excluded_files else safe_snapshot(store.repo))
     files, missing = dict(base["files"]) if base else {}, []
     unavailable = {}
     root = store.repo.resolve()
@@ -184,6 +187,8 @@ def source_snapshot(store, contract, task_id=None):
                 return
             path = path.relative_to(root)
         path = source_path(root, path.as_posix())
+        if path.relative_to(root).as_posix() in _excluded_files:
+            return
         if is_private_path(path.relative_to(root)):
             raise ValueError("Private project-local state is not project source")
         if path.is_file() and path.stat().st_nlink > 1:
@@ -195,7 +200,7 @@ def source_snapshot(store, contract, task_id=None):
             # must not add generated or ignored trees (including check output).
             # An explicitly named ignored dependency file remains supported.
             candidates = ([root / name for name in base["files"] if (root / name).is_relative_to(path)]
-                          if base is not None else sorted(_directory_sources(root, path)))
+                          if base is not None else sorted(_directory_sources(root, path, _excluded_files)))
         else:
             candidates = [path]
         if len(candidates) > 1000:

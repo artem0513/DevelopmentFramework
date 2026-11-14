@@ -137,7 +137,7 @@ def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def safe_snapshot(repo):
+def safe_snapshot(repo, *, _excluded_files=()):
     """The same source-content fingerprint representation as core.snapshot."""
     repo = Path(repo).resolve(strict=True)
     raw = _run(repo, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
@@ -147,6 +147,8 @@ def safe_snapshot(repo):
         raise ValueError("Private project-local state cannot be source or publication input")
     files = {}
     for relative in paths:
+        if relative in _excluded_files:
+            continue
         p = repo / relative
         if p.is_file() and p.stat().st_nlink > 1:
             raise ValueError("Hardlinked source cannot be fingerprinted or included in packets")
