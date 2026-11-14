@@ -331,7 +331,7 @@ class WorkflowController:
 
         return cancelled, launch_guard
 
-    def _call(self, task_id, function, timeout=1200):
+    def _call(self, task_id, function, timeout=1200, *, capture_reference=None):
         timeout = self._available(task_id, timeout)
         root_id = self._root_task(task_id)
         nonce = uuid.uuid4().hex
@@ -339,7 +339,12 @@ class WorkflowController:
             old = read_record(db, "active_call", root_id)
             if old["payload"]:
                 raise ValueError("An unfinished call needs explicit resume/reconciliation")
-            write_record(db, "active_call", root_id, {"started": now(), "timeout": timeout, "owner_nonce": nonce, "pid": os.getpid()}, expected_revision=old["revision"])
+            active = {"started": now(), "timeout": timeout, "owner_nonce": nonce, "pid": os.getpid(), "task_id": task_id}
+            if capture_reference is not None:
+                if capture_reference.get('task_id') != task_id:
+                    raise ValueError('Implementation capture differs from active task')
+                active['implementation_capture'] = capture_reference
+            write_record(db, "active_call", root_id, active, expected_revision=old["revision"])
         started = time.monotonic()
         try:
             return function(timeout)
@@ -1287,6 +1292,14 @@ class WorkflowController:
                 if not resume:
                     raise ValueError("Interrupted call needs explicit resume")
                 elapsed = max(0, (datetime.fromisoformat(now()) - datetime.fromisoformat(active["payload"]["started"])).total_seconds())
+                if active['payload'].get('implementation_capture'):
+                    try:
+                        from .candidate_capture import completed_interval
+                        elapsed = completed_interval(self, active['payload'], root_id)
+                    except (ValueError, OSError, KeyError, TypeError):
+                        # Partial/invalid/legacy calls cannot establish a trusted
+                        # completion time; retain conservative bounded charging.
+                        pass
                 with transaction(self.store.db) as db:
                     self.charge_time(task_id, min(elapsed, active["payload"]["timeout"]))
                     write_record(db, "active_call", root_id, None, expected_revision=active["revision"])
@@ -1527,6 +1540,31 @@ class WorkflowController:
             diagnostic_blocker = self._diagnostic_stop_reason(progress)
             resume_verdict = None
             recovered_application = False
+            if progress.get('phase') == 'CAPTURE_BLOCKED' and not resume:
+                return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
+            if resume and progress.get('phase') in {'IMPLEMENTING', 'CAPTURE_BLOCKED'} and progress.get('implementation_capture'):
+                try:
+                    from .candidate_capture import completed
+                    reference = progress['implementation_capture']
+                    if (not isinstance(reference, dict) or
+                            (reference.get('task_id'), reference.get('stage_id'), reference.get('candidate_id')) != (task_id, stage_id, progress.get('candidate_id'))):
+                        raise ValueError('Candidate capture reservation differs from the interrupted stage')
+                    candidate = completed(self, reference)
+                    self._save('implementation', task_id, candidate['receipt'])
+                    self._save('stage_implementation', progress_key, candidate['receipt'])
+                    if not read_record(self.store.db, 'baseline_implementation', task_id)['payload']:
+                        self._save('baseline_implementation', task_id, candidate['receipt'])
+                    from .local_edit_intent import prepare_local_edits
+                    progress = prepare_local_edits(self, task, stage, progress, candidate['receipt'],
+                        progress.get('candidate_authority'), prerequisite_binding, _target, EDIT_SCHEMA)
+                except (ValueError, OSError, KeyError, TypeError) as ex:
+                    from .core import redact
+                    progress.update(phase='CAPTURE_BLOCKED',
+                        capture_recovery_blocker='Saved candidate capture requires reconciliation: ' + redact(ex))
+                    self._save('cycle', progress_key, progress)
+                    return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
+            elif progress.get('phase') == 'CAPTURE_BLOCKED':
+                return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
             if resume and progress.get("local_edit_application_id") and progress.get("phase") == "APPLYING":
                 from .local_edit_intent import finish_local_edits
                 progress = finish_local_edits(self, task, stage, progress, prerequisite_binding, _target, apply_edits, EDIT_SCHEMA)
@@ -1594,9 +1632,16 @@ class WorkflowController:
                 candidate_authority = self._stage_authority(task, stage)
                 progress["candidate_authority"] = candidate_authority
                 self._save("cycle", progress_key, progress)
-                candidate = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, "implementation", EDIT_SCHEMA,
+                request = self._request(task_id, "implementation", EDIT_SCHEMA,
                     {"instruction": "Propose minimal approved-scope edits. Empty before_sha256 means a new file. Do not change requirements or proof state.",
-                     "stage": stage, "candidate_id": reservation["candidate_id"], "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
+                     "stage": stage, "candidate_id": reservation["candidate_id"], "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]})
+                from .candidate_capture import reference
+                capture, request = reference(task_id, stage_id, reservation['candidate_id'], uuid.uuid4().hex, request)
+                progress['implementation_capture'] = capture
+                self._save('cycle', progress_key, progress)
+                candidate = self._call(task_id, lambda timeout: runner.run(adapter, request,
+                    timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id), execution_id=capture['execution_id']),
+                    capture_reference=capture)
                 self._save("implementation", task_id, candidate["receipt"])
                 # Preserve unfinished independent stages before a later stage
                 # replaces the task-wide latest candidate. This is a proposal

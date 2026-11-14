@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from contextlib import nullcontext
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -208,7 +209,9 @@ class Runner:
         self.artifact_root = Path(artifact_root)
         if not self.artifact_root.is_absolute(): raise ValueError("Absolute artifact root required")
 
-    def run(self, adapter, request, *, timeout=300, cancel_requested=None):
+    def run(self, adapter, request, *, timeout=300, cancel_requested=None, execution_id=None):
+        if execution_id is not None and (not isinstance(execution_id, str) or not re.fullmatch('[0-9a-f]{32}', execution_id)):
+            raise ValueError('Invalid host execution ID')
         allowed = {"role", "project", "bindings", "schema", "source_packet", "handoff"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("Only transport-neutral request fields are accepted")
@@ -241,7 +244,7 @@ class Runner:
         checked_path(ancestor, directory=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         checked_path(self.artifact_root, directory=True)
-        execution_id = uuid.uuid4().hex
+        execution_id = execution_id if execution_id is not None else uuid.uuid4().hex
         root = self.artifact_root / execution_id
         root.mkdir(mode=0o700)
         artifacts = {"request": _write(root / "request.json", request_data),
