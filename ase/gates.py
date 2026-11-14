@@ -332,6 +332,8 @@ class GateService:
         current["high_risk_approved"] = bool(high and high.get("fingerprint") == source["fingerprint"] and high.get("contract_hash") == task["contract_hash"])
         result = evaluate_gate(task["contract"], current, receipts, [])
         extra = []
+        from .delegations import DelegationRegistry
+        extra.extend(DelegationRegistry(self.store).closure_blockers(task_id, stage_id=stage_id))
         readiness = tasks.readiness(task_id, stage_id=stage_id)
         extra.extend("Unresolved required source gap: " + gap["id"] for gap in readiness["required_source_gaps"])
         extra.extend(self._required_children(task_id, task["contract"], stage_id))

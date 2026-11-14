@@ -1181,9 +1181,17 @@ class WorkflowController:
         action_files, action_missing = action_packet_evidence(self.store, task, plan, snapshot, stage_id=stage_id)
         files.extend(action_files)
         missing.extend(action_missing)
+        from .delegations import DelegationRegistry
+        try:
+            delegation_evidence = DelegationRegistry(self.store).packet_evidence(task_id, stage_id=stage_id)
+        except (ValueError, OSError, KeyError, TypeError) as ex:
+            from .core import redact
+            reason = 'Native delegation evidence unavailable: ' + redact(ex)
+            missing.append(reason)
+            delegation_evidence = {'status': 'UNAVAILABLE', 'reason': reason}
         for name, data in (("contract", task["contract"]), ("execution_plan", plan), ("source_changes", changes), ("stage_history", stage_history),
                            ("discovery", discovery), ("intake_validation", intake_state["validation"]), ("source_availability", availability), ("artifact_representations", representation_metadata), ("omitted_sources", omitted_sources),
-                           ("actual_checks", read_record(self.store.db, "checks", task_id)["payload"])):
+                           ('delegations', delegation_evidence), ("actual_checks", read_record(self.store.db, "checks", task_id)["payload"])):
             content = encode(data)
             files.append({"path": "_ase_context/" + name + ".json", "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest()})
         check = read_record(self.store.db, "checks", task_id)["payload"]

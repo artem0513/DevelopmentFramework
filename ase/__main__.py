@@ -30,12 +30,54 @@ class JSONArgumentParser(argparse.ArgumentParser):
         raise ValueError(message)
 
 
+def _delegation_command(store, args):
+    from .delegations import DelegationRegistry
+    registry = DelegationRegistry(store)
+    if args.action == 'list':
+        return registry.snapshot(args.task_id)
+    if args.action == 'register':
+        return registry.register(args.task_id, load(args.file), expected_revision=args.expected_revision)
+    if args.action == 'recover':
+        return registry.recover(args.task_id, args.work_id)
+    kwargs = {'expected_revision': args.expected_revision}
+    if args.action == 'dispatch':
+        return registry.dispatch(args.task_id, args.work_id, coordinator=args.coordinator, backend=args.backend, **kwargs)
+    if args.action in {'attach', 'result'}:
+        return getattr(registry, args.action)(args.task_id, args.work_id, args.attempt_id, load(args.file), **kwargs)
+    if args.action == 'accept':
+        return registry.accept(args.task_id, args.work_id, args.attempt_id, coordinator=args.coordinator, summary=args.summary, **kwargs)
+    return registry.cancel(args.task_id, args.work_id, reason=args.reason, **kwargs)
+
+
 def parser():
     p = JSONArgumentParser(description="Project-local, evidence-driven supervised workflow")
     p.add_argument("--repo", default=".")
     p.add_argument("--home", help="Explicit state home (outside source or validated project-local state)")
     p.add_argument("--project", help="Registered project UUID or workspace alias")
     commands = p.add_subparsers(dest="command", required=True)
+    delegation = commands.add_parser('delegation', help='Persist native delegated work; bots keep creating subagents')
+    delegation_commands = delegation.add_subparsers(dest='action', required=True)
+    for name in ('register', 'list', 'dispatch', 'attach', 'result', 'accept', 'cancel', 'recover'):
+        command = delegation_commands.add_parser(name)
+        command.add_argument('task_id')
+        if name == 'recover':
+            command.add_argument('work_id', nargs='?')
+        elif name not in {'register', 'list'}:
+            command.add_argument('work_id')
+        if name not in {'list', 'recover'}:
+            command.add_argument('--expected-revision', type=int, default=0, required=name != 'register')
+        if name in {'register', 'attach', 'result'}:
+            command.add_argument('--file', required=True)
+        if name in {'attach', 'result', 'accept'}:
+            command.add_argument('--attempt', required=True, dest='attempt_id')
+        if name in {'dispatch', 'accept'}:
+            command.add_argument('--coordinator', required=True)
+        if name == 'dispatch':
+            command.add_argument('--backend', choices=('codex', 'claude', 'copilot'), required=True)
+        if name == 'accept':
+            command.add_argument('--summary', required=True)
+        if name == 'cancel':
+            command.add_argument('--reason', required=True)
     credentials = commands.add_parser("credentials", help="Manage encrypted local credential profiles").add_subparsers(dest="action", required=True)
     credential_import = credentials.add_parser("import")
     credential_import.add_argument("--file", required=True)
@@ -367,6 +409,8 @@ def main(argv=None):
                 store = Store(args.repo, args.home)
             if cmd == "task":
                 result = _task_command(store, args.action, args)
+            elif cmd == 'delegation':
+                result = _delegation_command(store, args)
             elif cmd == "access":
                 controller = WorkflowController(store)
                 access = {"credential_ref": args.credential, "target": args.target}
@@ -433,8 +477,10 @@ def main(argv=None):
             elif cmd == "start" and load(args.contract).get("schema_version") == 2:
                 result = TaskService(store).create(load(args.contract))
             elif cmd == "report" and not TaskService(store).snapshot(args.task_id)["legacy_v1"]:
+                from .delegations import DelegationRegistry
                 result = {"task": TaskService(store).snapshot(args.task_id), "quality_gate": GateService(store).gate(args.task_id),
-                          "project_id": store.project_id, "workspace_id": store.workspace_id}
+                          "project_id": store.project_id, "workspace_id": store.workspace_id,
+                          "delegations": DelegationRegistry(store).snapshot(args.task_id)}
             else:
                 # Existing Git-only tools remain available for legacy history,
                 # time and continuity. Public execution never reaches Engine.run.

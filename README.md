@@ -34,6 +34,8 @@ A managed task moves through intake, scoped discovery, a concise proposal and re
 
 Useful independent parts may run through available, permitted native subagents. One lead assigns bounded inputs, read/write ownership, outputs, acceptance and dependencies, then integrates results and performs final checks/review. The ready set changes after each result or dependency: waves such as 1 → 4 → 1 → 5 are valid, with excess work queued to the host's current capacity. Shared-root runtime mutations remain serialized. Missing optional delegation uses serial work; native advisory replies do not replace genuine Runner evidence or create new approval/budget.
 
+Managed native work uses the project-local `ase delegation` registry: register assignments/dependencies, commit a dispatch ticket before the bot spawns a worker, attach the real native handle, capture its private output, and separately accept the result. `ase delegation list`/`recover` and `ase restore` retain exact attempts across coordinator crashes. An uncertain launch is held rather than restarted on a timer; unsettled work blocks closure/publication. Bots keep native lifecycle control. Registry acceptance is advisory; original independent AC/review remain required. See [parallel work](skills/task-orchestrator/references/parallel-work.md).
+
 ```text
 ase project register --root ROOT --kind document --timezone Europe/Bucharest
 ase --project PROJECT_ID capabilities

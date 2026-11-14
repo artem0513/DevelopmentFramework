@@ -50,6 +50,8 @@ def generated_assets(root=ROOT):
                             'For useful independent ready work with permitted native subagents, read ' + relative +
                             '/task-orchestrator/references/parallel-work.md. One lead integrates adaptive waves while preserving '
                             'root leases, ownership and budgets; serial fallback remains available. '
+                            'For managed native delegation, commit ase delegation register/dispatch before native spawn, '
+                            'then attach the actual handle, seal the result and separately accept it; unknown launches require reconciliation. '
                             'Native advisory answers do not replace genuine independent Runner receipts. '
                             'This descriptor grants no access, approval or independent execution by itself.')
             if target == 'codex':
@@ -60,6 +62,7 @@ def generated_assets(root=ROOT):
                 suffix = '.agent.md' if target == 'copilot' else '.md'
                 path = root / 'templates/agents' / target / (role + suffix)
                 content = ('---\nname: ' + role + '\ndescription: ' + json.dumps(description) +
+                           ('\ninclude-custom-instructions: true' if target == 'copilot' else '') +
                            '\n---\n\n' + instructions + '\n')
             outputs[path] = content.encode('utf-8')
     outputs[root / 'ase/data/runtime_policy.json'] = canonical(build_bundle(root)) + b'\n'

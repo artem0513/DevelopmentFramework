@@ -415,8 +415,10 @@ class Publisher:
                 self.tasks.require_approval(task_id, stage["id"], allow_terminal=True)
             if controller._stop_requested(task_id):
                 raise ValueError("Task or ancestor is stopped or cancelled")
+            from .delegations import DelegationRegistry
+            delegations = DelegationRegistry(self.store).closure_binding(task_id)
             authority = controller._authority_binding(task_id)
-            return {"workflow": authority,
+            return {"workflow": authority, 'delegations_sha256': delegations,
                 "stop_revisions": {item["task_id"]: read_record(self.store.db, "stop", item["task_id"])["revision"]
                     for item in authority["ancestry"]},
                 "publishing_authorization_revision": self._authorization(remote)["revision"]}
