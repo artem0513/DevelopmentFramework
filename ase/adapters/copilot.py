@@ -6,9 +6,10 @@ from ..protocol import decode_json, normalized, packet_prompt
 class CopilotAdapter:
     name = "copilot"
 
-    def probe(self, config):
-        caps = probe_cli(self.name, config, ["--output-format", "--no-custom-instructions", "--disable-builtin-mcps", "--no-auto-update"])
-        if not caps["protocol_only"]:
+    def probe(self, config, *, deadline=None, cancel_requested=None):
+        caps = probe_cli(self.name, config, ["--output-format", "--no-custom-instructions", "--disable-builtin-mcps", "--no-auto-update"],
+                         deadline=deadline, cancel_requested=cancel_requested)
+        if not caps["protocol_only"] and caps["available"]:
             caps.update(available=False, blocker="COPILOT_CLEAN_START_UNVERIFIED", clean_start=False)
         caps["live_format_verified"] = False
         return caps

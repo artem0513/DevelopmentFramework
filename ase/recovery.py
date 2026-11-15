@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
+from datetime import datetime
 
 from .profiles import stage_evidence_specs
 from .state import hash_value, read_record
@@ -32,6 +33,100 @@ def initial_history(contract):
             "aliases": {}, "high_water": [], "failures": {}, "events": []}
 
 
+def _ancestor_stage(store, owner, task_id, stage_id=None):
+    """Map an actual descendant's spending to one immutable ancestor owner."""
+    seen = set()
+    while task_id != owner:
+        if task_id in seen:
+            raise ValueError("Parent task cycle")
+        seen.add(task_id)
+        contract = store.task(task_id)["contract"]
+        task_id, stage_id = contract.get("parent_task_id"), contract.get("parent_stage_id")
+        if not task_id:
+            return False, None
+    return True, stage_id
+
+
+def _created_after(task, before):
+    try:
+        return bool(task.get("created") and before and datetime.fromisoformat(task["created"]) > datetime.fromisoformat(before))
+    except (ValueError, TypeError):
+        return False
+
+
+def task_bound_contexts(store, history, tasks, budget, stage_id=None, *, updated=None):
+    """Keep local original allowances beside, never instead of, root history.
+
+    Root counters deliberately include inherited obligation high-water. Separate
+    owner counters prevent that earlier spending from consuming a new child's
+    own allowance, while every descendant still spends its ancestors' bounds.
+    """
+    owners = history.setdefault("task_bounds", {})
+    result = []
+    for task in tasks[:-1]:  # The existing root history already owns root bounds.
+        owner = task["task_id"]
+        if owner not in owners:
+            original = read_record(store.db, "task_version", owner + ":1")["payload"] or task
+            initial = initial_history(original["contract"])
+            entry = {key: initial[key] for key in ("hard_limits", "groups", "aliases")}
+            entry["task_cycles"] = 0
+            # Legacy stage counters may include inherited high-water. Ownership
+            # is known, exact local counts are not: import them conservatively.
+            for field, target in (("stages", "cycles"), ("diagnostics", "diagnostics")):
+                for key, count in budget.get(field, {}).items():
+                    parts = key.split(":", 1)
+                    if len(parts) < 2:
+                        # Bare legacy stage names carry no owner provenance.
+                        # Earlier spending cannot belong to a later-created task.
+                        if _created_after(task, updated):
+                            continue
+                        related, mapped = True, None
+                    else:
+                        related, mapped = _ancestor_stage(store, owner, *parts)
+                    if related:
+                        try:
+                            groups = (bind_stage(entry, owner, task["contract"], mapped, root_id=owner)
+                                      if mapped is not None else list(entry["groups"]))
+                        except (ValueError, KeyError):
+                            # A saved old stage name may no longer exist. Its
+                            # spending cannot disappear with that ambiguity.
+                            groups = list(entry["groups"])
+                        for name in groups:
+                            entry["groups"][name][target] += count
+                        if field == "stages":
+                            entry["task_cycles"] += count
+            owners[owner] = entry
+        entry = owners[owner]
+        for key, value in task["contract"]["execution_policy"].items():
+            if key in {"max_stage_cycles", "max_task_cycles", "max_diagnostic_passes", "active_time_budget_seconds"} and value is not None:
+                entry["hard_limits"][key] = min(value, entry["hard_limits"].get(key, value))
+        groups = bind_stage(entry, owner, task["contract"], stage_id, root_id=owner) if stage_id is not None else []
+        result.append((task, entry, groups))
+        stage_id = task["contract"].get("parent_stage_id") if stage_id is not None else None
+    return result
+
+
+def initialize_timing(budget, updated):
+    """Retain old unowned time explicitly; never silently reinterpret it as zero."""
+    if "active_by_task" not in budget:
+        budget["active_by_task"] = {}
+        budget["unattributed_active_seconds"] = budget.get("active_seconds", 0)
+        budget["unattributed_before"] = updated
+
+
+def task_active_seconds(store, task, budget):
+    spent = sum(seconds for owner, seconds in budget.get("active_by_task", {}).items()
+                if _ancestor_stage(store, task["task_id"], owner)[0])
+    unknown = budget.get("unattributed_active_seconds", 0)
+    if unknown:
+        # A task created after the last old timing record cannot own that old
+        # spending. Existing tasks retain the conservative aggregate until it
+        # can be reconciled; timestamps missing in legacy state prove nothing.
+        if not _created_after(task, budget.get("unattributed_before")):
+            spent += unknown
+    return spent
+
+
 def _resource_key(value):
     normalized = value.replace("\\", "/").rstrip("/")
     # URI paths and opaque identifiers retain case. Only local file paths use
@@ -54,7 +149,9 @@ def _overlap(left, right):
 def bind_stage(history, task_id, contract, stage_id, *, root_id, parent_groups=None):
     """New labels inherit overlapping old obligations; ambiguity reduces allowance."""
     key = task_id + ":" + stage_id
-    stage = next(s for s in contract["stages"] if s["id"] == stage_id)
+    stage = next((s for s in contract["stages"] if s["id"] == stage_id), None)
+    if stage is None:
+        raise ValueError("Unknown recovery stage: " + str(stage_id))
     groups = history["groups"]
     selected = set(history["aliases"].get(key, []))
     if parent_groups is not None:

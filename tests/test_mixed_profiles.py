@@ -18,7 +18,7 @@ import uuid
 
 from ase.__main__ import _task_command
 from ase.core import execute
-from ase.gates import GateService, source_snapshot, stage_checks
+from ase.gates import GateService, source_snapshot, stage_checks, verification_context_hash
 from ase.journal import Journal
 from ase import profiles
 from ase.state import hash_value, read_record, write_record
@@ -97,7 +97,8 @@ class MixedProfileTests(unittest.TestCase):
                              "artifact_root": str(self.store.root / "tasks" / task_id / "fixture"), "fixture_task_id": task_id,
                              "bindings": {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"],
                              "proposal_sha256": task["proposal_hash"], "plan_sha256": plan["plan_hash"],
-                             "check_sha256": hash_value(bundle), "workspace_id": self.store.workspace_id}}, expected_revision=old["revision"])
+                             "check_sha256": hash_value(bundle), "workspace_id": self.store.workspace_id,
+                             "verification_context_sha256": verification_context_hash(self.store, task["contract"], task_id)}}, expected_revision=old["revision"])
             for stage in task["contract"]["stages"]:
                 if completed_stages is not None and stage["id"] not in completed_stages:
                     continue

@@ -298,6 +298,8 @@ def _validate_archive(archive, temporary):
             raise ValueError("Invalid project metadata")
         if not re.fullmatch(r"[A-Za-z0-9_+./-]{1,128}", project["timezone"]):
             raise ValueError("Invalid timezone")
+        from .timezones import resolve_timezone
+        resolve_timezone(project["timezone"])
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError("Invalid project metadata") from error
     entries = manifest.get("files")
@@ -336,9 +338,38 @@ def _validate_archive(archive, temporary):
     return manifest
 
 
+def _import_revision_highwaters(db, records):
+    """Retain counters independently of the historical grants they once held.
+
+    Earlier imports reset current rows while preserving older record tiers and
+    immutable events. All of those observations can advance the next revision;
+    none supplies a current approval payload.
+    """
+    counters = {"task": {}, "approval": {}}
+    for kind, key, revision, _, _ in records:
+        while kind.startswith("historical_"):
+            kind = kind[11:]
+        if kind in counters:
+            counters[kind][key] = max(counters[kind].get(key, 0), revision)
+        elif kind in {"task_version", "approval_version"}:
+            owner, separator, suffix = key.rpartition(":")
+            if separator and re.fullmatch(r"[1-9][0-9]*", suffix):
+                counter = counters[kind[:-8]]
+                counter[owner] = max(counter.get(owner, 0), int(suffix))
+    for key, kind, task_id in db.execute(
+            "SELECT event_key,kind,task_id FROM runtime_events WHERE kind IN ('proposal','transition','approval')"):
+        prefix = str(task_id) + ":" + kind + ":"
+        suffix = key[len(prefix):] if key.startswith(prefix) else ""
+        if re.fullmatch(r"[1-9][0-9]*", suffix):
+            counter = counters["approval" if kind == "approval" else "task"]
+            counter[task_id] = max(counter.get(task_id, 0), int(suffix))
+    return counters
+
+
 def _historical_import(db, manifest, context, mode):
     with db:
         records = db.execute("SELECT kind,key,revision,payload,updated FROM runtime_records").fetchall()
+        highwaters = _import_revision_highwaters(db, records)
         for kind, key, revision, payload, updated in records:
             if not kind.startswith("historical_"):
                 historical = "historical_" + kind
@@ -353,12 +384,28 @@ def _historical_import(db, manifest, context, mode):
                 task = _json(data)
                 task.update(state="AWAITING_APPROVAL", proposal_hash=None, approved_stage_ids=[],
                             last_reason="Imported history requires a new reviewed proposal and approval")
-                write_record(db, kind, key, task, expected_revision=0)
+                # Preserve both counters above current, historical and event
+                # observations. A tombstone retains no old approval authority.
+                db.execute("INSERT INTO runtime_records VALUES(?,?,?,?,?)",
+                           (kind, key, highwaters["task"][key] + 1, encode(task), now()))
+                approval_revision = highwaters["approval"].get(key, 0)
+                if approval_revision:
+                    db.execute("INSERT INTO runtime_records VALUES(?,?,?,?,?)",
+                               ("approval", key, approval_revision, encode(None), now()))
             elif kind == "operation":
                 operation = _json(data)
                 if operation.get("state") not in {"APPLIED", "ABSENT"}:
                     operation["state"] = "UNKNOWN"
                 write_record(db, kind, key, operation, expected_revision=0)
+            elif kind == "publication_push":
+                # A copied workspace must not lose a remote push's uncertainty.
+                # Known applied/nonlaunch history grants no current approval;
+                # pending confirmation must be reobserved at the actual target.
+                publication = _json(data)
+                if publication.get("state") not in {"APPLIED", "ABSENT"}:
+                    publication = {**publication, "state": "UNKNOWN"}
+                    publication.pop("confirmation", None)
+                write_record(db, kind, key, publication, expected_revision=0)
             elif kind in {"execution_plan", "budget", "knowledge_dependencies"}:
                 write_record(db, kind, key, _json(data), expected_revision=0)
         db.execute("UPDATE tasks SET status='AWAITING_APPROVAL',updated=?", (now(),))

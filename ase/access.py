@@ -181,14 +181,15 @@ class CredentialAccess:
             raise _failure('INVALID_TIMEOUT')
         return self._ensure(ref, target, time.monotonic() + timeout, cancel_requested, launch_guard)[1]
 
-    def run(self, ref, target, argv, cwd, log, timeout=300, cancel_requested=None, launch_guard=None):
+    def run(self, ref, target, argv, cwd, log, timeout=300, cancel_requested=None, launch_guard=None, effect_launch_guard=None):
         if type(timeout) not in (int, float) or timeout <= 0:
             raise _failure('INVALID_TIMEOUT')
         deadline = time.monotonic() + timeout
         profile, metadata, secrets = self._ensure(ref, target, deadline, cancel_requested, launch_guard)
         _check_argv(argv, secrets)
         receipt = core.execute(argv, cwd, log, timeout=_remaining(deadline, cancel_requested), env=_env(profile),
-                               sensitive_values=secrets, cancel_requested=cancel_requested, max_output_bytes=1048576, launch_guard=launch_guard)
+                               sensitive_values=secrets, cancel_requested=cancel_requested, max_output_bytes=1048576,
+                               launch_guard=effect_launch_guard if effect_launch_guard is not None else launch_guard)
         receipt['access'] = {k: metadata[k] for k in ('credential_ref', 'target', 'revision')}
         return receipt
 

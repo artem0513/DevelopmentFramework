@@ -10,6 +10,7 @@ import uuid
 
 from .project_local import find_local_config, validate_local_state
 from .native_paths import state_io
+from .timezones import resolve_timezone
 
 
 def _now():
@@ -80,10 +81,10 @@ class ProjectRegistry:
         if project is not None and Path(project).expanduser().is_dir():
             config = local_config(project)
             _outside(self.state_home, config["root"] if config else Path(project).expanduser().resolve())
-        self.state_home.mkdir(parents=True, exist_ok=True)
+        state_io(self.state_home).mkdir(parents=True, exist_ok=True)
         for name in ("registry.sqlite3", "registry.sqlite3-wal", "registry.sqlite3-shm", "projects"):
             _safe_state(self.state_home / name)
-        self.db = sqlite3.connect(self.state_home / "registry.sqlite3", timeout=30)
+        self.db = sqlite3.connect(state_io(self.state_home / "registry.sqlite3"), timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
         try:
@@ -171,14 +172,16 @@ class ProjectRegistry:
                     raise ValueError("Existing project-local identity requires explicit project attach after relocation")
                 config = local_config(root)
                 default_timezone = config["timezone"] if config else "Europe/Bucharest"
+                selected_timezone = timezone or default_timezone
+                resolve_timezone(selected_timezone)
                 project_id, workspace_id = str(uuid.uuid4()), str(uuid.uuid4())
                 legacy_key = hashlib.sha256(_canonical(root).encode()).hexdigest()[:24]
                 legacy = self.state_home / "projects" / legacy_key / "memory.sqlite3"
                 _safe_state(legacy)
-                storage_key = legacy_key if legacy.is_file() else project_id
+                storage_key = legacy_key if state_io(legacy).is_file() else project_id
                 self.db.execute("INSERT INTO projects VALUES(?,?,?,?,?,?,?,?,?)", (
                     project_id, storage_key, kind or ("software" if (root / ".git").exists() else "workspace"),
-                    timezone or default_timezone, "PREPARING", 1,
+                    selected_timezone, "PREPARING", 1,
                     hashlib.sha256(_canonical(root).encode()).hexdigest(), workspace_id, _now()))
                 self.db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?)", (
                     workspace_id, project_id, str(root), _canonical(root), _now()))

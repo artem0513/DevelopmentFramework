@@ -21,8 +21,19 @@ def decode_json(value):
                 raise ValueError("Duplicate JSON key")
             result[key] = item
         return result
+    def finite_float(token):
+        result = float(token)
+        if not math.isfinite(result): raise ValueError("Non-finite JSON")
+        return result
     return json.loads(value, object_pairs_hook=pairs,
+                      parse_float=finite_float,
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON")))
+
+
+def _finite_number(value):
+    # Python integers have arbitrary precision; converting them to float can
+    # overflow even when the JSON integer and its schema bounds are valid.
+    return type(value) is int or (type(value) is float and math.isfinite(value))
 
 
 def validate_payload(payload, schema):
@@ -51,14 +62,14 @@ def validate_payload(payload, schema):
         for key in ("minItems", "maxItems", "minLength", "maxLength"):
             if key in node and (type(node[key]) is not int or node[key] < 0): raise ValueError("Invalid bound")
         for key in ("minimum", "maximum"):
-            if key in node and (type(node[key]) not in (int, float) or not math.isfinite(node[key])):
+            if key in node and not _finite_number(node[key]):
                 raise ValueError("Invalid bound")
 
     def check(value, node, path):
         kind = node.get("type")
         ok = {"object": isinstance(value, dict), "array": isinstance(value, list),
               "string": isinstance(value, str), "integer": type(value) is int,
-              "number": type(value) in (int, float) and math.isfinite(value),
+              "number": _finite_number(value),
               "boolean": type(value) is bool, "null": value is None}
         if kind and not ok[kind]: return [path + ": wrong type"]
         errors = []
@@ -81,7 +92,7 @@ def validate_payload(payload, schema):
             if len(value) < node.get("minLength", 0) or len(value) > node.get("maxLength", len(value)):
                 errors.append(path + ": string length")
         if type(value) in (int, float):
-            if not math.isfinite(value) or value < node.get("minimum", value) or value > node.get("maximum", value):
+            if not _finite_number(value) or value < node.get("minimum", value) or value > node.get("maximum", value):
                 errors.append(path + ": numeric bound")
         return errors
 

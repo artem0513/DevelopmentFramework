@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 
 from .projects import ProjectContext, ProjectRegistry, _canonical, _outside, _safe_state, local_config, resolve_state_home
+from .native_paths import state_io
 
 
 def now():
@@ -65,10 +66,11 @@ class Store:
             _safe_state(path)
         if not valid_local_home and (self.root == self.repo or self.root.is_relative_to(self.repo)):
             raise ValueError("State home must be outside the repository")
-        self.root.mkdir(parents=True, exist_ok=True)
-        if not preparing and not (self.root / "memory.sqlite3").is_file():
+        state_io(self.root).mkdir(parents=True, exist_ok=True)
+        database = state_io(self.root / "memory.sqlite3")
+        if not preparing and not database.is_file():
             raise ValueError("Missing project memory database; explicit recovery required")
-        self.db = sqlite3.connect(self.root / "memory.sqlite3", timeout=30)
+        self.db = sqlite3.connect(database, timeout=30)
         try:
             self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA foreign_keys=ON")
@@ -235,15 +237,16 @@ class Store:
         return result
 
     def transition(self, task_id, status, detail=""):
-        with self.db:
+        from .state import transaction
+        with transaction(self.db):
             self.db.execute("UPDATE tasks SET status=?,updated=? WHERE id=?", (status, now(), task_id))
             self.db.execute("INSERT INTO transitions(task_id,status,detail,created) VALUES(?,?,?,?)", (task_id, status, detail, now()))
 
     def backup(self):
         folder = self.root / "backups"
-        folder.mkdir(exist_ok=True)
+        state_io(folder).mkdir(exist_ok=True)
         target = folder / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".sqlite3")
-        out = sqlite3.connect(target)
+        out = sqlite3.connect(state_io(target))
         try:
             self.db.backup(out)
         finally:

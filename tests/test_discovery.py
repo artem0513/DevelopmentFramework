@@ -111,6 +111,32 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.discover(["app/package.json"], dependencies=[{"path": "private"}])
 
+    def test_shared_metadata_inherits_later_required_origin(self):
+        from ase.source_coverage import dependency_policy
+        self.write("guide.md", "Guide")
+        self.write("shared/first.txt", "Optional background")
+        self.write("shared/second.txt", "Required publication input")
+        self.write("shared/AGENTS.md", "Instructions for both inputs")
+        optional = {"path": "shared/first.txt", "reason": "Optional background", "required": False}
+        required = {"path": "shared/second.txt", "reason": "Required input", "blocking_stage_ids": ["publish"]}
+        for declarations in ([optional, required], [required, optional]):
+            with self.subTest(order=[item["path"] for item in declarations]):
+                result = self.discover(["guide.md"], dependencies=declarations)
+                governing = [item for item in result["dependencies"] if item["path"] == "shared/AGENTS.md"]
+                self.assertEqual(dependency_policy(governing), {"required": True, "blocking_stage_ids": ["publish"]})
+
+    def test_shared_metadata_unions_independent_required_stage_origins(self):
+        from ase.source_coverage import dependency_policy
+        self.write("guide.md", "Guide")
+        self.write("shared/first.txt", "Draft input")
+        self.write("shared/second.txt", "Publication input")
+        self.write("shared/AGENTS.md", "Instructions for both stages")
+        result = self.discover(["guide.md"], dependencies=[
+            {"path": "shared/first.txt", "reason": "Draft input", "blocking_stage_ids": ["draft"]},
+            {"path": "shared/second.txt", "reason": "Publication input", "blocking_stage_ids": ["publish"]}])
+        governing = [item for item in result["dependencies"] if item["path"] == "shared/AGENTS.md"]
+        self.assertEqual(dependency_policy(governing), {"required": True, "blocking_stage_ids": ["draft", "publish"]})
+
     def test_project_test_conventions_override_heuristics(self):
         self.write("pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = ["specs"]\naddopts = "-q"\n')
         self.write("tests/test_legacy.py", "raise RuntimeError('must not import')")

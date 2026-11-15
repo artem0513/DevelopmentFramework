@@ -6,9 +6,10 @@ from ..protocol import canonical, normalized, packet_prompt
 class ClaudeAdapter:
     name = "claude"
 
-    def probe(self, config):
+    def probe(self, config, *, deadline=None, cancel_requested=None):
         # --safe-mode preserves normal auth; --bare would require API credentials.
-        return probe_cli(self.name, config, ["--safe-mode", "--tools", "--strict-mcp-config", "--json-schema", "--output-format"])
+        return probe_cli(self.name, config, ["--safe-mode", "--tools", "--strict-mcp-config", "--json-schema", "--output-format"],
+                         deadline=deadline, cancel_requested=cancel_requested)
 
     def build_invocation(self, request, capabilities):
         return invocation(capabilities, ["--safe-mode", "--tools", "", "--strict-mcp-config", "--mcp-config",

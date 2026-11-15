@@ -206,5 +206,129 @@ class UniversalCLITests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["kind"], "document")
 
 
+class ScopedStageCLITests(unittest.TestCase):
+    """Real public execution keeps scoped blockers out of independent stages."""
+    setUp = UniversalCLITests.setUp
+    payload = UniversalCLITests.payload
+    cli = UniversalCLITests.cli
+    def _parallel_task(self, *, stages=None, gap_stages=('publish',), discovery=True):
+        from ase.discovery import discover_capabilities, record_discovery
+        from ase.state import transaction, write_record
+        from test_runner import FIXTURE
+        value = contract('parallel')
+        value['stages'] += [
+            {'id':'publish','acceptance_ids':[], 'depends_on':[],
+             'scope':{'resources':['guide.txt'],'effects':[]}},
+            {'id':'follow-up','acceptance_ids':[], 'depends_on':['publish'],
+             'scope':{'resources':['guide.txt'],'effects':[]}}]
+        task = self.cli('task','create','--file',self.payload(value))
+        task = self.cli('task','propose','parallel','--expected-revision',str(task['revision']),
+            '--file',self.payload({'summary':'Prepare independent draft while destination is investigated',
+                                  'stage_ids':['draft','publish','follow-up']}))
+        if stages != []:
+            self.cli('task','approve','parallel','--file',self.payload({'proposal_hash':task['proposal_hash'],
+                'user_message_ref':'test:original-clear-assignment','approved_stage_ids':stages or ['draft','publish','follow-up']}))
+        role_payload = """payload = {'verdict':'PASS'}
+request = json.loads(input_text.split('REQUEST_JSON:\\n',1)[1])
+role = request['role']
+if role == 'implementation':
+ assert request['handoff']['stage']['id'] == 'draft', 'Blocked stage launched implementation'
+ original = next(item for item in request['source_packet']['files'] if item['path'] == 'guide.txt')
+ payload = {'edits':[{'path':'guide.txt','operation':'write','before_sha256':original['sha256'],
+                     'content':'Prepared healthy approved draft\\n'}], 'summary':'Scoped draft proposal'}
+elif role == 'ac':
+ task = json.loads(next(item['content'] for item in request['source_packet']['files'] if item['path']=='_ase_context/contract.json'))
+ payload = {'criteria':[{'id':ac['id'],'expected':ac['expected'],'status':'UNVERIFIED','evidence':[],
+            'method':'Protocol-only fixture','limitations':['No semantic review'],
+            'missing_coverage':['Independent semantic judgment unavailable']} for ac in task['acceptance']]}
+elif role == 'review': payload = {'findings':[],'summary':'Protocol-only transport; no semantic approval'}
+"""
+        backend = self.base/'roles.py'
+        backend.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}",role_payload),encoding='utf-8')
+        trusted = self.home/'runner'
+        trusted.mkdir(exist_ok=True)
+        with closing(Store(self.root,self.home)) as store:
+            with transaction(store.db) as db:
+                write_record(db,'backend_config','codex',{'executable':sys.executable,
+                    'executable_args':[str(backend),'success','codex'],'protocol_only':True},expected_revision=0)
+            if discovery:
+                observed = discover_capabilities(store.project,scope={'resources':['guide.txt']},backend_config={})
+                if gap_stages:
+                    observed['intake'] = {'source_refs':[{'id':'task','kind':'user_message',
+                        'reference':'chat:scoped-gap','observed_at':'2026-11-15T18:00:00Z'}],
+                        'outcomes':[{'id':'guide','text':'Prepare independent draft','source_refs':['task']}],
+                        'gaps':[{'id':'destination','text':'Publication destination unavailable','required':True,
+                            'source_refs':['task'],'blocking_stage_ids':list(gap_stages)}]}
+                record_discovery(store,'parallel',observed,expected_revision=0)
+        return trusted/'invocations.jsonl'
+
+    def _assert_ready_stage_runs(self, action, *, stages=None, stopped=False):
+        self._parallel_task(stages=stages)
+        if stopped:
+            self.cli('task','stop','parallel','--reason','Temporary user pause')
+        result = self.cli('task',action,'parallel',ok=3)
+        self.assertEqual((self.root/'guide.txt').read_bytes(),b'Prepared healthy approved draft\n',result)
+        self.assertEqual(result['status'],'BLOCKED')  # protocol roles never approve
+        self.assertIn('draft',result['stage_results'])
+        self.assertIn('publish',result['stage_blockers'])
+        self.assertIn('follow-up',result['stage_blockers'])
+
+    def test_run_executes_ready_approved_stage_after_scoped_gap(self):
+        self._assert_ready_stage_runs('run')
+
+    def test_resume_executes_ready_stage_and_clears_only_own_stop(self):
+        self._assert_ready_stage_runs('resume',stopped=True)
+
+    def test_partial_approval_still_runs_only_ready_approved_stage(self):
+        self._assert_ready_stage_runs('run',stages=['draft'])
+
+    def test_all_blocked_stages_never_probe_backend(self):
+        log = self._parallel_task(gap_stages=('draft','publish'))
+        self.cli('task','run','parallel',ok=3)
+        self.cli('task','resume','parallel',ok=3)
+        self.assertFalse(log.exists())
+        self.assertEqual((self.root/'guide.txt').read_bytes(),b'Operating guide')
+
+    def test_unapproved_or_undiscovered_work_never_probes_backend(self):
+        for unapproved in (True,False):
+            with self.subTest(unapproved=unapproved):
+                # Each condition has its own durable task/project fixture.
+                fixture = UniversalCLITests()
+                fixture.setUp()
+                try:
+                    helper = ScopedStageCLITests()
+                    helper.__dict__.update(fixture.__dict__)
+                    log = helper._parallel_task(stages=[] if unapproved else None,discovery=False)
+                    helper.cli('task','run','parallel',ok=3)
+                    self.assertFalse(log.exists())
+                    self.assertEqual((helper.root/'guide.txt').read_bytes(),b'Operating guide')
+                finally:
+                    fixture.doCleanups()
+
+    def test_stop_and_cancel_guards_survive_partial_readiness(self):
+        log = self._parallel_task()
+        self.cli('task','stop','parallel','--reason','User requested pause')
+        self.cli('task','run','parallel',ok=3)
+        self.assertFalse(log.exists())
+        with closing(Store(self.root,self.home)) as store:
+            tasks = TaskService(store)
+            task = tasks.snapshot('parallel')
+            tasks.transition('parallel','CANCELLED',expected_revision=task['revision'],reason='User cancelled')
+        self.cli('task','resume','parallel',ok=3)
+        self.assertFalse(log.exists())
+
+    def test_child_resume_cannot_clear_ancestor_stop(self):
+        log = self._parallel_task()
+        with closing(Store(self.root,self.home)) as store:
+            from ase.discovery import discover_capabilities, record_discovery
+            child = dict(contract('child'),parent_task_id='parallel',parent_stage_id='draft')
+            TaskService(store).create(child)
+            record_discovery(store,'child',discover_capabilities(store.project,
+                scope={'resources':['guide.txt']},backend_config={}),expected_revision=0)
+        self.cli('task','stop','parallel','--reason','Stop entire root')
+        self.cli('task','resume','child',ok=3)
+        self.assertFalse(log.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

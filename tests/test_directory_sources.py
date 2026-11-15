@@ -1,5 +1,6 @@
 """Directory source selection uses real Git/files; no semantic model doubles."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -109,6 +110,155 @@ class DirectorySourceTests(unittest.TestCase):
         snapshot = source_snapshot(self.store, c, task_id="directory-task")
         self.assertEqual(snapshot["files"]["policy.txt"], hashlib.sha256(policy.read_bytes()).hexdigest())
         self.assertIn("policy.txt", controller._packet("directory-task")["coverage"]["included"])
+
+    def test_explicit_required_ignored_directory_is_hashed_and_reviewed(self):
+        self.write(".gitignore", "policies/\ncache/\n")
+        policy = self.write("policies/nested/policy.md", "Mandatory current policy")
+        self.write("cache/secret.txt", "Unrelated ignored secret")
+        c, controller = self.task(software=True, resources=["."], dependencies=[
+            {"path": "policies", "reason": "Contains required governing policy"}])
+        before = source_snapshot(self.store, c, task_id="directory-task")
+        packet = controller._packet("directory-task")
+        self.assertEqual(before["files"].get("policies/nested/policy.md"), hashlib.sha256(policy.read_bytes()).hexdigest())
+        self.assertIn("policies/nested/policy.md", packet["coverage"]["included"])
+        self.assertNotIn("cache/secret.txt", before["files"])
+        self.assertNotIn("cache/secret.txt", packet["coverage"]["included"])
+        policy.write_text("Materially revised policy", encoding="utf-8")
+        self.assertNotEqual(before["fingerprint"], source_snapshot(self.store, c, task_id="directory-task")["fingerprint"])
+
+    def test_required_manifest_ignored_directory_supplies_bodies_and_current_fingerprint(self):
+        self.write(".gitignore", "vendor/\ncache/\n")
+        self.write("package.json", '{"dependencies":{"local-policy":"file:vendor/local"}}')
+        policy = self.write("vendor/local/policy.py", "ALLOWED = True")
+        self.write("cache/secret.txt", "Unrelated ignored secret")
+        c, controller = self.task(software=True, resources=["guide.md", "package.json"])
+        before = source_snapshot(self.store, c, task_id="directory-task")
+        packet = controller._packet("directory-task")
+        source = next((item for item in packet["files"] if item["path"] == "vendor/local/policy.py"), None)
+        self.assertIsNotNone(source, "Required local package body was silently omitted")
+        self.assertEqual(source["content"], "ALLOWED = True")
+        self.assertEqual(before["files"].get("vendor/local/policy.py"), hashlib.sha256(policy.read_bytes()).hexdigest())
+        self.assertEqual(packet["coverage"]["missing"], [])
+        self.assertNotIn("cache/secret.txt", before["files"])
+        self.assertNotIn("cache/secret.txt", packet["coverage"]["included"])
+        policy.write_text("ALLOWED = False", encoding="utf-8")
+        after = source_snapshot(self.store, c, task_id="directory-task")
+        self.assertNotEqual(before["fingerprint"], after["fingerprint"])
+        current = next(item for item in controller._packet("directory-task")["files"] if item["path"] == "vendor/local/policy.py")
+        self.assertEqual(current["content"], "ALLOWED = False")
+
+    def test_optional_manifest_ignored_directory_does_not_expand_source_bodies(self):
+        self.write(".gitignore", "vendor/\n")
+        self.write("optional/package.json", '{"dependencies":{"local-policy":"file:../vendor/local"}}')
+        self.write("vendor/local/secret.txt", "Optional ignored material")
+        c, controller = self.task(software=True, dependencies=[
+            {"path": "optional/package.json", "reason": "Optional package example", "required": False}])
+        snapshot = source_snapshot(self.store, c, task_id="directory-task")
+        packet = controller._packet("directory-task")
+        self.assertNotIn("vendor/local/secret.txt", snapshot["files"])
+        self.assertNotIn("vendor/local/secret.txt", packet["coverage"]["included"])
+        self.assertEqual(packet["coverage"]["missing"], [])
+
+    def test_manifest_root_reference_preserves_ignored_secret_isolation(self):
+        self.write(".gitignore", "cache/\n")
+        self.write("package.json", '{"dependencies":{"workspace":"file:."}}')
+        self.write("cache/secret.txt", "Unrelated ignored secret")
+        c, controller = self.task(software=True, resources=["guide.md", "package.json"])
+        snapshot = source_snapshot(self.store, c, task_id="directory-task")
+        packet = controller._packet("directory-task")
+        self.assertNotIn("cache/secret.txt", snapshot["files"])
+        self.assertNotIn("cache/secret.txt", packet["coverage"]["included"])
+        self.assertEqual(packet["coverage"]["missing"], [])
+
+    def test_required_manifest_directory_unions_stage_impact_from_distinct_origins(self):
+        self.write(".gitignore", "vendor/\n")
+        for origin in ("draft", "publish"):
+            self.write(origin + "/package.json", '{"dependencies":{"local-policy":"file:../vendor/local"}}')
+        self.write("vendor/local/policy.md", "Policy for both stages")
+        c, controller = self.task(software=True, dependencies=[
+            {"path": "draft/package.json", "reason": "Draft package", "blocking_stage_ids": ["draft"]},
+            {"path": "publish/package.json", "reason": "Publication package", "blocking_stage_ids": ["publish"]}])
+        for stage in ("draft", "publish"):
+            with self.subTest(stage=stage):
+                packet = controller._packet("directory-task", stage_id=stage)
+                self.assertIn("vendor/local/policy.md", packet["coverage"]["included"])
+                self.assertEqual(packet["coverage"]["missing"], [])
+                availability = next(item for item in packet["files"] if item["path"] == "_ase_context/source_availability.json")
+                policy = next(item for item in json.loads(availability["content"]) if item["path"] == "vendor/local")
+                self.assertTrue(policy["required"])
+                self.assertEqual(set(policy["blocking_stage_ids"]), {"draft", "publish"})
+
+    def test_required_manifest_ignored_directory_rejects_hardlinked_body(self):
+        self.write(".gitignore", "vendor/\n")
+        self.write("package.json", '{"dependencies":{"local-policy":"file:vendor/local"}}')
+        origin = self.base / "outside-policy.txt"
+        origin.write_text("Outside linked policy", encoding="utf-8")
+        linked = self.repo / "vendor/local/policy.txt"
+        linked.parent.mkdir(parents=True)
+        os.link(origin, linked)
+        c, controller = self.task(software=True, resources=["guide.md", "package.json"])
+        with self.assertRaisesRegex(ValueError, "Hardlinked"):
+            source_snapshot(self.store, c, task_id="directory-task")
+
+    def test_required_manifest_ignored_directory_oversized_body_is_an_explicit_gap(self):
+        self.write(".gitignore", "vendor/\n")
+        self.write("package.json", '{"dependencies":{"local-policy":"file:vendor/local"}}')
+        policy = self.write("vendor/local/policy.txt", "x" * 512001)
+        c, controller = self.task(software=True, resources=["guide.md", "package.json"])
+        snapshot = source_snapshot(self.store, c, task_id="directory-task")
+        packet = controller._packet("directory-task")
+        self.assertEqual(snapshot["files"].get("vendor/local/policy.txt"), hashlib.sha256(policy.read_bytes()).hexdigest())
+        self.assertTrue(any("vendor/local/policy.txt" in gap and "bound" in gap for gap in packet["coverage"]["missing"]))
+
+    def test_optional_ignored_directory_does_not_expand_workspace_reads(self):
+        self.write(".gitignore", "policies/\n")
+        self.write("policies/secret.txt", "Optional ignored material")
+        c, controller = self.task(software=True, resources=["."], dependencies=[
+            {"path": "policies", "reason": "Optional background", "required": False}])
+        self.assertNotIn("policies/secret.txt", source_snapshot(self.store, c, task_id="directory-task")["files"])
+        self.assertNotIn("policies/secret.txt", controller._packet("directory-task")["coverage"]["included"])
+
+    def test_required_ignored_directory_read_failure_is_explicit(self):
+        self.write(".gitignore", "policies/\n")
+        policy = self.write("policies/policy.md", "Required ignored policy")
+        c, controller = self.task(software=True, dependencies=[{"path": "policies", "reason": "Required governing input"}])
+        original = Path.open
+        def denied(path, *args, **kwargs):
+            if path == policy:
+                raise PermissionError(13, "fixture source denied", str(path))
+            return original(path, *args, **kwargs)
+        before = source_snapshot(self.store, c, task_id="directory-task")
+        with patch.object(Path, "open", denied):
+            observed = source_snapshot(self.store, c, task_id="directory-task")
+            self.assertIn("policies", observed["unavailable"])
+            self.assertNotEqual(before["fingerprint"], observed["fingerprint"])
+            self.assertTrue(any("policies" in gap for gap in controller._packet("directory-task")["coverage"]["missing"]))
+
+    def test_required_ignored_directory_still_enforces_inventory_bound(self):
+        self.write(".gitignore", "policies/\n")
+        for index in range(1001):
+            self.write("policies/policy-" + str(index) + ".txt", "Required policy")
+        c, controller = self.task(software=True, dependencies=[{"path": "policies", "reason": "Required governing inputs"}])
+        with self.assertRaisesRegex(ValueError, "inventory exceeds limit"):
+            source_snapshot(self.store, c, task_id="directory-task")
+
+    def test_required_ignored_directory_rejects_redirected_descendants(self):
+        self.write(".gitignore", "policies/\n")
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "canary.txt").write_text("Outside source", encoding="utf-8")
+        alias = self.repo / "policies" / "redirect"
+        alias.parent.mkdir()
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(outside)], capture_output=True)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            self.addCleanup(alias.rmdir)
+        else:
+            alias.symlink_to(outside, target_is_directory=True)
+            self.addCleanup(alias.unlink)
+        c, controller = self.task(software=True, dependencies=[{"path": "policies", "reason": "Required governing inputs"}])
+        with self.assertRaisesRegex(ValueError, "escapes|redirect|link"):
+            source_snapshot(self.store, c, task_id="directory-task")
 
     def test_redirected_dependency_directory_never_reads_external_file(self):
         outside = self.base / "external"

@@ -6,8 +6,9 @@ from ..protocol import canonical, decode_json, normalized, packet_prompt
 class CodexAdapter:
     name = "codex"
 
-    def probe(self, config):
-        caps = probe_cli(self.name, config, ["--ignore-user-config", "--ephemeral", "--sandbox", "--output-schema", "--output-last-message", "--json"])
+    def probe(self, config, *, deadline=None, cancel_requested=None):
+        caps = probe_cli(self.name, config, ["--ignore-user-config", "--ephemeral", "--sandbox", "--output-schema", "--output-last-message", "--json"],
+                         deadline=deadline, cancel_requested=cancel_requested)
         caps["os_sandbox"] = "read-only"
         return caps
 
@@ -20,6 +21,10 @@ class CodexAdapter:
         return call
 
     def parse_result(self, raw_events, final_payload):
+        if any(not isinstance(e, dict) or not isinstance(e.get("type"), str) or not e["type"] or
+               (e["type"].startswith("item.") and (not isinstance(e.get("item"), dict) or
+                not isinstance(e["item"].get("type"), str))) for e in raw_events):
+            return normalized(blocker="SESSION_PROTOCOL_INVALID")
         if not raw_events or raw_events[-1].get("type") != "turn.completed":
             return normalized(blocker="TERMINAL_RESULT_MISSING")
         starts = [e for e in raw_events if e.get("type") == "thread.started"]

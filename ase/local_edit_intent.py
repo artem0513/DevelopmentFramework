@@ -1,4 +1,5 @@
 """Durable admission of one exact local candidate, not a new execution grant."""
+from contextlib import contextmanager
 import json
 import hashlib
 import re
@@ -121,31 +122,74 @@ def prepare_local_edits(controller, task, stage, progress, receipt, authority, p
     return progress
 
 
-def finish_local_edits(controller, task, stage, progress, prerequisite_binding, resolve_target, apply_function, schema, *, require_applied=False):
-    """Complete that committed intent; never reserve or regenerate a candidate."""
+def _validated_intent(controller, task, stage, progress, resolve_target, schema, *, require_applied=False):
+    """Authenticate persisted identity, receipt, exact plan and staging state."""
     store = controller.store
     key = progress.get('local_edit_application_id')
     if not isinstance(key, str) or not re.fullmatch('[0-9a-f]{32}', key):
         raise ValueError('Local edit application ID is invalid')
+    record = read_record(store.db, KIND, key)
+    value = record['payload']
+    if (not isinstance(value, dict) or value.get('state') not in {'PREPARED', 'APPLIED'}
+            or type(value.get('version')) is not int or value['version'] != 1):
+        raise ValueError('Local edit intent is missing or invalid')
+    if require_applied and value['state'] != 'APPLIED':
+        raise ValueError('Only a completed local intent can resume pending stage actions')
+    immutable = {name: item for name, item in value.items() if name not in {'state', 'applied_at', 'intent_sha256'}}
+    if (hash_value(immutable) != value.get('intent_sha256')
+            or key != progress.get('candidate_id') or value['file_plan']['application_id'] != key
+            or value['identity'] != _identity(controller, task, stage, progress, progress.get('candidate_authority'))):
+        raise ValueError('Local edit intent identity or captured proof differs')
+    receipt = _read_receipt(controller, task, value['receipt_ref'])
+    if hash_value(receipt) != value['receipt_sha256']:
+        raise ValueError('Local edit receipt identity differs')
+    edits = _capture(controller, task, stage, progress, receipt, schema)
+    inspect_plan(store.repo, stage['scope'], edits, value['file_plan'], resolve_target)
+    return record, value, edits
+
+
+@contextmanager
+def recovery_inventory(controller, task, stage, progress, resolve_target, schema):
+    """Authenticate an APPLYING intent before excluding its owned crash staging.
+
+    All participating task observations use the same inventory. Each sample
+    revalidates the intent, staging and current authority; final mutation also
+    retains its normal prerequisite binding and unrelated-source guards.
+    """
+    def authenticate():
+        with transaction(controller.store.db):
+            saved = read_record(controller.store.db, 'cycle', task['task_id'] + ':' + stage['id'])['payload']
+            if saved != progress:
+                raise ValueError('Saved local edit progress changed before recovery inventory')
+            _, value, _ = _validated_intent(controller, task, stage, progress, resolve_target, schema)
+            if controller._stage_authority(task, stage) != value['identity']['authority']:
+                raise ValueError('Candidate authority changed before local file mutation')
+            controller._available(task['task_id'], 1)
+            return {item['temporary_path'] for item in value['file_plan']['edits'] if item['temporary_path']}
+
+    if progress.get('phase') != 'APPLYING':
+        raise ValueError('Recovery inventory requires a saved APPLYING intent')
+    authenticate()
+    # The existing guard excludes only this now-authenticated plan, and still
+    # detects unrelated source/policy changes before any prerequisite refresh.
+    with transaction(controller.store.db):
+        _, value, _ = _validated_intent(controller, task, stage, progress, resolve_target, schema)
+        if _guard(controller, task, value['file_plan']) != value['source_guard']:
+            raise ValueError('Unrelated source or runtime changed during local edit recovery')
+    owners = {task['task_id'], *(owner['task_id'] for owner, _ in controller._prerequisite_stages(task, stage))}
+    from .gates import _source_inventory
+    with _source_inventory(controller.store, owners, authenticate):
+        yield
+
+
+def finish_local_edits(controller, task, stage, progress, prerequisite_binding, resolve_target, apply_function, schema, *, require_applied=False):
+    """Complete that committed intent; never reserve or regenerate a candidate."""
+    store = controller.store
+    key = progress.get('local_edit_application_id')
     with transaction(store.db):
-        record = read_record(store.db, KIND, key)
-        value = record['payload']
-        if (not isinstance(value, dict) or value.get('state') not in {'PREPARED', 'APPLIED'}
-                or type(value.get('version')) is not int or value['version'] != 1):
-            raise ValueError('Local edit intent is missing or invalid')
-        if require_applied and value['state'] != 'APPLIED':
-            raise ValueError('Only a completed local intent can resume pending stage actions')
-        immutable = {name: item for name, item in value.items() if name not in {'state', 'applied_at', 'intent_sha256'}}
-        if (hash_value(immutable) != value.get('intent_sha256')
-                or key != progress.get('candidate_id') or value['file_plan']['application_id'] != key
-                or value['identity'] != _identity(controller, task, stage, progress, progress.get('candidate_authority'))):
-            raise ValueError('Local edit intent identity or captured proof differs')
+        record, value, edits = _validated_intent(controller, task, stage, progress, resolve_target,
+            schema, require_applied=require_applied)
         _authority(controller, task, stage, value['identity']['authority'], prerequisite_binding)
-        receipt = _read_receipt(controller, task, value['receipt_ref'])
-        if hash_value(receipt) != value['receipt_sha256']:
-            raise ValueError('Local edit receipt identity differs')
-        edits = _capture(controller, task, stage, progress, receipt, schema)
-        inspect_plan(store.repo, stage['scope'], edits, value['file_plan'], resolve_target)
         if _guard(controller, task, value['file_plan']) != value['source_guard']:
             raise ValueError('Unrelated source or runtime changed during local edit recovery')
         if value['state'] != 'APPLIED':

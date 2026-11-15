@@ -10,7 +10,7 @@ import unittest
 from ase.state import read_record, hash_value, transaction, write_record
 from ase.store import Store
 from ase.tasks import TaskService
-from ase.workflow import WorkflowController, DIAGNOSTIC_SCHEMA
+from ase.workflow import WorkflowController, DIAGNOSTIC_SCHEMA, AC_SCHEMA
 from ase.adapters import get_adapter
 from ase.runner import Runner
 from ase.discovery import discover_capabilities, record_discovery
@@ -562,12 +562,7 @@ elif 'cause' in schema['properties']:
         observed = []
         def fresh_verification(task_id, stage_id):
             observed.append((task_id, stage_id))
-            task = self.tasks.snapshot(task_id)
-            plan = self.tasks.execution_plan(task_id)
-            checks = read_record(self.store.db, "checks", task_id)["payload"]
-            bindings = {"fingerprint": source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"],
-                "contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"], "plan_sha256": plan["plan_hash"],
-                "check_sha256": hash_value(checks), "workspace_id": self.store.workspace_id}
+            bindings = controller._request(task_id, "ac", AC_SCHEMA, {"stage_id": stage_id})["bindings"]
             controller._save("verification", task_id + ":ac", {"role": "ac", "artifact_root": str(self.store.root / "semantic-proof-double"),
                 "execution_id": "fresh-ac-execution", "bindings": bindings})
             return {"status": "REJECTED", "blocked_reasons": [], "rejected_reasons": ["P2: A separate review obligation remains"]}
@@ -1002,6 +997,234 @@ elif 'cause' in schema['properties']:
         self.assertTrue(any("cycle budget exhausted" in reason.lower() for reason in result["stage_blockers"].get("independent", [])))
         self.assertEqual(self.implementation_stages(), original_candidates)
         self.assertEqual(read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"], 2)
+
+
+class RecoveryBoundRepairTests(unittest.TestCase):
+    """Real durable budgets and captured receipts; semantic labels are a test double."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="rb-")
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.repo = self.base / "r"
+        self.repo.mkdir()
+        self.store = Store(self.repo, self.base / "s")
+        self.addCleanup(self.store.close)
+        self.tasks = TaskService(self.store)
+        self.controller = WorkflowController(self.store)
+
+    def create(self, task_id, *, parent=None, **policy):
+        spec = contract(task_id)
+        spec.update(unknowns=[], stages=spec["stages"][:1], execution_policy={"recovery_mode": "progress", **policy})
+        if parent:
+            spec.update(parent_task_id=parent, parent_stage_id="draft")
+            return self.tasks.create(spec)
+        task = self.tasks.create(spec)
+        task = self.tasks.propose(task_id, {"summary": "Approved disposable repair fixture", "stage_ids": ["draft"]}, expected_revision=task["revision"])
+        return self.tasks.approve(task_id, proposal_hash=task["proposal_hash"], approved_stage_ids=["draft"], user_message_ref="test:repair-bounds")
+
+    def test_child_stage_and_task_limits_do_not_expand_root_or_tighten_siblings(self):
+        self.create("r", max_stage_cycles=10, max_task_cycles=12)
+        self.create("c", parent="r", max_stage_cycles=1, max_task_cycles=1)
+        self.create("sibling", parent="r", max_stage_cycles=3, max_task_cycles=3)
+        self.controller.reserve_cycle("c", "draft")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("c", "draft")
+        self.controller.reserve_cycle("sibling", "draft")
+        self.controller.reserve_cycle("sibling", "draft")
+        self.assertEqual(read_record(self.store.db, "budget", "r")["payload"]["task_cycles"], 3)
+
+    def test_new_child_allowance_excludes_earlier_parent_cycles(self):
+        self.create("r", max_stage_cycles=10, max_task_cycles=12)
+        for _ in range(4):
+            self.controller.reserve_cycle("r", "draft")
+        self.create("c", parent="r", max_stage_cycles=1)
+        self.controller.reserve_cycle("c", "draft")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("c", "draft")
+
+    def test_descendants_share_parent_task_limit_and_keep_root_spending(self):
+        self.create("r", max_stage_cycles=10, max_task_cycles=12)
+        self.create("c", parent="r", max_task_cycles=2)
+        self.create("g1", parent="c", max_task_cycles=5)
+        self.create("g2", parent="c", max_task_cycles=5)
+        self.controller.reserve_cycle("g1", "draft")
+        self.controller.reserve_cycle("g2", "draft")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            WorkflowController(self.store).reserve_cycle("g2", "draft")
+        self.assertEqual(read_record(self.store.db, "budget", "r")["payload"]["task_cycles"], 2)
+
+    def test_child_stage_rename_and_policy_expansion_cannot_reset_cap(self):
+        self.create("r", max_stage_cycles=10)
+        task = self.create("c", parent="r", max_stage_cycles=1)
+        self.controller.reserve_cycle("c", "draft")
+        revised = copy.deepcopy(task["contract"])
+        revised["stages"][0]["id"] = "renamed"
+        revised["execution_policy"]["max_stage_cycles"] = 5
+        task = self.tasks.revise("c", revised, expected_revision=self.tasks.snapshot("c")["revision"])
+        task = self.tasks.propose("c", {"summary": "Same original child obligation", "stage_ids": ["renamed"]}, expected_revision=task["revision"])
+        self.tasks.approve("c", proposal_hash=task["proposal_hash"], approved_stage_ids=["renamed"], user_message_ref="test:child-rename")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            WorkflowController(self.store).reserve_cycle("c", "renamed")
+
+    def test_child_diagnostic_limit_survives_fresh_progress(self):
+        self.create("r", recovery_mode="fixed", max_stage_cycles=10, max_task_cycles=12, max_diagnostic_passes=5)
+        self.create("c", parent="r", max_diagnostic_passes=1)
+        self.controller.reserve_diagnostic("c", "draft")
+        (self.repo / "guide.md").write_text("Fresh original artifact")
+        self.controller.check("c", "draft")
+        self.controller.record_failure("c", "draft", ["Mandatory AC failed: AC1"])
+        with self.assertRaisesRegex(ValueError, "diagnostic budget"):
+            self.controller.reserve_diagnostic("c", "draft")
+
+    def test_descendant_cycles_consume_explicit_ancestor_stage_bound(self):
+        self.create("r", max_stage_cycles=10)
+        self.create("c", parent="r", max_stage_cycles=2)
+        self.create("g1", parent="c", max_stage_cycles=5)
+        self.create("g2", parent="c", max_stage_cycles=5)
+        self.controller.reserve_cycle("g1", "draft")
+        self.controller.reserve_cycle("g2", "draft")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("g1", "draft")
+
+    def test_legacy_child_stage_spend_survives_rename_before_bounds_upgrade(self):
+        self.create("r", max_stage_cycles=10)
+        task = self.create("c", parent="r", max_stage_cycles=1)
+        write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"c:draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
+        revised = copy.deepcopy(task["contract"])
+        revised["stages"][0]["id"] = "renamed"
+        task = self.tasks.revise("c", revised, expected_revision=task["revision"])
+        task = self.tasks.propose("c", {"summary": "Same original child obligation", "stage_ids": ["renamed"]}, expected_revision=task["revision"])
+        self.tasks.approve("c", proposal_hash=task["proposal_hash"], approved_stage_ids=["renamed"], user_message_ref="test:legacy-child-rename")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("c", "renamed")
+
+    def test_unowned_legacy_cycle_counter_does_not_reset_existing_child_cap(self):
+        self.create("r", max_stage_cycles=10)
+        self.create("c", parent="r", max_stage_cycles=1)
+        write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("c", "draft")
+
+    def test_new_child_does_not_own_older_unowned_legacy_cycles(self):
+        self.create("r", max_stage_cycles=10)
+        write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
+        self.create("c", parent="r", max_stage_cycles=1)
+        self.controller.reserve_cycle("c", "draft")
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("c", "draft")
+
+    def test_child_time_counts_descendants_but_not_known_parent_or_sibling_spend(self):
+        self.create("r")
+        self.controller.charge_time("r", 9)
+        self.create("c", parent="r", active_time_budget_seconds=2)
+        self.create("g", parent="c")
+        self.create("sibling", parent="r")
+        self.controller.charge_time("sibling", 5)
+        self.assertEqual(self.controller._available("g", 30), 2)
+        self.controller.charge_time("g", 1.25)
+        self.assertEqual(self.controller._available("c", 30), .75)
+        self.controller.charge_time("c", .75)
+        with self.assertRaisesRegex(ValueError, "time budget"):
+            WorkflowController(self.store)._available("g", 30)
+        self.assertEqual(self.controller._available("sibling", 30), 30)
+        self.assertEqual(read_record(self.store.db, "budget", "r")["payload"]["active_seconds"], 16)
+
+    def test_legacy_unattributed_time_cannot_reset_existing_child_allowance(self):
+        self.create("r")
+        self.create("c", parent="r", active_time_budget_seconds=2)
+        write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
+        with self.assertRaisesRegex(ValueError, "time budget"):
+            self.controller._available("c", 30)
+
+    def test_child_created_after_legacy_timing_has_fresh_local_allowance(self):
+        self.create("r")
+        write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
+        self.create("c", parent="r", active_time_budget_seconds=2)
+        self.assertEqual(self.controller._available("c", 30), 2)
+
+    def test_interrupted_call_time_belongs_to_saved_child_not_resuming_sibling(self):
+        from datetime import datetime, timedelta, timezone
+        self.create("r")
+        self.create("c", parent="r", active_time_budget_seconds=2)
+        self.create("sibling", parent="r", active_time_budget_seconds=2)
+        write_record(self.store.db, "active_call", "r", {"task_id": "c", "started": (datetime.now(timezone.utc) - timedelta(seconds=.5)).isoformat(), "timeout": 1}, expected_revision=0)
+        with patch.object(self.controller, "_run", return_value={"status": "BLOCKED", "blocked_reasons": ["fixture"]}):
+            self.controller.run("sibling", resume=True)
+        budget = read_record(self.store.db, "budget", "r")["payload"]
+        self.assertGreater(budget["active_by_task"]["c"], .4)
+        self.assertNotIn("sibling", budget["active_by_task"])
+        self.assertEqual(self.controller._available("sibling", 30), 2)
+
+    def test_interrupted_legacy_call_without_owner_retains_unattributed_time(self):
+        from datetime import datetime, timedelta, timezone
+        self.create("r")
+        self.create("c", parent="r", active_time_budget_seconds=1)
+        write_record(self.store.db, "active_call", "r", {"started": (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(), "timeout": 3}, expected_revision=0)
+        with patch.object(self.controller, "_run", return_value={"status": "BLOCKED", "blocked_reasons": ["fixture"]}):
+            self.controller.run("r", resume=True)
+        with self.assertRaisesRegex(ValueError, "time budget"):
+            self.controller._available("c", 30)
+
+    def receipts(self, coverage="draft", *, arbitrary=False):
+        """Actual requests/receipts; no model judgment or semantic acceptance."""
+        from ase.runner import verify_receipt
+        from ase.workflow import AC_SCHEMA, REVIEW_SCHEMA
+        task = self.create("r")
+        if coverage == "other":
+            revised = copy.deepcopy(task["contract"])
+            revised["stages"].append({"id": "other", "acceptance_ids": [], "depends_on": []})
+            task = self.tasks.revise("r", revised, expected_revision=task["revision"])
+            task = self.tasks.propose("r", {"summary": "Two separately approved stages", "stage_ids": ["draft", "other"]}, expected_revision=task["revision"])
+            task = self.tasks.approve("r", proposal_hash=task["proposal_hash"], approved_stage_ids=["draft", "other"], user_message_ref="test:coverage-stages")
+        (self.repo / "guide.md").write_text("Original artifact")
+        self.controller.check("r", "draft")
+        fixture = self.base / "provider.py"
+        trusted = self.base / "trusted"
+        trusted.mkdir()
+        expected = task["contract"]["acceptance"][0]["expected"]
+        payloads = [("ac", AC_SCHEMA, {"criteria": [{"id": "AC1", "expected": expected, "status": "PASS", "evidence": ["fixture"], "method": "protocol boundary double", "limitations": [], "missing_coverage": []}]}),
+                    ("review", REVIEW_SCHEMA, {"findings": [], "summary": "Protocol boundary double"})]
+        for role, schema, payload in payloads:
+            fixture.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}", "payload = " + repr(payload)))
+            request = self.controller._request("r", role, schema, {} if coverage is None else {"stage_id": coverage})
+            if arbitrary:
+                request["bindings"]["verification_context_sha256"] = "f" * 64
+            runner = Runner({"executable": sys.executable, "executable_args": [str(fixture), "success", "codex"], "trusted_cwd": str(trusted), "protocol_only": True}, self.store.root / "tasks/r/sessions")
+            receipt = runner.run(get_adapter("codex"), request, timeout=3)["receipt"]
+            verify_receipt(receipt, expected_bindings=request["bindings"])
+            self.controller._save("verification", "r:" + role, receipt)
+        def semantic_boundary(receipt, *, expected_bindings):
+            # Preserve real captured-byte and EXACT binding validation. Only
+            # semantic provenance is a double, never a claim of independent AC.
+            verified = verify_receipt(receipt, expected_bindings=expected_bindings)
+            return {**verified, "evidence_kind": "independent_cli"}
+        return semantic_boundary
+
+    def test_current_captured_stage_receipts_credit_original_semantic_progress(self):
+        boundary = self.receipts()
+        with patch("ase.workflow.verify_receipt", side_effect=boundary):
+            result = self.controller.record_failure("r", "draft", ["P2: separate issue"])
+        self.assertIn("ac:AC1", result["newly_verified"])
+        self.assertIn("review:draft", result["newly_verified"])
+
+    def test_current_captured_whole_task_receipts_credit_stage_progress(self):
+        boundary = self.receipts(coverage=None)
+        with patch("ase.workflow.verify_receipt", side_effect=boundary):
+            result = self.controller.record_failure("r", "draft", ["P2: separate issue"])
+        self.assertIn("ac:AC1", result["newly_verified"])
+        self.assertIn("review:draft", result["newly_verified"])
+
+    def test_arbitrary_captured_context_never_credits_semantic_progress(self):
+        boundary = self.receipts(arbitrary=True)
+        with patch("ase.workflow.verify_receipt", side_effect=boundary):
+            result = self.controller.record_failure("r", "draft", ["P2: separate issue"])
+        self.assertFalse(any(token.startswith(("ac:", "review:")) for token in result["newly_verified"]))
+
+    def test_other_stage_captured_context_never_credits_this_stage_progress(self):
+        boundary = self.receipts(coverage="other")
+        with patch("ase.workflow.verify_receipt", side_effect=boundary):
+            result = self.controller.record_failure("r", "draft", ["P2: separate issue"])
+        self.assertFalse(any(token.startswith(("ac:", "review:")) for token in result["newly_verified"]))
 
 
 if __name__ == "__main__":

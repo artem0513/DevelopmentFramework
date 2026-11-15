@@ -311,11 +311,22 @@ def _task_command(store, action, args):
         approved = task.get("approved_stage_ids", []) or ([task["contract"]["stages"][0]["id"]] if task["contract"].get("parent_task_id") else [])
         if not approved:
             raise ValueError("Current stage requires explicit approval of a reviewed v2 proposal")
+        blockers = []
         for stage_id in approved:
-            # Explicit resume may inspect the current task's paused authority
-            # before the controller clears its own stop. Ancestor stops and all
-            # cancellation/approval checks remain active.
-            tasks.require_approval(args.task_id, stage_id, allow_stopped=action == "resume")
+            # Validate one runnable stage before probing any backend. The
+            # scheduler retains scoped blockers and continues independent work.
+            # Resume may clear only this task's own stop; ancestor stops and
+            # cancellation/approval checks remain active in require_approval.
+            try:
+                tasks.require_approval(args.task_id, stage_id, allow_stopped=action == "resume")
+            except ValueError as error:
+                blockers.append(str(error))
+            else:
+                if action != "verify":
+                    break
+        else:
+            if blockers:
+                raise ValueError("; ".join(dict.fromkeys(blockers)))
         if action == "verify":
             return controller.verify(args.task_id)
         return controller.run(args.task_id, resume=action == "resume")

@@ -1,6 +1,6 @@
 """Supervised packet implementation, actual checks and bounded repair cycles."""
 from datetime import datetime
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -13,7 +13,7 @@ import uuid
 import weakref
 
 from .adapters import get_adapter
-from .gates import GateService, source_resources, source_snapshot, stage_checks
+from .gates import GateService, source_resources, source_snapshot, stage_checks, verification_context_hash, verification_context_hashes
 from .profiles import validate_access, validate_evidence_spec, has_software, evaluate_contract_profiles
 from .runner import Runner, verify_receipt
 from .state import append_event, encode, hash_value, read_record, text, transaction, write_record
@@ -21,7 +21,7 @@ from .store import now
 from .projects import _safe_state
 from .native_paths import logical_path, state_io
 from .tasks import TaskService
-from .recovery import initial_history, bind_stage, canonical_failures, progress_tokens, group_tokens, original_case_progress
+from .recovery import initial_history, bind_stage, canonical_failures, progress_tokens, group_tokens, original_case_progress, task_bound_contexts, initialize_timing, task_active_seconds
 
 
 def _object(properties):
@@ -142,6 +142,8 @@ class WorkflowController:
             record = read_record(db, "budget", root_id)
             value = record["payload"] or {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}}
             recovery_record, history, groups = self._recovery_context(db, task_id, stage_id)
+            initialize_timing(value, record["updated"])
+            owners = task_bound_contexts(self.store, history, self._ancestry(task_id), value, stage_id, updated=record["updated"])
             limits = history["hard_limits"]
             if limits.get("active_time_budget_seconds") is not None and value.get("active_seconds", 0) >= limits["active_time_budget_seconds"]:
                 raise ValueError("Active time budget exhausted")
@@ -150,6 +152,14 @@ class WorkflowController:
             if ((limits.get("max_stage_cycles") is not None and count >= limits["max_stage_cycles"])
                     or (limits.get("max_task_cycles") is not None and value["task_cycles"] >= limits["max_task_cycles"])):
                 raise ValueError("Implementation cycle budget exhausted")
+            for owner, bounds, local_groups in owners:
+                local = bounds["hard_limits"]
+                if local.get("active_time_budget_seconds") is not None and task_active_seconds(self.store, owner, value) >= local["active_time_budget_seconds"]:
+                    raise ValueError("Active time budget exhausted: " + owner["task_id"])
+                count_local = max(bounds["groups"][name]["cycles"] for name in local_groups)
+                if ((local.get("max_stage_cycles") is not None and count_local >= local["max_stage_cycles"])
+                        or (local.get("max_task_cycles") is not None and bounds["task_cycles"] >= local["max_task_cycles"])):
+                    raise ValueError("Implementation cycle budget exhausted: " + owner["task_id"])
             if policy.get("recovery_mode", "fixed") == "progress" and any(history["groups"][name]["stopped"] for name in groups):
                 raise ValueError("Corrective probe made no verified progress; automatic mutation is stopped")
             if any(history["groups"][name].get("probe_inflight") for name in groups):
@@ -164,6 +174,11 @@ class WorkflowController:
                 raise ValueError("Stagnation requires reassessment and diagnosis before another candidate")
             value["task_cycles"] += 1
             value["stages"][key] = count + 1
+            for owner, bounds, local_groups in owners:
+                count_local = max(bounds["groups"][name]["cycles"] for name in local_groups)
+                bounds["task_cycles"] += 1
+                for name in local_groups:
+                    bounds["groups"][name]["cycles"] = count_local + 1
             candidate_id = uuid.uuid4().hex
             corrective = any(history["groups"][name]["probe_pending"] for name in groups)
             for name in groups:
@@ -179,7 +194,7 @@ class WorkflowController:
             write_record(db, "budget", root_id, value, expected_revision=record["revision"])
         return {"task_cycles": value["task_cycles"], "stage_cycles": count + 1, "candidate_id": candidate_id, "corrective_probe": corrective}
 
-    def _recovery_context(self, db, task_id, stage_id):
+    def _recovery_context(self, db, task_id, stage_id=None):
         root_id = self._root_task(task_id)
         record = read_record(db, "recovery", root_id)
         original = read_record(db, "task_version", root_id + ":1")["payload"]
@@ -199,7 +214,7 @@ class WorkflowController:
             inherited = bind(parent, contract["parent_stage_id"]) if parent else None
             return bind_stage(history, current_id, contract, current_stage, root_id=root_id, parent_groups=inherited)
 
-        groups = bind(task_id, stage_id)
+        groups = bind(task_id, stage_id) if stage_id is not None else []
         if record["payload"] is None:
             # Old v2 coordinators stored raw stage names and reason hashes only.
             # Import conservatively once; missing old progress proof earns no reset.
@@ -208,13 +223,14 @@ class WorkflowController:
                 for old_key, count in budget.get(field, {}).items():
                     parts = old_key.split(":")
                     if len(parts) < 2:
-                        continue
-                    try:
-                        if self._root_task(parts[0]) != root_id:
-                            continue
-                        inherited = bind(parts[0], parts[1])
-                    except (ValueError, KeyError):
                         inherited = list(history["groups"])
+                    else:
+                        try:
+                            if self._root_task(parts[0]) != root_id:
+                                continue
+                            inherited = bind(parts[0], parts[1])
+                        except (ValueError, KeyError):
+                            inherited = list(history["groups"])
                     for name in inherited:
                         imported[name][target] += count
             for name, counters in imported.items():
@@ -225,28 +241,46 @@ class WorkflowController:
                 group["stagnation"] = max(group["stagnation"], counters["failures"])
         return record, history, groups
 
-    def charge_time(self, task_id, seconds):
+    def charge_time(self, task_id, seconds, *, attributed=True):
         if seconds < 0:
             raise ValueError("Elapsed time cannot be negative")
         root_id = self._root_task(task_id)
         with transaction(self.store.db) as db:
             record = read_record(db, "budget", root_id)
             value = record["payload"] or {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}}
+            initialize_timing(value, record["updated"])
             value["active_seconds"] = value.get("active_seconds", 0) + seconds
+            if attributed:
+                value["active_by_task"][task_id] = value["active_by_task"].get(task_id, 0) + seconds
+            else:
+                value["unattributed_active_seconds"] += seconds
+                value["unattributed_before"] = now()
             write_record(db, "budget", root_id, value, expected_revision=record["revision"])
 
     def _available(self, task_id, timeout):
-        root = self.tasks.snapshot(self._root_task(task_id))
+        root_id = self._root_task(task_id)
         if self._stop_requested(task_id):
             raise ValueError("Task or ancestor is paused or cancelled")
-        limit = root["contract"]["execution_policy"]["active_time_budget_seconds"]
-        saved_limit = ((read_record(self.store.db, "recovery", root["task_id"])["payload"] or {}).get("hard_limits", {}).get("active_time_budget_seconds"))
-        if saved_limit is not None:
-            limit = min(limit, saved_limit) if limit is not None else saved_limit
-        used = (read_record(self.store.db, "budget", root["task_id"])["payload"] or {}).get("active_seconds", 0)
-        if limit is not None and used >= limit:
-            raise ValueError("Active time budget exhausted")
-        return min(timeout, limit - used) if limit is not None else timeout
+        with transaction(self.store.db) as db:
+            record = read_record(db, "budget", root_id)
+            value = record["payload"] or {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}}
+            initialize_timing(value, record["updated"])
+            recovery_record, history, _ = self._recovery_context(db, task_id)
+            owners = task_bound_contexts(self.store, history, self._ancestry(task_id), value, updated=record["updated"])
+            remaining = timeout
+            budgets = [(history["hard_limits"], value.get("active_seconds", 0))]
+            budgets.extend((bounds["hard_limits"], task_active_seconds(self.store, owner, value)) for owner, bounds, _ in owners)
+            for limits, used in budgets:
+                limit = limits.get("active_time_budget_seconds")
+                if limit is not None:
+                    if used >= limit:
+                        raise ValueError("Active time budget exhausted")
+                    remaining = min(remaining, limit - used)
+            if value != record["payload"]:
+                write_record(db, "budget", root_id, value, expected_revision=record["revision"])
+            if history != recovery_record["payload"]:
+                write_record(db, "recovery", root_id, history, expected_revision=recovery_record["revision"])
+        return remaining
 
     def _stop_requested(self, task_id):
         return any(task["state"] == "CANCELLED" or read_record(self.store.db, "stop", task["task_id"])["payload"]
@@ -326,7 +360,10 @@ class WorkflowController:
                 # Check the verified inputs after authentication, immediately
                 # before process creation. Own effects may legitimately change
                 # them afterward, so cancellation keeps checking authority only.
-                self._require_prerequisite_binding(task_id, stage_id, prerequisite_binding)
+                # Read-only checks/observers remain available for reconciliation;
+                # mutating recipes require their binding before reaching here.
+                if prerequisite_binding is not None:
+                    self._require_prerequisite_binding(task_id, stage_id, prerequisite_binding)
                 yield
 
         return cancelled, launch_guard
@@ -367,9 +404,9 @@ class WorkflowController:
         from .execution.actions import ActionService
         return ActionService(self).access_client()
 
-    def _execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None):
+    def _execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None, launch_witness=None):
         from .execution.actions import ActionService
-        return ActionService(self).execute_command(task_id, spec, argv, log, timeout, stage_id, allow_terminal=allow_terminal, prerequisite_binding=prerequisite_binding, authority_binding=authority_binding)
+        return ActionService(self).execute_command(task_id, spec, argv, log, timeout, stage_id, allow_terminal=allow_terminal, prerequisite_binding=prerequisite_binding, authority_binding=authority_binding, launch_witness=launch_witness)
 
     def _declared_access(self, task_id, stage_id, access):
         from .execution.actions import ActionService
@@ -451,6 +488,7 @@ class WorkflowController:
         bindings = {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"],
             "proposal_sha256": task["proposal_hash"], "plan_sha256": plan["plan_hash"],
             "check_sha256": hash_value(bundle), "workspace_id": self.store.workspace_id}
+        contexts = verification_context_hashes(self.store, contract, task_id, stage_id)
         roles, execution_ids, session_ids = {}, set(), set()
         implementation = read_record(self.store.db, "implementation", task_id)["payload"] or {}
         for role in ("ac", "review"):
@@ -458,7 +496,10 @@ class WorkflowController:
             try:
                 if not Path(receipt["artifact_root"]).resolve().is_relative_to(self.store.root.resolve()):
                     continue
-                verified = verify_receipt(receipt, expected_bindings=bindings)
+                context = receipt.get("bindings", {}).get("verification_context_sha256")
+                if context not in contexts:
+                    continue
+                verified = verify_receipt(receipt, expected_bindings={**bindings, "verification_context_sha256": context})
                 execution_id, session_id = verified["execution_id"], verified["result"].get("session_id")
                 if (verified["evidence_kind"] != "independent_cli" or verified["result"].get("status") != "COMPLETE"
                         or execution_id in execution_ids or execution_id == implementation.get("execution_id")
@@ -495,9 +536,14 @@ class WorkflowController:
             policy = self.tasks.snapshot(root_id)["contract"]["execution_policy"]
             recovery_record, history, groups = self._recovery_context(db, task_id, stage_id)
             count = max([value["diagnostics"].get(key, 0)] + [history["groups"][name]["diagnostics"] for name in groups])
+            owners = task_bound_contexts(self.store, history, self._ancestry(task_id), value, stage_id, updated=record["updated"])
             limit = history["hard_limits"].get("max_diagnostic_passes")
             if limit is not None and count >= limit:
                 raise ValueError("diagnostic budget exhausted")
+            for owner, bounds, local_groups in owners:
+                local_limit = bounds["hard_limits"].get("max_diagnostic_passes")
+                if local_limit is not None and max(bounds["groups"][name]["diagnostics"] for name in local_groups) >= local_limit:
+                    raise ValueError("diagnostic budget exhausted: " + owner["task_id"])
             if any(history["groups"][name].get("diagnostic_inflight") for name in groups):
                 raise ValueError("Unresolved diagnostic reservation requires fresh original progress")
             reservation = {"id": uuid.uuid4().hex, "task_id": task_id, "stage_id": stage_id,
@@ -513,6 +559,10 @@ class WorkflowController:
                 history["groups"][name].update(diagnostics=count + 1, diagnostic_inflight=reservation,
                                                probe_pending=False, probe_authorization=None)
             value["diagnostics"][key] = count + 1
+            for owner, bounds, local_groups in owners:
+                local_count = max(bounds["groups"][name]["diagnostics"] for name in local_groups)
+                for name in local_groups:
+                    bounds["groups"][name]["diagnostics"] = local_count + 1
             write_record(db, "recovery", root_id, history, expected_revision=recovery_record["revision"])
             write_record(db, "budget", root_id, value, expected_revision=record["revision"])
         return value["diagnostics"][key]
@@ -751,7 +801,11 @@ class WorkflowController:
                     _safe_state(root)
                     if not root.resolve().is_relative_to(self.store.root.resolve()):
                         raise ValueError("historical receipt escapes project state")
-                    verified = verify_receipt(receipt, expected_bindings=bindings if role != "implementation" else None,
+                    historical_bindings = dict(bindings)
+                    if "verification_context_sha256" in receipt["bindings"]:
+                        # Archived context is provenance, not current authority.
+                        historical_bindings["verification_context_sha256"] = receipt["bindings"]["verification_context_sha256"]
+                    verified = verify_receipt(receipt, expected_bindings=historical_bindings if role != "implementation" else None,
                         require_current_policy=False)
                     if any(receipt["bindings"].get(key) != bindings[key] for key in ("contract_sha256", "proposal_sha256", "workspace_id", "plan_sha256")):
                         raise ValueError("historical receipt identity differs")
@@ -821,10 +875,14 @@ class WorkflowController:
             if len(reservations) != 1:
                 raise ValueError("Diagnostic request requires one current reservation and stage")
             handoff["diagnostic_reservation"] = self._diagnostic_context(next(iter(reservations.values())))
+        stage_id = handoff.get("stage_id") or handoff.get("stage", {}).get("id")
+        bindings = {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"],
+            "proposal_sha256": task["proposal_hash"] or "unapproved", "plan_sha256": plan["plan_hash"],
+            "check_sha256": hash_value(check) if check else "missing", "workspace_id": self.store.workspace_id}
+        if role in {"ac", "review"}:
+            bindings["verification_context_sha256"] = verification_context_hash(self.store, task["contract"], task_id, stage_id)
         return {"role": role, "project": {"root": str(self.store.repo), "project_id": self.store.project_id}, "schema": schema,
-                "bindings": {"fingerprint": source["fingerprint"], "contract_sha256": task["contract_hash"], "proposal_sha256": task["proposal_hash"] or "unapproved",
-                             "plan_sha256": plan["plan_hash"], "check_sha256": hash_value(check) if check else "missing", "workspace_id": self.store.workspace_id},
-                "source_packet": self._packet(task_id, stage_id=handoff.get("stage_id") or handoff.get("stage", {}).get("id")), "handoff": handoff}
+                "bindings": bindings, "source_packet": self._packet(task_id, stage_id=stage_id), "handoff": handoff}
 
     def _runner(self, task_id):
         if self.runner is not None:
@@ -881,7 +939,10 @@ class WorkflowController:
                         # completion time; retain conservative bounded charging.
                         pass
                 with transaction(self.store.db) as db:
-                    self.charge_time(task_id, min(elapsed, active["payload"]["timeout"]))
+                    owner = active["payload"].get("task_id")
+                    if owner is not None and self._root_task(owner) != root_id:
+                        raise ValueError("Interrupted call owner differs from its root")
+                    self.charge_time(owner or root_id, min(elapsed, active["payload"]["timeout"]), attributed=owner is not None)
                     write_record(db, "active_call", root_id, None, expected_revision=active["revision"])
             journal = Journal(self.store)
             old_workflow = read_record(self.store.db, "active_workflow", root_id)
@@ -937,68 +998,136 @@ class WorkflowController:
         self._save("active_workflow", root_id, None)
         return {**verdict, "session_id": session_id, "closure": closure}
 
-    def _revalidate_prerequisites(self, task, stage):
-        """Historical completion cannot authorize a new dependent effect.
+    def _prerequisite_stages(self, task, stage):
+        """Dependencies of this stage and every inherited parent-stage mapping.
 
-        Reassess the complete dependency chain against current checks and fresh
-        independent judgment. Never reserve/replay prerequisite implementation
-        or actions. Keeping the historical marker allows a later explicit resume
-        to reassess repaired artifacts without repeating completed mutations.
-        Return blockers and the common source binding from successful checks
-        and judgments, never a newly sampled baseline after verification.
+        The mapped parent stage itself may be implemented by this child; only
+        its prerequisite closure is inherited. Keep each owner identity so its
+        independent evidence and source boundaries are checked in that task.
         """
-        by_id = {item["id"]: item for item in task["contract"]["stages"]}
+        lineage, seen = [(task, stage)], {task["task_id"]}
+        while task["contract"].get("parent_task_id"):
+            parent_id = task["contract"]["parent_task_id"]
+            if parent_id in seen:
+                raise ValueError("Parent task cycle")
+            seen.add(parent_id)
+            parent = self.tasks.snapshot(parent_id)
+            mapped = next((item for item in parent["contract"]["stages"]
+                if item["id"] == task["contract"].get("parent_stage_id")), None)
+            if mapped is None:
+                raise ValueError("Inherited parent stage is unavailable")
+            lineage.append((parent, mapped))
+            task = parent
         ordered, selected = [], set()
-        def include(stage_id):
-            if stage_id in selected:
-                return
-            selected.add(stage_id)
-            for dependency in by_id[stage_id]["depends_on"]:
+        for owner, mapped in reversed(lineage):
+            by_id = {item["id"]: item for item in owner["contract"]["stages"]}
+            def include(stage_id):
+                key = (owner["task_id"], stage_id)
+                if key in selected:
+                    return
+                selected.add(key)
+                for dependency in by_id[stage_id]["depends_on"]:
+                    include(dependency)
+                ordered.append((owner, stage_id))
+            for dependency in mapped["depends_on"]:
                 include(dependency)
-            ordered.append(stage_id)
-        for stage_id in stage["depends_on"]:
-            include(stage_id)
-        binding = None
-        for stage_id in ordered:
+        return ordered
+
+    def _prerequisite_current_inputs(self, owner, stage_id):
+        """Read exact prerequisite inputs and scoped closure under one writer."""
+        from .delegations import DelegationRegistry
+        with transaction(self.store.db):
+            owner = self.tasks.require_approval(owner["task_id"], stage_id)
+            record = read_record(self.store.db, "stage", owner["task_id"] + ":" + stage_id)
+            proof = record["payload"] or {}
+            if (proof.get("state") != "COMPLETED" or proof.get("contract_hash") != owner["contract_hash"]
+                    or proof.get("proposal_hash") != owner["proposal_hash"]):
+                raise ValueError("Current completed prerequisite stage proof is missing")
+            blockers = DelegationRegistry(self.store).closure_blockers(owner["task_id"], stage_id=stage_id)
+            if blockers:
+                raise ValueError("Prerequisite delegation closure requires reconciliation: " + "; ".join(blockers))
+            return {"task_id": owner["task_id"], "stage_id": stage_id, "workspace_id": self.store.workspace_id,
+                "contract_hash": owner["contract_hash"], "proposal_hash": owner["proposal_hash"],
+                "plan_hash": self.tasks.execution_plan(owner["task_id"])["plan_hash"],
+                "fingerprint": source_snapshot(self.store, owner["contract"], task_id=owner["task_id"])["fingerprint"],
+                "stage_revision": record["revision"], "authority": self._authority_binding(owner["task_id"]),
+                "verification_context_sha256": verification_context_hash(self.store, owner["contract"], owner["task_id"], stage_id)}
+
+    def _revalidate_prerequisites(self, task, stage):
+        """Refresh inherited and local proof without replaying completed work."""
+        ordered = self._prerequisite_stages(task, stage)
+        if not ordered:
+            return [], None
+        source = source_snapshot(self.store, task["contract"], task_id=task["task_id"])
+        binding = {"task_id": task["task_id"], "stage_id": stage["id"], "workspace_id": self.store.workspace_id,
+            "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
+            "plan_hash": self.tasks.execution_plan(task["task_id"])["plan_hash"], "fingerprint": source["fingerprint"],
+            "prerequisites": []}
+        observed_sources = {}
+        for owner, stage_id in ordered:
+            label = stage_id if owner["task_id"] == task["task_id"] else owner["task_id"] + ":" + stage_id
             try:
-                proof = read_record(self.store.db, "stage", task["task_id"] + ":" + stage_id)["payload"] or {}
-                if (proof.get("state") != "COMPLETED" or proof.get("contract_hash") != task["contract_hash"]
-                        or proof.get("proposal_hash") != task["proposal_hash"]):
+                record = read_record(self.store.db, "stage", owner["task_id"] + ":" + stage_id)
+                proof = record["payload"] or {}
+                if (proof.get("state") != "COMPLETED" or proof.get("contract_hash") != owner["contract_hash"]
+                        or proof.get("proposal_hash") != owner["proposal_hash"]):
                     raise ValueError("Current completed stage proof is missing")
-                self.tasks.require_approval(task["task_id"], stage_id)
-                checks = self.check(task["task_id"], stage_id)
-                specs = stage_checks(task["contract"], self.tasks.execution_plan(task["task_id"])["checks"], stage_id)
-                profile = evaluate_contract_profiles(task["contract"], specs, checks["results"], stage_id=stage_id)
-                verdict = (self.verify(task["task_id"], stage_id) if profile["status"] == "PASS"
-                           else GateService(self.store).gate(task["task_id"], stage_id=stage_id))
+                self.tasks.require_approval(owner["task_id"], stage_id)
+                authority = self._authority_binding(owner["task_id"])
+                checks = self.check(owner["task_id"], stage_id)
+                specs = stage_checks(owner["contract"], self.tasks.execution_plan(owner["task_id"])["checks"], stage_id)
+                profile = evaluate_contract_profiles(owner["contract"], specs, checks["results"], stage_id=stage_id)
+                verdict = (self.verify(owner["task_id"], stage_id) if profile["status"] == "PASS"
+                           else GateService(self.store).gate(owner["task_id"], stage_id=stage_id))
                 if verdict["status"] != "APPROVED":
                     reasons = list(dict.fromkeys(verdict.get("blocked_reasons", []) + verdict.get("rejected_reasons", [])))
-                    return (["Prerequisite " + stage_id + " requires current verification: " + reason
+                    return (["Prerequisite " + label + " requires current verification: " + reason
                              for reason in (reasons or ["Current independent approval is unavailable"])], None)
-                observed = {"task_id": task["task_id"], "stage_id": stage["id"], "workspace_id": checks["workspace_id"],
-                    "contract_hash": checks["contract_hash"], "proposal_hash": task["proposal_hash"],
-                    "plan_hash": checks["plan_hash"], "fingerprint": checks["fingerprint"]}
-                if checks.get("source_changed_during_checks") or verdict.get("fingerprint") != observed["fingerprint"]:
-                    raise ValueError("Prerequisite source changed during current verification")
-                if binding is not None and binding != observed:
+                observed = {"task_id": owner["task_id"], "stage_id": stage_id, "workspace_id": checks["workspace_id"],
+                    "contract_hash": checks["contract_hash"], "proposal_hash": owner["proposal_hash"],
+                    "plan_hash": checks["plan_hash"], "fingerprint": checks["fingerprint"],
+                    "stage_revision": record["revision"], "authority": authority,
+                    "verification_context_sha256": verdict.get("verification_context_sha256")}
+                if (checks.get("source_changed_during_checks") or verdict.get("fingerprint") != observed["fingerprint"]
+                        or observed["verification_context_sha256"] != verification_context_hash(
+                            self.store, owner["contract"], owner["task_id"], stage_id)):
+                    raise ValueError("Prerequisite source or action proof changed during current verification")
+                # Native work may have appeared after the verifier's gate.
+                # Retain its stage-local closure guard through final mutation.
+                if self._prerequisite_current_inputs(owner, stage_id) != observed:
+                    raise ValueError("Prerequisite evidence changed during current verification")
+                previous = observed_sources.setdefault(owner["task_id"], observed["fingerprint"])
+                if previous != observed["fingerprint"] or (owner["task_id"] == task["task_id"]
+                        and binding["fingerprint"] != observed["fingerprint"]):
                     raise ValueError("Prerequisite source changed between dependency observations")
-                binding = observed
+                binding["prerequisites"].append(observed)
             except (ValueError, OSError, KeyError, TypeError) as ex:
                 from .core import redact
-                return (["Prerequisite " + stage_id + " requires current verification: " + redact(ex)], None)
+                return (["Prerequisite " + label + " requires current verification: " + redact(ex)], None)
         return [], binding
 
     def _require_prerequisite_binding(self, task_id, stage_id, binding):
-        """Compare verified local inputs only at the final mutation boundary."""
-        if binding is None:
-            return
+        """Compare the exact verified inputs inside the final mutation writer."""
         task = self.tasks.snapshot(task_id)
+        stage = next(item for item in task["contract"]["stages"] if item["id"] == stage_id)
+        prerequisites = self._prerequisite_stages(task, stage)
+        if binding is None:
+            if prerequisites:
+                raise ValueError("Prerequisite evidence binding is required before mutation")
+            return
         current = {"task_id": task_id, "stage_id": stage_id, "workspace_id": self.store.workspace_id,
             "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
             "plan_hash": self.tasks.execution_plan(task_id)["plan_hash"],
             "fingerprint": source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"]}
-        if binding != current:
+        captured = binding.get("prerequisites", [])
+        if (not isinstance(captured, list) or current != {key: value for key, value in binding.items() if key != "prerequisites"}
+                or [(item["task_id"], stage) for item, stage in prerequisites]
+                != [(item.get("task_id"), item.get("stage_id")) for item in captured]):
             raise ValueError("Prerequisite evidence changed before dependent mutation; reassess current prerequisites")
+        for (owner, dependency), expected in zip(prerequisites, captured):
+            observed = self._prerequisite_current_inputs(owner, dependency)
+            if observed != expected:
+                raise ValueError("Prerequisite evidence changed before dependent mutation; reassess current prerequisites")
 
     def _run(self, task_id, *, resume=False):
         task = self.tasks.snapshot(task_id)
@@ -1015,7 +1144,8 @@ class WorkflowController:
             return {"status": "BLOCKED", "blocked_reasons": ["Scoped environment and capability discovery is required before implementation"]}
         runner = self._runner(task_id)
         adapter = get_adapter(task["contract"]["execution_policy"]["backend"])
-        caps = adapter.probe(runner.config)
+        caps = self._call(task_id, lambda timeout: adapter.probe(runner.config,
+            deadline=time.monotonic() + timeout, cancel_requested=lambda: self._stop_requested(task_id)))
         if not caps.get("available"):
             return {"status": "BLOCKED", "blocked_reasons": [caps.get("blocker", "INDEPENDENT_SESSION_UNAVAILABLE")]}
         if not read_record(self.store.db, "baseline", task_id)["payload"]:
@@ -1110,59 +1240,64 @@ class WorkflowController:
         """Settle one stage; the scheduler retains its blockers and runs independent work."""
         task_id, stage_id = task["task_id"], stage["id"]
         while True:
-            # Every corrective iteration needs current prerequisite proof before
-            # reserving another candidate, including explicit resumes.
-            prerequisite_blockers, prerequisite_binding = self._revalidate_prerequisites(task, stage)
-            if prerequisite_blockers:
-                return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
             progress_key = task_id + ":" + stage_id
             progress = read_record(self.store.db, "cycle", progress_key)["payload"] or {}
-            diagnostic_blocker = self._diagnostic_stop_reason(progress)
-            resume_verdict = None
-            recovered_application = False
-            if progress.get('phase') == 'CAPTURE_BLOCKED' and not resume:
-                return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
-            if resume and progress.get('phase') in {'IMPLEMENTING', 'CAPTURE_BLOCKED'} and progress.get('implementation_capture'):
-                try:
-                    from .candidate_capture import completed
-                    reference = progress['implementation_capture']
-                    if (not isinstance(reference, dict) or
-                            (reference.get('task_id'), reference.get('stage_id'), reference.get('candidate_id')) != (task_id, stage_id, progress.get('candidate_id'))):
-                        raise ValueError('Candidate capture reservation differs from the interrupted stage')
-                    candidate = completed(self, reference)
-                    self._save('implementation', task_id, candidate['receipt'])
-                    self._save('stage_implementation', progress_key, candidate['receipt'])
-                    if not read_record(self.store.db, 'baseline_implementation', task_id)['payload']:
-                        self._save('baseline_implementation', task_id, candidate['receipt'])
-                    from .local_edit_intent import prepare_local_edits
-                    progress = prepare_local_edits(self, task, stage, progress, candidate['receipt'],
-                        progress.get('candidate_authority'), prerequisite_binding, _target, EDIT_SCHEMA)
-                except (ValueError, OSError, KeyError, TypeError) as ex:
-                    from .core import redact
-                    progress.update(phase='CAPTURE_BLOCKED',
-                        capture_recovery_blocker='Saved candidate capture requires reconciliation: ' + redact(ex))
-                    self._save('cycle', progress_key, progress)
+            from .local_edit_intent import recovery_inventory
+            inventory = (recovery_inventory(self, task, stage, progress, _target, EDIT_SCHEMA)
+                if resume and progress.get('phase') == 'APPLYING' and progress.get('local_edit_application_id')
+                else nullcontext())
+            with inventory:
+                # Every corrective iteration needs current prerequisite proof before
+                # reserving another candidate, including explicit resumes.
+                prerequisite_blockers, prerequisite_binding = self._revalidate_prerequisites(task, stage)
+                if prerequisite_blockers:
+                    return {"status": "BLOCKED", "blocked_reasons": prerequisite_blockers}
+                diagnostic_blocker = self._diagnostic_stop_reason(progress)
+                resume_verdict = None
+                recovered_application = False
+                if progress.get('phase') == 'CAPTURE_BLOCKED' and not resume:
                     return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
-            elif progress.get('phase') == 'CAPTURE_BLOCKED':
-                return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
-            if resume and progress.get("local_edit_application_id") and progress.get("phase") == "APPLYING":
-                from .local_edit_intent import finish_local_edits
-                progress = finish_local_edits(self, task, stage, progress, prerequisite_binding, _target, apply_edits, EDIT_SCHEMA)
-                recovered_application = True
-            elif resume and progress.get("local_edit_application_id") and progress.get("phase") == "CHECKING":
-                from .local_edit_intent import finish_local_edits
-                try:
-                    progress = finish_local_edits(self, task, stage, progress, prerequisite_binding,
-                        _target, apply_edits, EDIT_SCHEMA, require_applied=True)
+                if resume and progress.get('phase') in {'IMPLEMENTING', 'CAPTURE_BLOCKED'} and progress.get('implementation_capture'):
+                    try:
+                        from .candidate_capture import completed
+                        reference = progress['implementation_capture']
+                        if (not isinstance(reference, dict) or
+                                (reference.get('task_id'), reference.get('stage_id'), reference.get('candidate_id')) != (task_id, stage_id, progress.get('candidate_id'))):
+                            raise ValueError('Candidate capture reservation differs from the interrupted stage')
+                        candidate = completed(self, reference)
+                        self._save('implementation', task_id, candidate['receipt'])
+                        self._save('stage_implementation', progress_key, candidate['receipt'])
+                        if not read_record(self.store.db, 'baseline_implementation', task_id)['payload']:
+                            self._save('baseline_implementation', task_id, candidate['receipt'])
+                        from .local_edit_intent import prepare_local_edits
+                        progress = prepare_local_edits(self, task, stage, progress, candidate['receipt'],
+                            progress.get('candidate_authority'), prerequisite_binding, _target, EDIT_SCHEMA)
+                    except (ValueError, OSError, KeyError, TypeError) as ex:
+                        from .core import redact
+                        progress.update(phase='CAPTURE_BLOCKED',
+                            capture_recovery_blocker='Saved candidate capture requires reconciliation: ' + redact(ex))
+                        self._save('cycle', progress_key, progress)
+                        return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
+                elif progress.get('phase') == 'CAPTURE_BLOCKED':
+                    return {'status': 'BLOCKED', 'blocked_reasons': [progress['capture_recovery_blocker']]}
+                if resume and progress.get("local_edit_application_id") and progress.get("phase") == "APPLYING":
+                    from .local_edit_intent import finish_local_edits
+                    progress = finish_local_edits(self, task, stage, progress, prerequisite_binding, _target, apply_edits, EDIT_SCHEMA)
                     recovered_application = True
-                except (ValueError, OSError, KeyError, TypeError) as ex:
-                    # An earlier action may legitimately have changed source.
-                    # Keep the conservative observation-only recovery route;
-                    # a completed local intent never authorizes file replay.
-                    from .core import redact
-                    progress.update(phase="VERIFYING", read_only_recovery=True,
-                        local_edit_continuation_blocker="Saved local edit continuation requires reconciliation: " + redact(ex))
-                    self._save("cycle", progress_key, progress)
+                elif resume and progress.get("local_edit_application_id") and progress.get("phase") == "CHECKING":
+                    from .local_edit_intent import finish_local_edits
+                    try:
+                        progress = finish_local_edits(self, task, stage, progress, prerequisite_binding,
+                            _target, apply_edits, EDIT_SCHEMA, require_applied=True)
+                        recovered_application = True
+                    except (ValueError, OSError, KeyError, TypeError) as ex:
+                        # An earlier action may legitimately have changed source.
+                        # Keep the conservative observation-only recovery route;
+                        # a completed local intent never authorizes file replay.
+                        from .core import redact
+                        progress.update(phase="VERIFYING", read_only_recovery=True,
+                            local_edit_continuation_blocker="Saved local edit continuation requires reconciliation: " + redact(ex))
+                        self._save("cycle", progress_key, progress)
             if resume:
                 _, recovery, recovery_groups = self._recovery_context(self.store.db, task_id, stage_id)
                 stopped = any(recovery["groups"][name]["stopped"] or recovery["groups"][name].get("diagnostic_inflight")

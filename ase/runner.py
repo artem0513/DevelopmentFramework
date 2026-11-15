@@ -87,7 +87,7 @@ class _WindowsJob:
             self.handle = None
 
 
-def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, extra_output_paths=(), cancel_requested=None, env=None, launch_guard=None):
+def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, extra_output_paths=(), cancel_requested=None, env=None, launch_guard=None, deadline=None):
     """Run shell=False with an owned input channel; never inherit chat stdin."""
     if type(timeout) not in (int, float) or timeout <= 0 or type(max_output_bytes) is not int or max_output_bytes < 1024:
         raise ValueError("Positive timeout and output cap required")
@@ -95,6 +95,12 @@ def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, e
     began = time.monotonic()
     process, job, writer = None, None, None
     code, error, timed_out, limited, cancelled = None, None, False, False, False
+    if deadline is not None: timeout = min(timeout, deadline - began)
+    cancelled = cancel_requested is not None and cancel_requested()
+    if cancelled or timeout <= 0:
+        return {"pid": None, "started_at_utc": started, "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+                "duration_seconds": time.monotonic() - began, "exit_code": None, "error": None,
+                "timed_out": not cancelled, "output_limited": False, "cancelled": cancelled, "stdout": b"", "stderr": b""}
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
             with launch_guard() if launch_guard is not None else nullcontext():
@@ -210,6 +216,9 @@ class Runner:
         if not self.artifact_root.is_absolute(): raise ValueError("Absolute artifact root required")
 
     def run(self, adapter, request, *, timeout=300, cancel_requested=None, execution_id=None):
+        if type(timeout) not in (int, float) or timeout <= 0:
+            raise ValueError("Positive timeout required")
+        deadline = time.monotonic() + timeout
         if execution_id is not None and (not isinstance(execution_id, str) or not re.fullmatch('[0-9a-f]{32}', execution_id)):
             raise ValueError('Invalid host execution ID')
         allowed = {"role", "project", "bindings", "schema", "source_packet", "handoff"}
@@ -249,7 +258,7 @@ class Runner:
         root.mkdir(mode=0o700)
         artifacts = {"request": _write(root / "request.json", request_data),
                      "schema": _write(root / "schema.json", canonical(request["schema"]))}
-        caps = adapter.probe(self.config)
+        caps = adapter.probe(self.config, deadline=deadline, cancel_requested=cancel_requested)
         caps["artifact_paths"] = {"schema": str(root / "schema.json"), "final": str(root / "final.json")}
         receipt = {"receipt_version": 2, "execution_id": execution_id, "backend": adapter.name, "role": request["role"],
                    "bindings": bindings, "request_sha256": sha256(request_data), "artifact_root": str(root),
@@ -258,7 +267,8 @@ class Runner:
                    "version": caps["version"], "capabilities": caps, "artifacts": artifacts}
         if not caps.get("available"):
             result = normalized(blocker=caps.get("blocker") or "BACKEND_UNAVAILABLE")
-            receipt.update(pid=None, exit_code=None, status="BLOCKED", error=result["blocker"], timed_out=False, output_limited=False, cancelled=False,
+            receipt.update(pid=None, exit_code=None, status="BLOCKED", error=result["blocker"],
+                           timed_out=caps.get("timed_out", False), output_limited=caps.get("output_limited", False), cancelled=caps.get("cancelled", False),
                            terminal=None, session_id=None, argv=[], cwd=str(cwd), permission_description={}, duration_seconds=0)
         else:
             call = adapter.build_invocation(request, caps)
@@ -272,7 +282,7 @@ class Runner:
             artifacts["stdin"] = _write(root / "stdin.bin", input_bytes or b"")
             cap = self.config.get("max_output_bytes", 1048576)
             process = capture_process(call["argv"], cwd, timeout=timeout, max_output_bytes=cap, input_bytes=input_bytes,
-                                      extra_output_paths=[root / 'final.json'], cancel_requested=cancel_requested)
+                                      extra_output_paths=[root / 'final.json'], cancel_requested=cancel_requested, deadline=deadline)
             stdout, stderr = process.pop("stdout"), process.pop("stderr")
             artifacts.update(stdout=_write(root / "stdout.jsonl", stdout), stderr=_write(root / "stderr.log", stderr))
             final_data = None

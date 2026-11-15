@@ -1,12 +1,53 @@
 """Durable intent before effects; a lost acknowledgement remains unknown."""
+from contextlib import contextmanager
 import hashlib
+import uuid
 import json
 from pathlib import Path
 import posixpath
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 from .state import append_event, encode, hash_value, identifier, read_record, text, transaction, write_record
 from .native_paths import state_io
+from .store import now
+
+
+class _EffectLaunchWitness:
+    """Host-only synchronous scope; never infer nonlaunch after a crash.
+
+    Only the actual effect's final Popen guard receives ``guard``. Authentication
+    and status processes must use the ordinary authority guard instead.
+    """
+    def __init__(self, attempt):
+        self.binding = {key: attempt[key] for key in
+                        ('action_id', 'attempt_number', 'intent_hash', 'host_attempt_id')}
+        self.phase = 'CREATED'
+        self.proof = None
+
+    def __enter__(self):
+        if self.phase != 'CREATED':
+            raise ValueError('Effect launch witness cannot be reused')
+        self.phase = 'PREPARING'
+        return self
+
+    def __exit__(self, *failure):
+        if self.phase == 'PREPARING':
+            self.phase = 'NOT_LAUNCHED'
+            self.proof = dict(self.binding, version=1, kind='HOST_EFFECT_NOT_LAUNCHED', ended_at=now())
+            self.proof['sha256'] = hash_value(self.proof)
+
+    def guard(self, authority_guard):
+        @contextmanager
+        def guarded():
+            with authority_guard():
+                if self.phase != 'PREPARING':
+                    raise ValueError('Effect launch witness is not active')
+                # This is the last host boundary before Popen. A failure/crash
+                # after this assignment is uncertain, even if no receipt returns.
+                self.phase = 'POSSIBLY_LAUNCHED'
+                yield
+        return guarded
 
 
 class OperationLedger:
@@ -78,6 +119,13 @@ class OperationLedger:
 
     @staticmethod
     def _scopes_overlap(previous, current):
+        def unreserved(value):
+            # Broad overlap may normalize safe URI aliases, never application
+            # identity. Reserved escapes and opaque resource IDs retain syntax.
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+            return re.sub(r"%([0-9A-Fa-f]{2})", lambda match:
+                chr(int(match[1], 16)) if chr(int(match[1], 16)) in alphabet else match[0], value)
+
         def resources(scope):
             values = scope["resources"] if scope else []
             if (not values or any(item in {".", "..", "/", "//"} or item.startswith("../")
@@ -95,8 +143,8 @@ class OperationLedger:
                         return None
                     # Broad comparison can hold uncertain work, never prove
                     # identity. Normalize URI path separately from its syntax.
-                    comparable.append(urlunsplit((uri.scheme.casefold(), uri.netloc.casefold(),
-                        posixpath.normpath(uri.path).casefold(), "", "")))
+                    comparable.append(urlunsplit((uri.scheme.casefold(), unreserved(uri.netloc).casefold(),
+                        posixpath.normpath(unreserved(uri.path)).casefold(), "", "")))
                 else:
                     path = item.replace("\\", "/")
                     windows = len(path) > 2 and path[0].isalpha() and path[1:3] == ":/"
@@ -194,7 +242,7 @@ class OperationLedger:
                     or (attempted and not self._confirmed_current_attempt(previous))):
                 raise ValueError("Unresolved or applied operation cannot be replayed: " + previous["state"])
             value = dict(previous, state="UNKNOWN", ever_attempted=True, ever_applied=applied,
-                         attempt_number=previous.get("attempt_number", 0) + 1)
+                         attempt_number=previous.get("attempt_number", 0) + 1, host_attempt_id=uuid.uuid4().hex)
             # A terminal rejection covers the previous attempt, never the next one.
             binding = value.pop("submission_binding", None)
             value.pop("execution_receipt", None)
@@ -203,6 +251,51 @@ class OperationLedger:
                     [*value.get("consumed_provider_attempt_ids", []), binding["provider_attempt_id"]]))
             self._clear_nonapplication(value)
             write_record(db, "operation", action_id, value, expected_revision=record["revision"])
+        return value
+
+    def start_launch(self, action_id):
+        """Obtain a witness only by starting a new permitted attempt.
+
+        The caller must commit this write-ahead UNKNOWN before entering the
+        witness scope or invoking any actual effect executor.
+        """
+        return _EffectLaunchWitness(self.started(action_id))
+
+    @staticmethod
+    def _host_nonlaunch_current(value):
+        proof = value.get('host_nonlaunch_proof')
+        return (isinstance(proof, dict) and proof.get('version') == 1
+                and proof.get('kind') == 'HOST_EFFECT_NOT_LAUNCHED'
+                and type(value.get('attempt_number')) is int and value['attempt_number'] > 0
+                and value.get('intent_hash') == hash_value(value.get('intent'))
+                and isinstance(value.get('host_attempt_id'), str) and bool(value['host_attempt_id'])
+                and all(proof.get(key) == value.get(key) for key in
+                        ('action_id', 'attempt_number', 'intent_hash', 'host_attempt_id'))
+                and proof.get('sha256') == hash_value({key: item for key, item in proof.items() if key != 'sha256'}))
+
+    def record_nonlaunch(self, witness):
+        """Accept positive host completion for this exact never-launched attempt."""
+        if not isinstance(witness, _EffectLaunchWitness) or witness.phase != 'NOT_LAUNCHED' or not witness.proof:
+            raise ValueError('A completed host nonlaunch witness is required')
+        proof = witness.proof
+        action_id = proof['action_id']
+        with transaction(self.store.db) as db:
+            record = read_record(db, 'operation', action_id)
+            previous = record['payload']
+            if (not previous or any(previous.get(key) != proof.get(key) for key in
+                    ('action_id', 'attempt_number', 'intent_hash', 'host_attempt_id'))):
+                raise ValueError('Host nonlaunch proof differs from the current attempt or intent')
+            if previous.get('host_nonlaunch_proof') == proof and previous['state'] == 'ABSENT':
+                return previous
+            if (previous['state'] != 'UNKNOWN' or self._history(previous)[1]
+                    or 'execution_receipt' in previous or 'submission_binding' in previous):
+                raise ValueError('A submitted, resolved or applied attempt cannot accept nonlaunch proof')
+            value = dict(previous, state='ABSENT', host_nonlaunch_proof=proof)
+            if not self._host_nonlaunch_current(value):
+                raise ValueError('Invalid host nonlaunch proof')
+            write_record(db, 'operation', action_id, value, expected_revision=record['revision'])
+            append_event(db, 'operation:' + action_id + ':nonlaunch:' + str(value['attempt_number']),
+                         'operation_not_launched', value['task_id'], proof)
         return value
 
     @staticmethod
@@ -215,7 +308,7 @@ class OperationLedger:
     @staticmethod
     def _clear_nonapplication(value):
         for field in ("nonapplication_proof_ref", "nonapplication_proof_refs",
-                      "nonapplication_provider_attempt_id", "nonapplication_attempt_number"):
+                      "nonapplication_provider_attempt_id", "nonapplication_attempt_number", "host_nonlaunch_proof"):
             value.pop(field, None)
 
     @staticmethod
@@ -230,9 +323,9 @@ class OperationLedger:
 
     @classmethod
     def _confirmed_current_attempt(cls, value):
-        return (cls._current_binding(value) and bool(value.get("nonapplication_proof_ref"))
+        return (cls._host_nonlaunch_current(value) or (cls._current_binding(value) and bool(value.get("nonapplication_proof_ref"))
                 and value.get("nonapplication_attempt_number") == value["attempt_number"]
-                and value.get("nonapplication_provider_attempt_id") == value["submission_binding"]["provider_attempt_id"])
+                and value.get("nonapplication_provider_attempt_id") == value["submission_binding"]["provider_attempt_id"]))
 
     def record_submission(self, action_id, execution, *, context=None):
         """Bind an actual submission receipt to the current local attempt.

@@ -3,6 +3,7 @@
 These observations establish local transport/integrity only. The independent
 domain reviewer must judge whether a representation is substantively adequate.
 """
+import codecs
 import hashlib
 from pathlib import Path, PureWindowsPath
 
@@ -41,6 +42,36 @@ def source_bytes(root, relative):
     if len(data) > PACKET_FILE_LIMIT:
         raise ValueError("source exceeds per-file packet bound")
     return data
+
+
+def readable_source(root, relative):
+    """Return complete bounded raw UTF-8 authority, or None for native bytes.
+
+    Classify with bounded memory even when native artifacts exceed packet size.
+    A readable oversized source is a coverage gap, never silently replaced by a
+    smaller summary. I/O/path failures also remain gaps rather than fallback.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    data, size = bytearray(), 0
+    with source_path(root, relative).open("rb") as stream:
+        while chunk := stream.read(65536):
+            if b"\0" in chunk:
+                return None
+            try:
+                decoder.decode(chunk)
+            except UnicodeError:
+                return None
+            size += len(chunk)
+            if size <= PACKET_FILE_LIMIT:
+                data.extend(chunk)
+    try:
+        decoder.decode(b"", final=True)
+    except UnicodeError:
+        return None
+    if size > PACKET_FILE_LIMIT:
+        raise ValueError("readable raw source exceeds per-file packet bound")
+    raw = bytes(data)
+    return {"path": relative, "content": raw.decode("utf-8"), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def source_hash(root, relative):

@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -12,6 +14,7 @@ import uuid
 
 from ase.projects import ProjectContext, ProjectRegistry
 from ase.store import Store, default_home, now
+from ase.timezones import TimezoneDataUnavailable
 
 
 class ProjectTests(unittest.TestCase):
@@ -188,3 +191,34 @@ class ProjectTests(unittest.TestCase):
         database.unlink()
         with self.assertRaisesRegex(ValueError, "[Mm]issing"):
             Store(project)
+
+    def test_unknown_timezone_rejected_before_registry_identity_is_persisted(self):
+        with self.assertRaises(TimezoneDataUnavailable) as unavailable:
+            self.register(timezone="Europe/Buchresst")
+        self.assertEqual(unavailable.exception.code, "TZ_DATA_UNAVAILABLE")
+        for table in ("projects", "workspaces", "aliases"):
+            self.assertEqual(self.registry.db.execute("SELECT count(*) FROM " + table).fetchone()[0], 0)
+        self.assertFalse(self.registry.db.in_transaction)
+        project = self.register()
+        self.assertEqual(project.timezone, "Europe/Bucharest")
+
+    def test_cli_timezone_failure_leaves_no_project_and_valid_retry_reports(self):
+        checkout = Path(__file__).resolve().parents[1]
+        def cli(*args):
+            return subprocess.run([sys.executable, "-B", "-m", "ase", "--home", str(self.home), *map(str, args)],
+                cwd=checkout, env={**os.environ, "PYTHONPATH": str(checkout), "PYTHONDONTWRITEBYTECODE": "1"},
+                capture_output=True, text=True, timeout=30)
+        invalid = cli("project", "register", "--root", self.root, "--kind", "document", "--timezone", "Europe/Buchresst")
+        self.assertEqual(invalid.returncode, 3, invalid.stdout + invalid.stderr)
+        self.assertIn("TZ_DATA_UNAVAILABLE", json.loads(invalid.stdout)["error"])
+        self.assertEqual(self.registry.db.execute("SELECT count(*) FROM projects").fetchone()[0], 0)
+        valid = cli("project", "register", "--root", self.root, "--kind", "document", "--timezone", "Europe/Bucharest")
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        report = cli("--project", self.root, "worklog", "--from", "2026-11-14", "--until", "2026-11-15")
+        self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
+        self.assertEqual(json.loads(report.stdout)["timezone"], "Europe/Bucharest")
+
+    def test_compatibility_registration_preserves_existing_timezone(self):
+        project = self.register(timezone="UTC")
+        self.assertEqual(self.registry.for_root(self.root).timezone, "UTC")
+        self.assertEqual(self.registry.resolve(project.project_id).timezone, "UTC")

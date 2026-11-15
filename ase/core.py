@@ -484,21 +484,39 @@ class Engine:
         return {"project_id": self.store.project_id, "state_dir": str(self.store.root), **detection}
 
     def start(self, contract):
+        # This operation owns filesystem preparation as well as its SQL commit.
+        # A caller rollback cannot undo published files, so do not compose it
+        # with unrelated pending database writes.
+        if self.store.db.in_transaction:
+            raise ValueError("Legacy start requires no active caller transaction")
+        from .state import transaction
         c = validate_contract(contract, self.repo)
         task_id = c.pop("id", None) or uuid.uuid4().hex[:12]
         if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", task_id):
             raise ValueError("Invalid task ID")
         if SECRET.search(json.dumps(c)):
             raise ValueError("Task contract appears to contain credentials; provide a sanitized request and credential-free argv")
-        with self.store.db:
-            self.store.db.execute("INSERT INTO tasks VALUES(?,?,?,?,?,?)", (task_id, c["request"], "PLANNED", json.dumps(c), now(), now()))
-        folder = self.folder(task_id)
-        folder.mkdir(parents=True)
         baseline = self._snapshot(self.repo)
         baseline["dirty"] = self._git(self.repo, "status", "--porcelain")
-        save(folder / "baseline.json", baseline)
-        save(folder / "contract.json", c)
-        self.store.transition(task_id, "PLANNED", "Confirmed task contract recorded")
+        prepared = None
+        try:
+            with transaction(self.store.db):
+                self.store.db.execute("INSERT INTO tasks VALUES(?,?,?,?,?,?)", (task_id, c["request"], "PLANNED", json.dumps(c), now(), now()))
+                folder = self.folder(task_id)
+                folder.mkdir(parents=True)
+                prepared = folder  # Only this call's newly created directory.
+                save(folder / "baseline.json", baseline)
+                save(folder / "contract.json", c)
+                self.store.transition(task_id, "PLANNED", "Confirmed task contract recorded")
+        except BaseException:
+            try:
+                # A failed COMMIT may leave the owned transaction open.
+                if self.store.db.in_transaction:
+                    self.store.db.rollback()
+            finally:
+                if prepared is not None:
+                    shutil.rmtree(prepared)
+            raise
         return {"task_id": task_id, "state_dir": str(folder), "status": "PLANNED", "contract_sha256": digest(canonical(c))}
 
     def _contract(self, task_id):

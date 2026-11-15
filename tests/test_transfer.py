@@ -258,12 +258,13 @@ class TransferTests(unittest.TestCase):
 
     def test_export_rejects_credentials_without_rewriting_history(self):
         self.seed()
+        fixture_value = "=".join(("password", "private-value-must-stay-local"))
         with self.store.db:
-            self.store.db.execute("UPDATE sessions SET summary=?", ("password=private-value-must-stay-local",))
+            self.store.db.execute("UPDATE sessions SET summary=?", (fixture_value,))
         with self.assertRaisesRegex(ValueError, "credential"):
             transfer.export_project(self.project, self.archive)
         self.assertFalse(self.archive.exists())
-        self.assertEqual(self.store.db.execute("SELECT summary FROM sessions").fetchone()[0], "password=private-value-must-stay-local")
+        self.assertEqual(self.store.db.execute("SELECT summary FROM sessions").fetchone()[0], fixture_value)
 
     def test_import_rejects_excess_bounds_and_database_identity_tamper(self):
         self.seed()
@@ -343,3 +344,265 @@ class TransferTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TransferLifecycleBoundaryTests(unittest.TestCase):
+    setUp = TransferTests.setUp
+    seed = TransferTests.seed
+    target = TransferTests.target
+    rewrite = TransferTests.rewrite
+
+    def test_unknown_timezone_is_rejected_before_target_activation(self):
+        self.seed()
+        transfer.export_project(self.project,self.archive)
+        def change(entries):
+            for index,(entry,data) in enumerate(entries):
+                if entry.filename=='manifest.json':
+                    value=json.loads(data)
+                    value['project']['timezone']='Unknown/Audit_Zone'
+                    entries[index]=(entry,json.dumps(value).encode())
+        archive=self.rewrite(change)
+        home=self.base/'fresh-state'
+        root=self.target('unknown-zone')
+        with self.assertRaisesRegex(ValueError,'TZ_DATA_UNAVAILABLE'):
+            transfer.import_project(archive,home,root=root)
+        self.assertFalse(home.exists(),'Invalid timezone must not reserve any identity')
+        with closing(ProjectRegistry(home)) as registry:
+            current=registry.register(root,kind='document',timezone='UTC')
+            self.assertEqual(current.timezone,'UTC')
+
+    def test_uncertain_push_history_remains_fenced_after_import(self):
+        self.seed()
+        states=('UNKNOWN','CONFIRMED','APPLIED','ABSENT')
+        originals={}
+        with self.store.db:
+            for number,state in enumerate(states):
+                key=format(number+1,'064x')
+                value={'version':1,'state':state,'action_id':key,'attempt_number':1,
+                    'intent':{'project_id':self.project.project_id,'workspace_id':self.project.workspace_id,
+                              'task_id':'portable','url':'https://example.invalid/repository.git',
+                              'ref':'refs/heads/feature/audit','commit':'a'*40}}
+                if state=='CONFIRMED':value['confirmation']={'historical':'cached pre-import observation'}
+                originals[key]=value
+                write_record(self.store.db,'publication_push',key,value,expected_revision=0)
+        transfer.export_project(self.project,self.archive)
+        context=transfer.import_project(self.archive,self.base/'push-state',root=self.target('push-target'))
+        with closing(Store(context)) as store:
+            for key,old in originals.items():
+                current=read_record(store.db,'publication_push',key)['payload']
+                self.assertIsNotNone(current,'An uncertain push must not disappear into passive history')
+                self.assertEqual(current['state'],old['state'] if old['state'] in {'APPLIED','ABSENT'} else 'UNKNOWN')
+                self.assertEqual(current['intent'],old['intent'],'Retain original target/owner, never rebind authority')
+                self.assertNotIn('confirmation',current)
+                self.assertEqual(read_record(store.db,'historical_publication_push',key)['payload'],old)
+            self.assertIsNone(read_record(store.db,'approval','portable')['payload'])
+
+    def test_supported_reporting_timezone_survives_import(self):
+        from ase.journal import Journal
+        self.seed()
+        transfer.export_project(self.project,self.archive)
+        context=transfer.import_project(self.archive,self.base/'known-state',root=self.target('known-zone'))
+        self.assertEqual(context.timezone,'Europe/Bucharest')
+        with closing(Store(context)) as store:
+            report=Journal(store).meeting_report('2026-10-25','2026-10-26',timezone=store.project.timezone)
+            self.assertEqual(report['timezone'],'Europe/Bucharest')
+
+    def test_import_preserves_event_counter_before_new_closure_and_proposal(self):
+        from ase.continuity import Continuity
+        from ase.journal import Journal
+        tasks=TaskService(self.store)
+        task=tasks.create(contract('portable'))
+        task=tasks.transition('portable','BLOCKED',expected_revision=task['revision'],reason='Original required decision')
+        old_revision=task['revision']
+        history=[tuple(row) for row in self.store.db.execute('SELECT event_key,kind,task_id,payload,created FROM runtime_events ORDER BY sequence')]
+        transfer.export_project(self.project,self.archive)
+        archive=self.archive
+        for number in (1,2):
+            context=transfer.import_project(archive,self.base/('state-'+str(number)),root=self.target('target-'+str(number)))
+            with closing(Store(context)) as store:
+                service=TaskService(store)
+                task=service.snapshot('portable')
+                self.assertEqual(task['state'],'AWAITING_APPROVAL')
+                self.assertIsNone(read_record(store.db,'approval','portable')['payload'])
+                self.assertIsNone(read_record(store.db,'verification','portable:ac')['payload'])
+                journal=Journal(store)
+                journal.start_session('portable','imported-'+str(number))
+                closure=journal.finish_session('portable','imported-'+str(number),{
+                    'finish_reason':'blocked','stage':'imported','summary':'Imported history awaits owner approval',
+                    'next_action':'Review original requirements and approve a current proposal','context':{'summary':'Imported history requires fresh approval'},'blockers':[]},
+                    closure_key='portable:imported-closure-'+str(number),
+                    expected_revision=Continuity(store).snapshot('portable')['revision'],expected_context_revision=journal.context()['revision'])
+                self.assertIsNotNone(closure)
+                task=service.snapshot('portable')
+                self.assertGreater(task['revision'],old_revision,'New closure must continue beyond immutable historical events')
+                task=service.propose('portable',{'summary':'Current imported proposal '+str(number),'stage_ids':['draft']},expected_revision=task['revision'])
+                self.assertEqual(task['approved_stage_ids'],[])
+                current=[tuple(row) for row in store.db.execute('SELECT event_key,kind,task_id,payload,created FROM runtime_events ORDER BY sequence')]
+                self.assertEqual(current[:len(history)],history,'Immutable original history must be preserved')
+                self.assertEqual(len({row[0] for row in current}),len(current))
+                old_revision=task['revision']
+                archive=self.base/('repeat-'+str(number)+'.zip')
+                transfer.export_project(context,archive)
+
+
+class ImportRevisionHistoryTests(unittest.TestCase):
+    """Fresh authorization must append beyond passive imported history."""
+    setUp = TransferTests.setUp
+    seed = TransferTests.seed
+    target = TransferTests.target
+
+    @staticmethod
+    def history(store):
+        return [tuple(row) for row in store.db.execute(
+            'SELECT event_key,kind,task_id,payload,created FROM runtime_events ORDER BY sequence')]
+
+    def close_and_approve(self, store, label, task_high, approval_high):
+        from ase.continuity import Continuity
+        from ase.journal import Journal
+        service = TaskService(store)
+        task = service.snapshot('portable')
+        self.assertEqual(task['state'], 'AWAITING_APPROVAL')
+        self.assertEqual(task['approved_stage_ids'], [])
+        self.assertIsNone(task['proposal_hash'])
+        self.assertIsNone(read_record(store.db, 'approval', 'portable')['payload'])
+        self.assertFalse(store.db.execute(
+            "SELECT 1 FROM runtime_records WHERE kind='approval_version'").fetchone())
+        with self.assertRaisesRegex(ValueError, 'approval'):
+            service.require_approval('portable', 'draft')
+        retained = self.history(store)
+        imported_task_revision = task['revision']
+        imported_approval_revision = read_record(store.db, 'approval', 'portable')['revision']
+        try:
+            journal = Journal(store)
+            journal.start_session('portable', label)
+            journal.finish_session('portable', label, {
+                'finish_reason': 'blocked', 'summary': 'Review imported obligations',
+                'next_action': 'Approve the current draft proposal',
+                'context': {'summary': 'Imported authorization is historical'}, 'blockers': []},
+                closure_key='portable:' + label,
+                expected_revision=Continuity(store).snapshot('portable')['revision'],
+                expected_context_revision=journal.context()['revision'])
+            task = service.snapshot('portable')
+            task = service.propose('portable', {'summary': 'Fresh imported draft ' + label,
+                'stage_ids': ['draft']}, expected_revision=task['revision'])
+            task = service.approve('portable', proposal_hash=task['proposal_hash'],
+                user_message_ref='chat:fresh-import-' + label, approved_stage_ids=['draft'])
+        except ValueError as error:
+            self.fail('Fresh imported closure/proposal/approval must append without collision: ' + str(error))
+        self.assertGreater(imported_task_revision, task_high)
+        self.assertGreaterEqual(imported_approval_revision, approval_high)
+        self.assertGreater(task['revision'], task_high)
+        approval = read_record(store.db, 'approval', 'portable')
+        self.assertGreater(approval['revision'], approval_high)
+        self.assertEqual(approval['payload']['user_message_ref'], 'chat:fresh-import-' + label)
+        self.assertEqual(service.require_approval('portable', 'draft')['state'], 'READY')
+        current = self.history(store)
+        self.assertEqual(current[:len(retained)], retained)
+        self.assertEqual(len({row[0] for row in current}), len(current))
+        return task['revision'], approval['revision']
+
+    def test_approved_task_can_close_and_gain_fresh_approval_after_copy_restore_and_recopy(self):
+        self.seed()
+        task_high = TaskService(self.store).snapshot('portable')['revision']
+        approval_high = read_record(self.store.db, 'approval', 'portable')['revision']
+        original = self.history(self.store)
+        transfer.export_project(self.project, self.archive)
+        archive = self.archive
+        for number, mode in enumerate(('copy', 'restore', 'copy'), 1):
+            with self.subTest(mode=mode, number=number):
+                context = transfer.import_project(archive, self.base / ('fresh-state-' + str(number)),
+                    root=self.target('fresh-target-' + str(number)), mode=mode)
+                with closing(Store(context)) as store:
+                    self.assertEqual(self.history(store)[:len(original)], original)
+                    task_high, approval_high = self.close_and_approve(
+                        store, 'fresh-' + str(number), task_high, approval_high)
+                    archive = self.base / ('fresh-copy-' + str(number) + '.zip')
+                    transfer.export_project(context, archive)
+
+    def test_invalidated_approval_tombstone_retains_its_counter_without_its_grant(self):
+        self.seed()
+        service = TaskService(self.store)
+        task = service.snapshot('portable')
+        task = service.propose('portable', {'summary': 'Changed source proposal', 'stage_ids': ['draft']},
+            expected_revision=task['revision'])
+        tombstone = read_record(self.store.db, 'approval', 'portable')
+        self.assertIsNone(tombstone['payload'])
+        transfer.export_project(self.project, self.archive)
+        context = transfer.import_project(self.archive, self.base / 'tombstone-state',
+            root=self.target('tombstone-target'))
+        with closing(Store(context)) as store:
+            self.close_and_approve(store, 'invalidated', task['revision'], tombstone['revision'])
+
+    def legacy_reset(self):
+        """Retain real source records/events behind the counters old imports reset."""
+        self.seed()
+        service = TaskService(self.store)
+        for number in (1, 2):
+            task = service.snapshot('portable')
+            task = service.propose('portable', {'summary': 'Original revision ' + str(number),
+                'stage_ids': ['draft']}, expected_revision=task['revision'])
+            service.approve('portable', proposal_hash=task['proposal_hash'],
+                user_message_ref='chat:original-' + str(number), approved_stage_ids=['draft'])
+        task = service.snapshot('portable')
+        task = service.propose('portable', {'summary': 'Original invalidated final proposal',
+            'stage_ids': ['draft']}, expected_revision=task['revision'])
+        high = (task['revision'], read_record(self.store.db, 'approval', 'portable')['revision'])
+        original = self.history(self.store)
+        transfer.export_project(self.project, self.archive)
+        context = transfer.import_project(self.archive, self.base / 'legacy-state',
+            root=self.target('legacy-target'))
+        return context, high, original
+
+    def test_legacy_reset_counters_recover_from_all_historical_record_tiers(self):
+        context, high, original = self.legacy_reset()
+        with closing(Store(context)) as store:
+            with store.db:
+                # Old copies retained the true high-water only as passive history.
+                for kind in ('task', 'approval'):
+                    row = store.db.execute('SELECT key,revision,payload,updated FROM runtime_records '
+                        'WHERE kind=? AND key=?', ('historical_' + kind, 'portable')).fetchone()
+                    store.db.execute('INSERT INTO runtime_records VALUES(?,?,?,?,?)',
+                        ('historical_historical_' + kind, *tuple(row)))
+                    store.db.execute('UPDATE runtime_records SET revision=1 WHERE kind=? AND key=?',
+                        ('historical_' + kind, 'portable'))
+                store.db.execute("UPDATE runtime_records SET revision=1 WHERE kind='task' AND key='portable'")
+                store.db.execute("DELETE FROM runtime_records WHERE kind='approval' AND key='portable'")
+            before = [tuple(row) for row in store.db.execute("SELECT * FROM runtime_records WHERE kind LIKE 'historical_%' ORDER BY kind,key")]
+            archive = self.base / 'legacy-reset.zip'
+            transfer.export_project(context, archive)
+        current = transfer.import_project(archive, self.base / 'legacy-recovered-state',
+            root=self.target('legacy-recovered-target'))
+        with closing(Store(current)) as store:
+            self.assertEqual(self.history(store)[:len(original)], original)
+            for row in before:
+                self.assertEqual(tuple(store.db.execute('SELECT * FROM runtime_records WHERE kind=? AND key=?', row[:2]).fetchone()), row)
+            self.close_and_approve(store, 'legacy-restored', *high)
+
+    def test_legacy_reset_counters_recover_from_canonical_events_when_record_counters_lag(self):
+        context, high, original = self.legacy_reset()
+        # Preserved canonical events are independently sufficient when old record
+        # snapshots lag behind the immutable event history.
+        with closing(Store(context)) as store:
+            with store.db:
+                for row in store.db.execute('SELECT kind,key FROM runtime_records').fetchall():
+                    kind = row[0]
+                    while kind.startswith('historical_'):
+                        kind = kind[11:]
+                    if kind in {'task', 'approval'}:
+                        store.db.execute('UPDATE runtime_records SET revision=1 WHERE kind=? AND key=?', tuple(row))
+                    elif kind in {'task_version', 'approval_version'}:
+                        store.db.execute('DELETE FROM runtime_records WHERE kind=? AND key=?', tuple(row))
+                store.db.execute("DELETE FROM runtime_records WHERE kind='approval' AND key='portable'")
+                from ase.state import append_event
+                append_event(store.db, 'portable:transition:21', 'transition', 'portable',
+                    {'state': 'BLOCKED', 'reason': 'Actual preserved legacy transition'})
+                append_event(store.db, 'portable:approval:23', 'approval', 'portable',
+                    {'user_message_ref': 'chat:preserved-legacy-approval'})
+            events = self.history(store)
+            archive = self.base / 'legacy-events.zip'
+            transfer.export_project(context, archive)
+        current = transfer.import_project(archive, self.base / 'event-recovered-state',
+            root=self.target('event-recovered-target'))
+        with closing(Store(current)) as store:
+            self.assertEqual(self.history(store), events)
+            self.close_and_approve(store, 'event-restored', 21, 23)

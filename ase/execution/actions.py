@@ -44,23 +44,33 @@ class ActionService:
         from ..credentials import CredentialVault
         return CredentialAccess(CredentialVault(context.store.state_home))
 
-    def execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None):
+    def execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None, launch_witness=None):
         context = self.context
         from ..core import execute
         if stage_id is None:
             raise ValueError("Command requires its actual approved stage")
-        stage = next(s for s in context.tasks.snapshot(task_id)["contract"]["stages"] if s["id"] == stage_id)
-        if (stage["depends_on"] and spec in stage.get("actions", [])
+        task = context.tasks.snapshot(task_id)
+        stage = next(s for s in task["contract"]["stages"] if s["id"] == stage_id)
+        if not isinstance(argv, (list, tuple)):
+            raise ValueError("Command argv must name an approved recipe")
+        argv = list(argv)  # Pin the actual recipe before authentication/launch.
+        allowed = [spec["argv"]]
+        if spec in stage.get("actions", []):
+            allowed.append(spec["observation_argv"])
+        if argv not in allowed:
+            raise ValueError("Command argv differs from its approved recipe")
+        if (context._prerequisite_stages(task, stage) and spec in stage.get("actions", [])
                 and list(argv) == spec["argv"] and prerequisite_binding is None):
             raise ValueError("Dependent effect requires current prerequisite evidence binding")
         cancel, launch_guard = context._command_control(task_id, spec, stage_id, allow_terminal=allow_terminal,
             prerequisite_binding=prerequisite_binding, authority_binding=authority_binding)
+        effect_guard = launch_witness.guard(launch_guard) if launch_witness is not None else launch_guard
         if "access" not in spec:
-            return execute(argv, context.store.repo, log, timeout, cancel_requested=cancel, launch_guard=launch_guard)
+            return execute(argv, context.store.repo, log, timeout, cancel_requested=cancel, launch_guard=effect_guard)
         context._access_stage(task_id, spec, stage_id, allow_terminal=allow_terminal)
         access = spec["access"]
         receipt = context._access_client().run(access["credential_ref"], access["target"], argv, context.store.repo,
-            log, timeout=timeout, cancel_requested=cancel, launch_guard=launch_guard)
+            log, timeout=timeout, cancel_requested=cancel, launch_guard=launch_guard, effect_launch_guard=effect_guard)
         with transaction(context.store.db) as db:
             append_event(db, "access:" + uuid.uuid4().hex, "access_used", task_id, receipt["access"])
         return receipt
@@ -157,6 +167,8 @@ class ActionService:
     def execute_actions(self, task_id, stage):
         context = self.context
         """Probe actual state before every effect, including uncertain resumes."""
+        if context.store.db.in_transaction:
+            raise ValueError('Action execution requires a committed write-ahead boundary')
         from ..core import execute
         from ..operations import OperationLedger
         task = context.tasks.snapshot(task_id)
@@ -202,10 +214,21 @@ class ActionService:
                     if context._stage_authority(task, stage) != authority:
                         raise ValueError("Approved action authority changed during prerequisite verification")
                     context._available(task_id, action.get("timeout", 300))
-                    ledger.started(action_id)
-                execution = context._call(task_id, lambda timeout: context._execute_command(task_id, action,
-                    action["argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"],
-                    prerequisite_binding=prerequisite_binding, authority_binding=authority), action.get("timeout", 300))
+                    launch_witness = ledger.start_launch(action_id)
+                # UNKNOWN above commits before authentication or possible Popen.
+                # Only this completed host scope may certify actual nonlaunch;
+                # process entry or a hard crash leaves the attempt UNKNOWN.
+                try:
+                    with launch_witness:
+                        execution = context._call(task_id, lambda timeout: context._execute_command(task_id, action,
+                            action["argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"],
+                            prerequisite_binding=prerequisite_binding, authority_binding=authority,
+                            launch_witness=launch_witness), action.get("timeout", 300))
+                finally:
+                    if launch_witness.phase == 'NOT_LAUNCHED':
+                        ledger.record_nonlaunch(launch_witness)
+                if launch_witness.phase == 'NOT_LAUNCHED':
+                    raise ValueError('Effect command did not reach process launch')
                 ledger.record_submission(action_id, execution, context=execution_context)
                 observation = observe()
                 ledger.reconcile(action_id, observation)

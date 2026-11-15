@@ -168,6 +168,7 @@ class PublishingV2Tests(unittest.TestCase):
         self.assertFalse(self.remote_commit())
 
     def test_exact_single_url_authorization_can_be_revoked_and_cannot_follow_redirect(self):
+        before = self.git("rev-parse", "HEAD")
         with patch("ase.publishing.GateService.gate", side_effect=self.protocol_gate):
             self.assertEqual(self.publisher.publish("publish", execute_push=True)["status"], "BLOCKED")
             self.publisher.authorize()
@@ -182,7 +183,12 @@ class PublishingV2Tests(unittest.TestCase):
             self.git("config", "--add", "remote.origin.pushurl", str(other))
             with self.assertRaises(ValueError):
                 self.publisher.authorize()
-            self.assertEqual(self.publisher.publish("publish", execute_push=True)["status"], "REJECTED")
+            (self.repo / "app.py").write_text("value = 2\n", encoding="utf-8")
+            self.assertEqual(self.publisher.publish("publish", execute_push=True, commit_message="Reject invalid destination")["status"], "REJECTED")
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+        self.assertFalse(self.journal("committed"))
+        self.assertFalse(self.journal("published"))
         self.assertFalse(self.remote_commit())
         self.assertFalse(self.remote_commit(other))
 

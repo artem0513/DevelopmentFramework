@@ -1,4 +1,6 @@
 """Current-source evidence gate; semantic judgments remain separate from proof."""
+from contextlib import contextmanager
+from contextvars import ContextVar
 import fnmatch
 import hashlib
 import json
@@ -34,7 +36,8 @@ def evaluate_gate(contract, current, receipts, judgments):
     blocked.extend(profile["blocked_reasons"])
     expected_bindings = {"fingerprint": current.get("fingerprint"), "contract_sha256": current.get("contract_hash"),
                          "proposal_sha256": current.get("proposal_hash"), "plan_sha256": current.get("plan_hash"),
-                         "check_sha256": current.get("check_hash")}
+                         "check_sha256": current.get("check_hash"),
+                         "verification_context_sha256": current.get("verification_context_sha256", "missing")}
     if current.get("workspace_id"):
         expected_bindings["workspace_id"] = current["workspace_id"]
     roles, execution_ids, session_ids = {}, set(), set()
@@ -49,7 +52,13 @@ def evaluate_gate(contract, current, receipts, judgments):
             continue
         execution_ids.add(receipt.get("execution_id"))
         try:
-            verified = verify_receipt(receipt, expected_bindings=expected_bindings)
+            role_bindings = dict(expected_bindings)
+            captured = receipt.get("bindings")
+            captured_context = captured.get("verification_context_sha256") if isinstance(captured, dict) else None
+            allowed_contexts = current.get("verification_context_sha256s", (expected_bindings["verification_context_sha256"],))
+            if captured_context in allowed_contexts:
+                role_bindings["verification_context_sha256"] = captured_context
+            verified = verify_receipt(receipt, expected_bindings=role_bindings)
             if verified["evidence_kind"] != "independent_cli":
                 blocked.append("Protocol fixtures are not independent semantic approval: " + role)
                 continue
@@ -110,11 +119,66 @@ def evaluate_gate(contract, current, receipts, judgments):
             "rejected_reasons": list(dict.fromkeys(rejected)), "blocked_reasons": list(dict.fromkeys(blocked)),
             "reasons": list(dict.fromkeys(rejected + blocked)), "contract_hash": current.get("contract_hash"),
             "proposal_hash": current.get("proposal_hash"), "plan_hash": current.get("plan_hash"),
-            "fingerprint": current.get("fingerprint"), "profile_evidence": profile, "timestamp": now()}
+            "fingerprint": current.get("fingerprint"), "verification_context_sha256": current.get("verification_context_sha256"),
+            "profile_evidence": profile, "timestamp": now()}
 
 
 def stage_checks(contract, checks, stage_id=None):
     return stage_evidence_specs(contract, checks, stage_id)
+
+
+def verification_context_hash(store, contract, task_id, stage_id=None):
+    """Bind exact judgment coverage and the relevant current action proof.
+
+    This is separate from source identity: reobserving an external resource can
+    change its evidence without changing any source file or executed check.
+    """
+    from .operations import OperationLedger
+    by_id = {stage["id"]: stage for stage in contract["stages"]}
+    selected = set()
+
+    def include(name):
+        if name not in by_id:
+            raise ValueError("Unknown verification context stage")
+        if name not in selected:
+            selected.add(name)
+            for dependency in by_id[name]["depends_on"]:
+                include(dependency)
+
+    if stage_id is None:
+        selected.update(by_id)
+    else:
+        include(stage_id)
+    ledger = OperationLedger(store)
+    root_task_id = ledger.root_task_id(task_id)
+    operations = [json.loads(row[0]) for row in store.db.execute(
+        "SELECT payload FROM runtime_records WHERE kind='operation'")]
+    actions = []
+    for stage in contract["stages"]:
+        if stage["id"] not in selected:
+            continue
+        for action in stage.get("actions", []):
+            intent = {"project_id": store.project_id, "workspace_id": store.workspace_id,
+                "action": action, "effect_scope": stage["scope"]}
+            # Select canonical proof records, without treating another action's
+            # in-flight overlap as a change to this prerequisite's own proof.
+            # Conflict-aware lookup remains mandatory in packets and the gate.
+            matches = [operation for operation in operations if operation
+                and ledger.root_task_id(operation["task_id"]) == root_task_id
+                and ledger._effect_identity(operation["intent"]) == ledger._effect_identity(intent)
+                and ledger._same_scope(operation, intent)]
+            actions.append({"stage_id": stage["id"], "action_id": action["id"],
+                "proof_sha256": hash_value(sorted(matches, key=lambda item: item["action_id"]))})
+    return hash_value({"version": 1, "stage_id": stage_id, "actions": actions})
+
+
+def verification_context_hashes(store, contract, task_id, stage_id=None):
+    """Current contexts whose captured coverage may authorize this gate."""
+    selected = verification_context_hash(store, contract, task_id, stage_id)
+    if stage_id is None:
+        return (selected,)
+    whole = verification_context_hash(store, contract, task_id)
+    return tuple(dict.fromkeys((selected, whole)))
 
 
 def source_resources(store, contract, task_id=None):
@@ -154,9 +218,27 @@ def _directory_sources(root, directory, excluded_files=()):
                 yield candidate
 
 
+_recovery_inventories = ContextVar('recovery_source_inventories', default=())
+
+
+@contextmanager
+def _source_inventory(store, task_ids, authenticate):
+    """Scope exact authenticated recovery staging to participating observations."""
+    scope_handle = _recovery_inventories.set((*_recovery_inventories.get(),
+        (store, frozenset(task_ids), authenticate)))
+    try:
+        yield
+    finally:
+        _recovery_inventories.reset(scope_handle)
+
+
 def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
+    _excluded_files = set(_excluded_files)
+    for owner, task_ids, authenticate in _recovery_inventories.get():
+        if owner is store and task_id in task_ids:
+            _excluded_files.update(authenticate())
     from .project_local import is_private_path
-    from .source_coverage import source_path, declared_source_resources, normalized_discovery_policy
+    from .source_coverage import source_path, source_hash, declared_source_resources, normalized_discovery_policy
     row = store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone() if task_id is not None else None
     discovery = json.loads(row[0]) if row else None
     policy_sha256 = hash_value(normalized_discovery_policy(discovery)) if discovery is not None else None
@@ -169,6 +251,9 @@ def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
     unavailable = {}
     root = store.repo.resolve()
     resources = declared_source_resources(contract, discovery)
+    declarations = [*(discovery or {}).get("scope", {}).get("dependencies", []),
+                    *(discovery or {}).get("dependencies", [])]
+    required_dependencies = {item["path"] for item in declarations if item.get("required", True)}
     dependencies = {}
 
     def capture(resource):
@@ -196,11 +281,14 @@ def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
         if any(part.lower() == ".git" for part in path.relative_to(root).parts):
             raise ValueError("Private Git data is not project source")
         if path.is_dir():
-            # Git already supplies tracked/nonignored files. Directory discovery
-            # must not add generated or ignored trees (including check output).
-            # An explicitly named ignored dependency file remains supported.
+            # Broad workspace inventory keeps Git ignore semantics. A named
+            # required dependency subtree includes manifest-inferred local paths:
+            # "from" records provenance, not a weaker input requirement. Root
+            # declarations never expand into ignored secrets.
+            required_directory = path != root and path.relative_to(root).as_posix() in required_dependencies
             candidates = ([root / name for name in base["files"] if (root / name).is_relative_to(path)]
-                          if base is not None else sorted(_directory_sources(root, path, _excluded_files)))
+                          if base is not None and not required_directory
+                          else sorted(_directory_sources(root, path, _excluded_files)))
         else:
             candidates = [path]
         if len(candidates) > 1000:
@@ -211,7 +299,7 @@ def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
                 raise ValueError("Source escapes workspace")
             if candidate.is_file():
                 relative = str(candidate.relative_to(root)).replace("\\", "/")
-                observed = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                observed = source_hash(root, relative)
                 if relative not in files:
                     dependencies[relative] = observed
                     files[relative] = observed
@@ -310,6 +398,8 @@ class GateService:
                    "checks": plan["checks"], "workspace_id": self.store.workspace_id}
         if stage is not None:
             current.update(stage_id=stage_id, checks=stage_checks(task["contract"], plan["checks"], stage_id))
+        current["verification_context_sha256s"] = verification_context_hashes(self.store, task["contract"], task_id, stage_id)
+        current["verification_context_sha256"] = current["verification_context_sha256s"][0]
         implementation = read_record(self.store.db, "implementation", task_id)["payload"]
         current["implementation_execution_id"] = (implementation or {}).get("execution_id")
         receipts = [check] if check else []
@@ -443,6 +533,8 @@ class GateService:
                             raise ValueError("Invalid observation proof")
                     except (KeyError, ValueError, OSError, TypeError):
                         extra.append("Action observation proof is missing or invalid: " + action["id"])
+        if verification_context_hashes(self.store, task["contract"], task_id, stage_id) != current["verification_context_sha256s"]:
+            extra.append("Action verification context changed during gate")
         if extra:
             result["blocked_reasons"] = list(dict.fromkeys(result["blocked_reasons"] + extra))
             result["reasons"] = list(dict.fromkeys(result["reasons"] + extra))

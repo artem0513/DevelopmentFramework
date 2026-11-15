@@ -17,7 +17,7 @@ class PacketService:
 
     def packet(self, task_id, stage_id=None):
         context = self.context
-        from ..source_coverage import source_availability, availability_gaps, source_bytes, bound_representation, read_persisted_intake
+        from ..source_coverage import source_availability, availability_gaps, source_bytes, bound_representation, read_persisted_intake, readable_source
         task = context.tasks.snapshot(task_id)
         row = context.store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
         discovery = json.loads(row[0]) if row else None
@@ -129,11 +129,15 @@ class PacketService:
                                             "limitation": "Body was not supplied or reviewed in this packet; current source hashes and declared stage impact remain visible"})
                     continue
                 if path in representations:
+                    raw = readable_source(context.store.repo, path)
                     represented = bound_representation(context.store.repo, representations[path])
+                    if raw is not None and not any(item["path"] == path for item in files):
+                        files.append(raw)
                     if not any(item["path"] == represented["path"] for item in files):
                         files.append(represented)
                     representation_metadata.append({**representations[path], "integrity": "Current artifact and readable representation bytes match both declared hashes",
-                                                    "limitation": "Representation adequacy requires independent domain judgment; native binary bytes are not interpreted by this transport"})
+                                                    "limitation": ("Readable raw source is supplied as authority; the representation is supplementary"
+                                                        if raw is not None else "Representation adequacy requires independent domain judgment; native binary bytes are not interpreted by this transport")})
                     continue
                 data = source_bytes(context.store.repo, path)
                 content = data.decode("utf-8")

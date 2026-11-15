@@ -261,6 +261,7 @@ def discover_capabilities(project, *, scope, backend_config):
     tools, skills = _capability_tools(backend_config)
     resources, dependencies, limitations, contents, directories = {}, [], [], {}, set()
     queue, inherited_edges = [], []
+    metadata_cache, metadata_origins = {}, set()
 
     def add(path, reason=None, origin=None, requirement=None):
         from .project_local import is_private_path
@@ -318,13 +319,19 @@ def discover_capabilities(project, *, scope, backend_config):
         add(item["path"], item["reason"], item.get("from"), item)
 
     def related_metadata(directory, origin):
-        try:
-            children = list(directory.iterdir())
-        except OSError:
-            limitations.append("Unable to list metadata in " + directory.relative_to(root).as_posix())
+        edge = (directory, origin)
+        if edge in metadata_origins:
             return
-        for child in sorted(children):
-            if child.name in _MARKERS or child.suffix.lower() in {".sln", ".slnx", ".csproj", ".fsproj", ".vbproj"}:
+        metadata_origins.add(edge)
+        if directory not in metadata_cache:
+            try:
+                metadata_cache[directory] = [child for child in sorted(directory.iterdir())
+                    if child.name in _MARKERS or child.suffix.lower() in {".sln", ".slnx", ".csproj", ".fsproj", ".vbproj"}]
+            except OSError:
+                metadata_cache[directory] = []
+                limitations.append("Unable to list metadata in " + directory.relative_to(root).as_posix())
+        for child in metadata_cache[directory]:
+            if child.relative_to(root).as_posix() != origin:
                 add(child.relative_to(root), "Project configuration/instructions governing " + origin, origin)
 
     while queue:
@@ -365,9 +372,8 @@ def discover_capabilities(project, *, scope, backend_config):
         # source contents. Each parent step is traceable to its original resource.
         parent = path if path.is_dir() else path.parent
         while parent.is_relative_to(root):
-            if parent not in directories:
-                directories.add(parent)
-                related_metadata(parent, relative)
+            directories.add(parent)
+            related_metadata(parent, relative)
             if parent == root:
                 break
             parent = parent.parent
@@ -549,6 +555,7 @@ def validate_discovery(payload):
     for item in _list(value.get("resources"), "resources", _MAX_RESOURCES):
         _object(item, {"path", "status", "type", "size", "sha256"}, "resource")
         path = _scope_path(item.get("path"))
+        item["path"] = path
         if path in resource_paths:
             raise ValueError("Duplicate resource path")
         resource_paths.add(path)

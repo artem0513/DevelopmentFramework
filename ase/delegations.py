@@ -5,10 +5,10 @@ from pathlib import Path, PureWindowsPath
 import uuid
 
 from .delegation_artifacts import attempt_root, load_result, seal_result
-from .gates import source_snapshot
+from .gates import source_snapshot, verification_context_hash
 from .native_paths import logical_path
 from .operations import OperationLedger
-from .state import append_event, hash_value, identifier, read_record, text, transaction, write_record
+from .state import append_event, encode, hash_value, identifier, read_record, text, transaction, write_record
 from .store import now
 from .tasks import TaskService
 
@@ -72,18 +72,32 @@ class DelegationRegistry:
             controller._available(task_id, 1)
         if not self.tasks.readiness(task_id, stage_id=stage_id)['discovery_present']:
             raise ValueError('Scoped discovery is required before native delegation')
-        for dependency in stage['depends_on']:
-            proof = read_record(self.store.db, 'stage', task_id + ':' + dependency)['payload'] or {}
-            if proof.get('state') != 'COMPLETED':
-                raise ValueError('Managed stage prerequisite is not complete: ' + dependency)
+        prerequisites = []
+        for owner, dependency in controller._prerequisite_stages(task, stage):
+            proof_record = read_record(self.store.db, 'stage', owner['task_id'] + ':' + dependency)
+            proof = proof_record['payload'] or {}
+            if (proof.get('state') != 'COMPLETED' or proof.get('contract_hash') != owner['contract_hash']
+                    or proof.get('proposal_hash') != owner['proposal_hash']):
+                raise ValueError('Managed stage prerequisite is not complete: ' + owner['task_id'] + ':' + dependency)
             from .gates import GateService
-            if GateService(self.store).gate(task_id, stage_id=dependency)['status'] != 'APPROVED':
-                raise ValueError('Managed stage prerequisite needs current proof: ' + dependency)
+            verdict = GateService(self.store).gate(owner['task_id'], stage_id=dependency)
+            if verdict['status'] != 'APPROVED':
+                raise ValueError('Managed stage prerequisite needs current proof: ' + owner['task_id'] + ':' + dependency)
+            prerequisites.append({'task_id': owner['task_id'], 'stage_id': dependency,
+                'stage_revision': proof_record['revision'], 'fingerprint': verdict['fingerprint'],
+                'verification_context_sha256': verdict['verification_context_sha256'],
+                'contract_hash': owner['contract_hash'], 'proposal_hash': owner['proposal_hash'],
+                'plan_hash': self.tasks.execution_plan(owner['task_id'])['plan_hash'],
+                'authority': controller._authority_binding(owner['task_id'])})
         source = source_snapshot(self.store, task['contract'], task_id=task_id)
         authority = controller._authority_binding(task_id) if allow_completed else controller._stage_authority(task, stage)
-        return {'authority': authority, 'source_fingerprint': source['fingerprint'],
+        binding = {'authority': authority, 'source_fingerprint': source['fingerprint'],
+            'verification_context_sha256': verification_context_hash(self.store, task['contract'], task_id, stage_id),
             'contract_hash': task['contract_hash'], 'proposal_hash': task['proposal_hash'],
             'plan_hash': self.tasks.execution_plan(task_id)['plan_hash']}
+        if prerequisites:
+            binding['prerequisites'] = prerequisites
+        return binding
 
     def _spec(self, task_id, spec):
         fields = {'id', 'stage_id', 'goal', 'expected_result', 'mode', 'resources', 'depends_on'}
@@ -427,8 +441,59 @@ class DelegationRegistry:
             if (row['task_id'], payload.get('work_id')) in identities:
                 events.append({'sequence': row['sequence'], 'kind': row['kind'], 'task_id': row['task_id'],
                     'payload': payload, 'created_at_utc': row['created']})
-        return {'task_id': task_id, 'work': selected, 'results': results, 'events': events,
+        evidence = {'task_id': task_id, 'work': selected, 'results': results, 'events': events,
             'authority': 'Host-captured advisory registry/history and hash-verified result manifests. Native handles are coordinator observations, not machine-authenticated provider execution or independent semantic AC.'}
+        # Preserve the existing small-history shape. Large histories use a
+        # complete identity index, leaving room for actual required source.
+        # Every result above is still loaded and hash-verified before either
+        # representation is selected; compaction never repairs invalid proof.
+        if len(encode(evidence).encode('utf-8')) <= 32768:
+            return evidence
+        return self._compact_packet_evidence(evidence)
+
+    def _compact_packet_evidence(self, evidence):
+        from .core import redact
+        contexts, index, states = {}, [], {}
+        for record in evidence['work']:
+            value = record['payload']
+            context = (value['task_id'], value['stage_id'])
+            if context not in contexts:
+                try:
+                    contexts[context] = {'sha256': hash_value(self._binding(*context, allow_completed=True))}
+                except (ValueError, OSError, KeyError, TypeError) as error:
+                    # This comparison is advisory identity provenance, never a
+                    # replacement for current authority or closure blockers.
+                    contexts[context] = {'sha256': None, 'unavailable_reason': redact(error)}
+            original = hash_value(value['binding'])
+            current = contexts[context]['sha256']
+            binding = {'original_sha256': original, 'current_sha256': current,
+                'status': 'UNAVAILABLE' if current is None else 'CURRENT' if current == original else 'CHANGED'}
+            if current is None:
+                binding['unavailable_reason'] = contexts[context]['unavailable_reason']
+            attempt = value.get('attempt')
+            sealed = evidence['results'].get(value['id'])
+            acceptance = value.get('acceptance')
+            index.append({'task_id': value['task_id'], 'work_id': value['id'],
+                'stage_id': value['stage_id'], 'revision': record['revision'], 'state': value['state'],
+                'record_sha256': hash_value(record), 'spec_sha256': value['spec_sha256'], 'binding': binding,
+                'attempt': None if attempt is None else {
+                    **{key: attempt[key] for key in ('id', 'backend', 'coordinator', 'context_sha256', 'native')},
+                    'dependencies_sha256': hash_value(attempt['dependencies'])},
+                'result': None if sealed is None else {'reference': value['result'],
+                    'manifest_sha256': hash_value(sealed), 'status': sealed['status'],
+                    'artifact_count': len(sealed['artifacts']), 'artifacts_sha256': hash_value(sealed['artifacts'])},
+                'acceptance': None if acceptance is None else {'sha256': hash_value(acceptance),
+                    **{key: acceptance[key] for key in ('kind', 'coordinator', 'result_sha256')}}})
+            states[value['state']] = states.get(value['state'], 0) + 1
+        return {'format': 'compact_advisory_index_v1', 'task_id': evidence['task_id'],
+            'project_id': self.store.project_id, 'workspace_id': self.store.workspace_id,
+            'root_task_id': self.root_task_id(evidence['task_id']), 'work_index': index,
+            'counts': {'work': len(index), 'results': len(evidence['results']), 'events': len(evidence['events']),
+                'unsettled': sum(count for state, count in states.items() if state not in {'ACCEPTED', 'CANCELLED'}), 'states': states},
+            'history_sha256': hash_value(evidence), 'history_bytes': len(encode(evidence).encode('utf-8')),
+            'omitted': {'specs_results_events': 'NOT_SUPPLIED_NOT_REVIEWED',
+                'details': 'Full specifications, result/acceptance summary text, artifact bodies and event history are omitted from this advisory transport. All selected identities are indexed; referenced manifests and artifact hashes were revalidated, not semantically reviewed. Full history is bound by history_sha256.'},
+            'authority': evidence['authority'] + ' Binding CURRENT means matching identity inputs only, not current approval. Unsettled work and result-integrity failures retain their independent closure guards.'}
 
     def snapshot(self, task_id):
         entries = self._entries(task_id)

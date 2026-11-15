@@ -89,6 +89,48 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn(".", packet["coverage"]["included"])
         self.assertIn("guide.md", packet["coverage"]["included"])
 
+    def test_structured_windows_resource_path_remains_usable_after_recording(self):
+        policy = self.store.repo / "shared" / "policy.md"
+        policy.parent.mkdir()
+        policy.write_text("Required policy", encoding="utf-8")
+        payload = discover_capabilities(self.store.project,
+            scope={"resources": ["guide.md", "shared/policy.md"]}, backend_config={})
+        next(item for item in payload["resources"] if item["path"] == "shared/policy.md")["path"] = "shared\\policy.md"
+        record_discovery(self.store, "approval-task", payload, expected_revision=0)
+        self.assertEqual(self.tasks.readiness("approval-task", "draft")["required_source_gaps"], [])
+        self.tasks.require_approval("approval-task", "draft")
+        self.assertIn("shared/policy.md", self.controller._packet("approval-task", "draft")["coverage"]["included"])
+
+    def representation(self, raw, text="Prepared summary"):
+        artifact = self.store.repo / "guide.md"
+        artifact.write_bytes(raw)
+        readable = self.store.repo / "guide.txt"
+        readable.write_text(text, encoding="utf-8")
+        payload = discover_capabilities(self.store.project, scope={"resources": ["guide.md"]}, backend_config={})
+        payload["representations"] = [{"artifact_path": "guide.md", "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+            "path": "guide.txt", "sha256": hashlib.sha256(readable.read_bytes()).hexdigest(), "method": "Prepared text extraction"}]
+        record_discovery(self.store, "approval-task", payload, expected_revision=0)
+
+    def test_readable_raw_authority_is_supplied_despite_representation(self):
+        self.representation(b"Authoritative policy: deployment is prohibited.", "Deployment is approved.")
+        packet = self.controller._packet("approval-task", "draft")
+        files = {item["path"]: item for item in packet["files"]}
+        self.assertIn("guide.md", files)
+        self.assertEqual(files["guide.md"]["content"], "Authoritative policy: deployment is prohibited.")
+        self.assertEqual(packet["coverage"]["missing"], [])
+
+    def test_oversized_readable_raw_authority_is_an_explicit_gap(self):
+        self.representation(b"x" * 512001)
+        packet = self.controller._packet("approval-task", "draft")
+        self.assertTrue(any("guide.md" in gap and "bound" in gap for gap in packet["coverage"]["missing"]))
+
+    def test_binary_nul_artifact_keeps_its_bound_representation(self):
+        self.representation(b"native\x00artifact", "Extracted native content")
+        packet = self.controller._packet("approval-task", "draft")
+        self.assertNotIn("guide.md", packet["coverage"]["included"])
+        self.assertEqual(next(item["content"] for item in packet["files"] if item["path"] == "guide.txt"), "Extracted native content")
+        self.assertEqual(packet["coverage"]["missing"], [])
+
     def test_gate_never_completes_unexecuted_stages(self):
         verdict = GateService(self.store).gate("approval-task")
         self.assertIn("Stage incomplete: draft", verdict["reasons"])

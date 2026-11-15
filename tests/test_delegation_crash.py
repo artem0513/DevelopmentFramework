@@ -157,7 +157,12 @@ class DelegationCrashTests(unittest.TestCase):
             actual = fixture.registry(store).get('delegated', 'race')
             self.assertEqual(actual['payload']['state'], 'DISPATCHING')
             self.assertEqual(actual['payload']['attempt']['id'], next(row['attempt_id'] for row in results if row['status'] == 'DISPATCHED'))
-            self.assertIsNone(read_record(store.db, 'budget', 'delegated')['payload'])
+            budget = read_record(store.db, 'budget', 'delegated')['payload'] or {}
+            self.assertEqual(budget.get('task_cycles', 0), 0)
+            self.assertEqual(budget.get('stages', {}), {})
+            self.assertEqual(budget.get('diagnostics', {}), {})
+            self.assertEqual(budget.get('active_seconds', 0), 0)
+            self.assertEqual(budget.get('active_by_task', {}), {})
 
     def test_hard_kill_after_dispatch_intent_never_repeats_unknown_native_launch(self):
         ready = self.kill_ready('dispatch')

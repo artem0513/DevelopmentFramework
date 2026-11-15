@@ -545,6 +545,26 @@ payload = {'criteria':[]} if 'criteria' in schema['properties'] else {'findings'
         self.assertEqual(manifest["stages"][0]["implementation_proposal"]["status"], "INVALID")
         self.assertTrue(packet["coverage"]["missing"])
 
+    def capture_protocol_prerequisite(self):
+        """Authentic history with a scheduler marker, never semantic approval."""
+        from ase.gates import GateService
+        trusted = self.base / "prerequisite-provider"
+        trusted.mkdir()
+        fixture = trusted / "provider.py"
+        body = "schema = json.loads(pathlib.Path(args[9]).read_text())\npayload = ({'criteria':[]} if 'criteria' in schema['properties'] else {'findings':[],'summary':'Protocol-only prerequisite history'})"
+        fixture.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}", body))
+        runner = Runner({"executable": sys.executable, "executable_args": [str(fixture), "success", "codex"],
+            "trusted_cwd": str(trusted), "protocol_only": True}, self.store.root / "tasks/evidence/sessions")
+        self.controller.check("evidence", "deliver")
+        for role, schema in (("ac", AC_SCHEMA), ("review", REVIEW_SCHEMA)):
+            receipt = runner.run(get_adapter("codex"), self.controller._request("evidence", role, schema,
+                {"stage_id": "deliver"}), timeout=5)["receipt"]
+            self.assertEqual(receipt["status"], "COMPLETE")
+            self.controller._save("verification", "evidence:" + role, receipt)
+        verdict = GateService(self.store).gate("evidence", "deliver")
+        self.assertEqual(verdict["status"], "BLOCKED", "Protocol history cannot supply actual AC")
+        self.controller._capture_stage("evidence", "deliver", {**verdict, "status": "APPROVED"})
+
     def candidate_until_recheck(self, stage, path, content, inspect=None):
         """Real runner/edit/DB path; stop at the scheduler-only recheck seam.
 
@@ -558,10 +578,18 @@ payload = {'criteria':[]} if 'criteria' in schema['properties'] else {'findings'
         payload = {"edits": [{"path": path, "operation": "write", "content": content,
             "before_sha256": hashlib.sha256(target.read_bytes()).hexdigest() if target.exists() else ""}],
             "summary": "Protocol-only stage attribution fixture"}
-        fixture.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}", "payload = " + repr(payload)))
+        body = "schema = json.loads(pathlib.Path(args[9]).read_text())\npayload = (" + repr(payload) + " if 'edits' in schema['properties'] else {'criteria':[]} if 'criteria' in schema['properties'] else {'findings':[],'summary':'Protocol-only scheduler seam'})"
+        fixture.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}", body))
         runner = Runner({"executable": sys.executable, "executable_args": [str(fixture), "success", "codex"],
             "trusted_cwd": str(trusted), "protocol_only": True}, self.store.root / "tasks/evidence/sessions")
         calls = []
+        actual_recheck, actual_verify = self.controller._revalidate_prerequisites, self.controller.verify
+        def protocol_only_scheduler_judgment(task_id, stage_id=None):
+            # Execute/capture the real protocol sessions; only the scheduler
+            # decision is substituted, while real receipts remain unapproved.
+            verdict = actual_verify(task_id, stage_id)
+            self.assertEqual(verdict["status"], "BLOCKED")
+            return {**verdict, "status": "APPROVED"}
         def scheduler_recheck(task, selected):
             calls.append(selected["id"])
             if len(calls) == 3:
@@ -569,8 +597,10 @@ payload = {'criteria':[]} if 'criteria' in schema['properties'] else {'findings'
                 if inspect:
                     inspect()
                 return ["Protocol-only stop after real candidate application"], None
-            return [], None
-        with patch.object(self.controller, "_revalidate_prerequisites", side_effect=scheduler_recheck):
+            return actual_recheck(task, selected)
+        with patch.object(self.controller, "runner", runner), \
+                patch.object(self.controller, "verify", side_effect=protocol_only_scheduler_judgment), \
+                patch.object(self.controller, "_revalidate_prerequisites", side_effect=scheduler_recheck):
             result = self.controller._run_stage(self.tasks.snapshot("evidence"), stage, runner, get_adapter("codex"), resume=False)
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(len(calls), 3)
@@ -580,9 +610,13 @@ payload = {'criteria':[]} if 'criteria' in schema['properties'] else {'findings'
         other = self.two_stages()
         contract = copy.deepcopy(self.task["contract"])
         contract["stages"][1]["depends_on"] = ["deliver"]
+        # This is guide attribution, so its prerequisite has no pending effect.
+        contract["stages"][0]["actions"] = []
+        contract["evidence"][0]["path"] = "guide.py"
         self.revise(contract)
         other = self.task["contract"]["stages"][1]
         original = self.proposal()
+        self.capture_protocol_prerequisite()
         inspected = []
         def inspect():
             manifest, packet = self.manifest()

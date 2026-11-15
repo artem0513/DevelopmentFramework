@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from ase.gates import GateService
-from ase.state import hash_value, read_record, write_record
+from ase.state import hash_value, read_record, transaction, write_record
 from ase.store import Store
 from ase.tasks import TaskService
 from ase.workflow import WorkflowController
@@ -77,15 +77,17 @@ class OperationAliasGateTests(unittest.TestCase):
         value['intent_hash']=hash_value(value['intent'])
         for field in ['action_hash','observing_task_id','observing_stage_id','observing_workspace_id']:
             value['observation'].pop(field,None)
-        write_record(self.store.db,'operation',key,value,expected_revision=record['revision'])
-        task=self.tasks.snapshot('aliases');payload={k:v for k,v in task.items() if k not in {'revision','legacy_v1'}}
-        payload['state']='COMPLETED';self.tasks._save(payload,task['revision'])
+        with transaction(self.store.db) as db:
+            write_record(db,'operation',key,value,expected_revision=record['revision'])
+            task=self.tasks.snapshot('aliases');payload={k:v for k,v in task.items() if k not in {'revision','legacy_v1'}}
+            payload['state']='COMPLETED';self.tasks._save(payload,task['revision'])
         self.assertEqual(self.action_reasons(),[])
         self.controller.check('aliases')
         self.assertEqual(self.action_reasons(),[])
         self.assertEqual((self.repo/'counter').read_text(),'1')
         with self.assertRaisesRegex(ValueError,'terminal'):
             self.execute()
+        self.assertEqual((self.repo/'counter').read_text(),'1')
 
 
 if __name__=='__main__':unittest.main()

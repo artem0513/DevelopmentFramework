@@ -38,6 +38,7 @@ class ActionContext(Protocol):
     _execute_command: Callable[..., Any]
     _observe_action: Callable[..., Any]
     _ownership: Callable[..., Any]
+    _prerequisite_stages: Callable[..., Any]
     _revalidate_prerequisites: Callable[..., Any]
     _stage_authority: Callable[..., Any]
     store: Any

@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import tempfile
@@ -223,6 +225,97 @@ if 'REQUEST_JSON:\\n' in input_text:
         gate = GateService(store).gate(task_id, stage_id="deliver")
         self.assertEqual(gate["profile_evidence"]["status"], "PASS")
         self.assertFalse(any("outside selected" in reason or "Source log missing" in reason for reason in gate["reasons"]))
+
+    def sqlite_home(self, length):
+        home = self.base
+        while len(str(home)) + 61 < length:
+            home /= "s" * 60
+        if len(str(home)) < length:
+            home /= "s" * (length - len(str(home)) - 1)
+        physical(home).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(len(str(home)), length)
+        return home
+
+    @unittest.skipUnless(os.name == "nt", "requires actual Windows SQLite path handling")
+    def test_store_wal_and_backup_cross_windows_path_limit_with_logical_identity(self):
+        repo = self.base / "work"
+        repo.mkdir()
+        home = self.sqlite_home(197)
+        try:
+            store = Store(repo, home)
+        except (OSError, sqlite3.Error) as error:
+            self.fail("Pre-created valid state must initialize SQLite across its journal boundary: " + str(error))
+        try:
+            database = store.root / "memory.sqlite3"
+            self.assertEqual(len(str(database)), 258)
+            self.assertGreater(len(str(database) + "-journal"), 260)
+            self.assertGreater(len(str(database) + "-wal"), 260)
+            self.assertGreater(len(str(database) + "-shm"), 260)
+            with transaction(store.db):
+                write_record(store.db, "long-path", "fact", {"retained": True}, expected_revision=0)
+            self.assertTrue(physical(Path(str(database) + "-wal")).is_file())
+            self.assertTrue(physical(Path(str(database) + "-shm")).is_file())
+            backup = store.backup()
+            self.assertGreater(len(backup), 260)
+            self.assertNotIn("\\\\?\\", backup)
+            with closing(sqlite3.connect(physical(Path(backup)))) as db:
+                self.assertEqual(json.loads(db.execute("SELECT payload FROM runtime_records WHERE kind='long-path'").fetchone()[0]), {"retained": True})
+            self.assertEqual(store.project.state_home, home)
+            self.assertEqual(store.project.root, repo)
+            self.assertNotIn("\\\\?\\", str(store.root))
+        finally:
+            store.close()
+        with closing(Store(repo, home)) as reopened:
+            self.assertEqual(read_record(reopened.db, "long-path", "fact")["payload"], {"retained": True})
+
+    @unittest.skipUnless(os.name == "nt", "requires actual Windows SQLite path handling")
+    def test_legacy_migration_and_original_backup_cross_windows_path_limit(self):
+        from test_schema_v5 import V4_SCHEMA
+        repo = self.base / "work"
+        repo.mkdir()
+        home = self.sqlite_home(209)
+        legacy_key = hashlib.sha256(os.path.normcase(str(repo)).encode()).hexdigest()[:24]
+        folder = home / "projects" / legacy_key
+        physical(folder).mkdir(parents=True)
+        database = folder / "memory.sqlite3"
+        self.assertEqual(len(str(database)), 258)
+        with closing(sqlite3.connect(physical(database))) as db, db:
+            db.executescript(V4_SCHEMA)
+            db.execute("INSERT INTO projects VALUES(?,?,?,?)", (legacy_key, str(repo), "{}", "2026-01-01"))
+            db.execute("INSERT INTO tasks VALUES(?,?,?,?,?,?)", ("old", "Preserve migrated request", "PLANNED", "{}", "2026-01-01", "2026-01-01"))
+        try:
+            store = Store(repo, home)
+        except (OSError, sqlite3.Error) as error:
+            self.fail("Valid long legacy SQLite state must migrate: " + str(error))
+        try:
+            self.assertEqual(store.project.storage_key, legacy_key)
+            self.assertEqual(store.task("old")["request"], "Preserve migrated request")
+            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 5)
+        finally:
+            store.close()
+        backups = list(physical(folder / "backups").glob("*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        self.assertGreater(len(str(folder / "backups" / backups[0].name)), 260)
+        with closing(sqlite3.connect(backups[0])) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("SELECT request FROM tasks").fetchone()[0], "Preserve migrated request")
+
+    @unittest.skipUnless(os.name == "nt", "requires actual Windows SQLite path handling")
+    def test_registry_journal_crosses_windows_path_limit(self):
+        from ase.projects import ProjectRegistry
+        home = self.sqlite_home(237)
+        self.assertGreater(len(str(home / "registry.sqlite3") + "-journal"), 260)
+        try:
+            registry = ProjectRegistry(home)
+        except (OSError, sqlite3.Error) as error:
+            self.fail("Pre-created valid registry home must initialize across its journal boundary: " + str(error))
+        try:
+            self.assertEqual(registry.state_home, home)
+            self.assertEqual(registry.db.execute("PRAGMA user_version").fetchone()[0], 1)
+        finally:
+            registry.close()
+        with closing(ProjectRegistry(home)) as reopened:
+            self.assertEqual(reopened.db.execute("SELECT count(*) FROM projects").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

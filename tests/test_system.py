@@ -824,6 +824,132 @@ print(json.dumps({'type':'agent.complete','fixture':True,'role':role}))
         self.assertEqual(receipt["results"][0]["exit_code"], 0)
 
 
+
+class LegacyStartTests(unittest.TestCase):
+    """A failed legacy start is retryable without damaging existing evidence."""
+    setUp = SystemTests.setUp
+    git = SystemTests.git
+    cli = SystemTests.cli
+
+    def _engine(self):
+        from ase.core import Engine
+        engine = Engine(self.repo, self.home)
+        self.addCleanup(engine.store.close)
+        return engine
+
+    def _contract(self, task_id="start-retry"):
+        return {"id": task_id, "request": "Preserve integer addition",
+                "commands": [{"id": "unit", "argv": [sys.executable, "-m", "unittest", "discover", "-v"],
+                              "kind": "test", "required": True, "parser": "unittest"}],
+                "acceptance": [{"id": "AC1", "expected": "2 + 3 returns 5", "commands": ["unit"]}]}
+
+    def _assert_absent(self, engine, task_id):
+        self.assertIsNone(engine.store.db.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone())
+        self.assertIsNone(engine.store.db.execute("SELECT id FROM transitions WHERE task_id=?", (task_id,)).fetchone())
+        self.assertFalse((engine.store.root / "tasks" / task_id).exists())
+
+    def test_start_hardlinked_source_api_failure_can_retry_same_id(self):
+        engine = self._engine()
+        alias = self.base / "app-alias.py"
+        os.link(self.repo / "app.py", alias)
+        with self.assertRaisesRegex(ValueError, "Hardlinked source"):
+            engine.start(self._contract())
+        self._assert_absent(engine, "start-retry")
+        alias.unlink()
+        result = engine.start(self._contract())
+        self.assertEqual(result["status"], "PLANNED")
+        self.assertEqual(engine._contract("start-retry")["request"], "Preserve integer addition")
+        self.assertTrue((Path(result["state_dir"]) / "baseline.json").is_file())
+
+    def test_start_hardlinked_source_public_cli_failure_can_retry_same_id(self):
+        engine = self._engine()
+        alias = self.base / "cli-app-alias.py"
+        os.link(self.repo / "app.py", alias)
+        contract = self.base / "public-contract.json"
+        contract.write_text(json.dumps(self._contract()), encoding="utf-8")
+        def start():
+            return subprocess.run([sys.executable, "-B", "-m", "ase", "--repo", str(self.repo),
+                "--home", str(self.home), "start", str(contract)], cwd=ROOT, env=self.env,
+                capture_output=True, text=True, timeout=60)
+        failed = start()
+        self.assertEqual(failed.returncode, 3, failed.stdout + failed.stderr)
+        self.assertIn("Hardlinked source", json.loads(failed.stdout)["error"])
+        self._assert_absent(engine, "start-retry")
+        alias.unlink()
+        retried = start()
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(json.loads(retried.stdout)["task_id"], "start-retry")
+        self.assertEqual(engine._contract("start-retry")["request"], "Preserve integer addition")
+
+    def test_start_replace_failure_cleans_prepared_files_and_can_retry(self):
+        from unittest.mock import patch
+        engine = self._engine()
+        replace = os.replace
+        for name in ("baseline.json", "contract.json"):
+            with self.subTest(failed_write=name):
+                task_id = "write-" + name.split(".")[0]
+                def fail_replace(source, target):
+                    if Path(target).name == name:
+                        raise OSError("injected task preparation write failure")
+                    return replace(source, target)
+                with patch("ase.core.os.replace", side_effect=fail_replace):
+                    with self.assertRaisesRegex(OSError, "preparation write failure"):
+                        engine.start(self._contract(task_id))
+                self._assert_absent(engine, task_id)
+                self.assertEqual(engine.start(self._contract(task_id))["status"], "PLANNED")
+
+    def test_start_transition_failure_rolls_back_preparation_and_can_retry(self):
+        engine = self._engine()
+        engine.store.db.execute("CREATE TRIGGER reject_start_transition BEFORE INSERT ON transitions "
+            "WHEN NEW.task_id='start-retry' BEGIN SELECT RAISE(ABORT, 'injected transition failure'); END")
+        engine.store.db.commit()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "transition failure"):
+            engine.start(self._contract())
+        self._assert_absent(engine, "start-retry")
+        engine.store.db.execute("DROP TRIGGER reject_start_transition")
+        self.assertEqual(engine.start(self._contract())["status"], "PLANNED")
+
+    def test_start_duplicate_preserves_existing_task_and_evidence(self):
+        engine = self._engine()
+        result = engine.start(self._contract())
+        folder = Path(result["state_dir"])
+        (folder / "retained-evidence.json").write_text('{"retain": true}', encoding="utf-8")
+        evidence = {p.name: p.read_bytes() for p in folder.iterdir()}
+        task = engine.store.task("start-retry")
+        transitions = [tuple(row) for row in engine.store.db.execute("SELECT * FROM transitions")]
+        with self.assertRaises(sqlite3.IntegrityError):
+            engine.start({**self._contract(), "request": "A duplicate must not overwrite prior evidence"})
+        self.assertEqual(engine.store.task("start-retry"), task)
+        self.assertEqual({p.name: p.read_bytes() for p in folder.iterdir()}, evidence)
+        self.assertEqual([tuple(row) for row in engine.store.db.execute("SELECT * FROM transitions")], transitions)
+
+    def test_start_preexisting_folder_is_preserved_without_reserving_task(self):
+        engine = self._engine()
+        folder = engine.store.root / "tasks" / "start-retry"
+        folder.mkdir(parents=True)
+        retained = folder / "existing-evidence.json"
+        retained.write_text("retained", encoding="utf-8")
+        with self.assertRaises(FileExistsError):
+            engine.start(self._contract())
+        self.assertIsNone(engine.store.db.execute("SELECT id FROM tasks WHERE id='start-retry'").fetchone())
+        self.assertEqual(retained.read_text(encoding="utf-8"), "retained")
+        self.assertEqual(list(folder.iterdir()), [retained])
+
+    def test_start_rejects_caller_transaction_without_committing_or_rolling_it_back(self):
+        engine = self._engine()
+        engine.store.db.execute("INSERT INTO decisions(task_id,context,decision,rationale,created) "
+            "VALUES(NULL,'caller-owned','pending','retain caller control','2026-11-15')")
+        with self.assertRaisesRegex(ValueError, "transaction"):
+            engine.start(self._contract())
+        self.assertTrue(engine.store.db.in_transaction)
+        self._assert_absent(engine, "start-retry")
+        with closing(sqlite3.connect(engine.store.root / "memory.sqlite3")) as observer:
+            self.assertEqual(observer.execute("SELECT COUNT(*) FROM decisions WHERE context='caller-owned'").fetchone()[0], 0)
+        self.assertEqual(engine.store.db.execute("SELECT COUNT(*) FROM decisions WHERE context='caller-owned'").fetchone()[0], 1)
+        engine.store.db.rollback()
+        self.assertEqual(engine.store.db.execute("SELECT COUNT(*) FROM decisions WHERE context='caller-owned'").fetchone()[0], 0)
+
+
 class InstallationTests(unittest.TestCase):
     def test_preserves_existing_configuration_and_backs_up_managed_changes(self):
         with tempfile.TemporaryDirectory(prefix="ase-install-") as temp:
