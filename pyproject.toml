@@ -12,8 +12,8 @@ dependencies = []
 [project.scripts]
 ase = "ase.__main__:main"
 
-[tool.setuptools]
-packages = ["ase", "ase.adapters"]
+[tool.setuptools.packages.find]
+include = ["ase", "ase.*"]
 
 [tool.setuptools.package-data]
 ase = ["data/timezones/*", "data/timezones/**/*", "data/runtime_policy.json"]

@@ -73,10 +73,11 @@ def _bundle():
 
 def _identity(bundle):
     # Guidance and its delivery semantics both invalidate existing approval.
-    engine = {name: sha256(Path(__file__).with_name(name).read_bytes()) for name in
-        ('runtime_policy.py', 'protocol.py', 'runner.py', 'workflow.py', 'gates.py',
-         'edit_application.py', 'local_edit_intent.py', 'inspection.py', 'candidate_capture.py',
-         'delegations.py', 'delegation_artifacts.py', '__main__.py', 'publishing.py', 'continuity.py')}
+    # Functional services now live in subpackages. Bind the complete installed
+    # engine so moving logic out of a facade cannot leave old approval current.
+    package = Path(__file__).parent
+    engine = {path.relative_to(package).as_posix(): sha256(path.read_bytes())
+              for path in sorted(package.rglob('*.py'))}
     return sha256(canonical({'bundle': bundle, 'engine': engine}))
 
 

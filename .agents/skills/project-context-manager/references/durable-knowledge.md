@@ -8,6 +8,10 @@ Use `knowledge-record --file PATH` with templates/knowledge.json. Each claim car
 
 Knowledge is dated history, not a promise that code still behaves that way. Reverify drift-prone facts against current sources before acting. New evidence replaces a claim by recording a new dated claim with supersedes equal to the prior claim id. The old record remains available and visibly superseded. A stale or mismatched supersession must fail; query the latest records, reconcile and retry. Never erase an inconvenient decision or treat a past approval as new authority.
 
+Use `knowledge retrieve` with relevant scope to check current dependencies. `source_validity` describes freshness; effective `CONFLICT`/`review_required` marks unresolved overlapping same-topic alternatives, including conflicting prerequisites. A claim selector cannot hide its peers. This is a conservative review trigger, not a semantic contradiction verdict. Resolve applicable alternatives from evidence and explicit supersession before using them as an uncontested fact.
+
+`ase context` retains the latest summary plus dated `task_contexts` from other tasks. Each session closure also records a `task-summary:ID` historical claim; it does not automatically become CURRENT or replace unrelated business topics. Legacy contexts without a workspace binding are labelled; verify their relevance. Save reusable source-backed business/technical facts explicitly with their own topic and dependencies.
+
 Run `knowledge-lint` when reviewing accumulated knowledge or before a substantial handoff. Multiple unsuperseded claims for one topic require review; that signal is not proof of a semantic contradiction. Resolve conflicting evidence in the actual task and append the justified history. No recurring automation is created by this instruction.
 
 SQLite is canonical. Markdown exports and indexes may be disposable views only. Task progress stays in the revision-checked checkpoint; knowledge records explain durable decisions without becoming a second task tracker or an alternative quality gate. No blanket subagent delegation or environment changes are implied.

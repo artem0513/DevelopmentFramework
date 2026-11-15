@@ -108,9 +108,13 @@ class UniversalCLITests(unittest.TestCase):
         self.assertTrue(worklog["events"])
         self.cli("meeting", "--start", "2026-01-01", "--until", "2027-01-01")
         knowledge = self.cli("knowledge", "retrieve", "--file", self.payload({"scope": {}}))
-        self.assertEqual(knowledge["claims"], [])
-        observations = self.cli("knowledge", "observations", "--expected-revision", "0", "--file", self.payload({"observations": [], "dependencies": []}))
-        self.assertEqual(observations["revision"], 1)
+        self.assertEqual(len(knowledge["claims"]), 1)
+        self.assertEqual(knowledge["claims"][0]["topic"], "task-summary:guide")
+        self.assertEqual(knowledge["claims"][0]["validity"], "UNKNOWN")
+        self.assertEqual(knowledge["claims"][0]["source_validity"], "UNKNOWN")
+        self.cli("knowledge", "observations", "--expected-revision", "0", "--file", self.payload({"observations": [], "dependencies": []}), ok=3)
+        observations = self.cli("knowledge", "observations", "--expected-revision", str(knowledge["revision"]), "--file", self.payload({"observations": [], "dependencies": []}))
+        self.assertEqual(observations["revision"], knowledge["revision"] + 1)
 
     def test_public_legacy_execution_is_blocked_before_invocation(self):
         with closing(Store(self.root, self.home)) as store, store.db:
@@ -138,7 +142,13 @@ class UniversalCLITests(unittest.TestCase):
     def test_packaging_contains_adapter_and_timezone_assets(self):
         settings = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         packaging = settings["tool"]["setuptools"]
-        self.assertIn("ase.adapters", packaging.get("packages", []))
+        import fnmatch
+        configured = packaging.get("packages", [])
+        patterns = configured.get("find", {}).get("include", []) if isinstance(configured, dict) else configured
+        packages = {".".join(path.parent.relative_to(ROOT).parts) for path in (ROOT / "ase").rglob("__init__.py")}
+        self.assertIn("ase.adapters", packages)
+        for package in packages:
+            self.assertTrue(any(fnmatch.fnmatchcase(package, pattern) for pattern in patterns), package)
         self.assertIn("data/timezones/*", packaging.get("package-data", {}).get("ase", []))
 
     def test_non_git_init_and_legacy_task_revision(self):

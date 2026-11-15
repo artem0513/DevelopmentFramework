@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlsplit
 import uuid
 
 from .continuity import _strings, _text
+from .memory.conflicts import conflicting_alternatives
 from .store import now
 from .state import append_event, read_record, text, transaction, write_record
 
@@ -290,8 +291,10 @@ class Knowledge:
         return {"revision": revision, "workspace_id": self.store.workspace_id,
                 "observations": observations, "dependency_discovery_complete": False}
 
-    def _save_validity(self, claim_id, validity, reasons):
-        payload = {"workspace_id": self.store.workspace_id, "validity": validity, "reasons": sorted(set(reasons))}
+    def _save_validity(self, claim_id, validity, reasons, *, source_validity=None, conflicts=None):
+        payload = {"workspace_id": self.store.workspace_id, "validity": validity, "reasons": sorted(set(reasons)),
+                   "source_validity": source_validity or validity, "conflicts": conflicts or [],
+                   "review_required": bool(conflicts)}
         if self._save("knowledge_validity", str(claim_id), payload):
             self._event("knowledge_validity", {"claim_id": claim_id, **payload})
             return True
@@ -324,8 +327,9 @@ class Knowledge:
         """Check declared dependencies without interpreting or rewriting claims.
 
         Scope selects roots; their explicit claim dependencies are followed even
-        outside the selected topic. No directory crawl or implicit discovery is
-        performed. A returned CURRENT observation never grants authority.
+        outside the selected topic. Active alternatives are checked independently
+        of root selection. Source freshness is separate from unresolved review.
+        No semantic contradiction detection or implicit source discovery occurs.
         """
         if type(refresh) is not bool:
             raise ValueError("refresh must be boolean")
@@ -382,6 +386,28 @@ class Knowledge:
                 needed.add(claim_id)
                 if (metadata.get(claim_id) or {}).get("workspace_id") == self.store.workspace_id:
                     pending.extend(edge["depends_on_claim_id"] for edge in dependencies.get(claim_id, []) if "depends_on_claim_id" in edge)
+            # Select relevant topics first, but retain every active peer in
+            # them: a claim/source selector cannot hide an alternative. Old or
+            # unrelated paths must not break a healthy scoped retrieval.
+            topics = {all_claims[key]["topic"] for key in needed if key in all_claims}
+            candidates, unresolved_scopes = [], []
+            for claim_id, claim in all_claims.items():
+                meta = metadata[claim_id]
+                if (claim["superseded_by"] is not None or claim["topic"] not in topics
+                        or not meta or meta["workspace_id"] != self.store.workspace_id):
+                    continue
+                applicability = dict(meta["scope"])
+                try:
+                    applicability["paths"] = [str(self._local_path("local:" + item, allow_shared_reference=True))
+                                              for item in applicability.get("paths", [])]
+                except (OSError, ValueError):
+                    # Keep canonical in-workspace aliases when resolvable.
+                    # Drift outside the workspace never authorizes a read and
+                    # cannot establish disjointness; broaden this dimension.
+                    applicability["paths"] = []
+                    unresolved_scopes.append(claim_id)
+                candidates.append({**claim, "scope": applicability})
+            peers = conflicting_alternatives(candidates)
             source_ids = {edge["source_id"] for claim_id in needed
                           if (metadata.get(claim_id) or {}).get("workspace_id") == self.store.workspace_id
                           for edge in dependencies.get(claim_id, []) if "source_id" in edge}
@@ -463,14 +489,36 @@ class Knowledge:
                 return validity, sorted(set(reasons)), live
 
             annotated = []
-            evaluated = {key: evaluate(key) for key in needed if key in all_claims}
+            source_evaluated = {key: evaluate(key) for key in needed if key in all_claims}
+            evaluated = {}
+            for root, (source_validity, source_reasons, live) in source_evaluated.items():
+                conflicts, seen, pending = [], set(), [root]
+                while pending and source_validity != "SUPERSEDED":
+                    claim_id = pending.pop()
+                    if claim_id in seen:
+                        continue
+                    seen.add(claim_id)
+                    if (metadata.get(claim_id) or {}).get("workspace_id") != self.store.workspace_id:
+                        continue
+                    if claim_id in peers:
+                        conflicts.append({"claim_id": claim_id, "alternative_claim_ids": peers[claim_id]})
+                    pending.extend(edge["depends_on_claim_id"] for edge in dependencies.get(claim_id, [])
+                                   if "depends_on_claim_id" in edge)
+                conflicts.sort(key=lambda item: item["claim_id"])
+                reasons = list(source_reasons)
+                for conflict in conflicts:
+                    reasons.append("Claim " + str(conflict["claim_id"]) + " has unresolved overlapping same-topic alternatives: "
+                                   + ", ".join(map(str, conflict["alternative_claim_ids"])) + "; review required")
+                evaluated[root] = ("CONFLICT" if conflicts else source_validity, sorted(set(reasons)), live,
+                                   source_validity, conflicts)
             for claim_id in sorted(needed):
                 if claim_id not in evaluated:
                     continue
-                validity, reasons, live = evaluated[claim_id]
+                validity, reasons, live, source_validity, conflicts = evaluated[claim_id]
                 meta = metadata[claim_id]
                 if refresh and meta and meta["workspace_id"] == self.store.workspace_id:
-                    dirty |= self._save_validity(claim_id, validity, reasons)
+                    dirty |= self._save_validity(claim_id, validity, reasons,
+                                                source_validity=source_validity, conflicts=conflicts)
             revision = self._revision()
             if dirty:
                 revision = self._bump(revision)
@@ -484,11 +532,13 @@ class Knowledge:
                 if event["workspace_id"] == self.store.workspace_id and event["observation"]["source_id"] in source_ids:
                     observation_history.append({"sequence": row["sequence"], "recorded_at_utc": row["created"], **event})
             for claim_id in selected:
-                validity, reasons, live = evaluated[claim_id]
+                validity, reasons, live, source_validity, conflicts = evaluated[claim_id]
                 cached = read_record(self.store.db, "knowledge_validity", str(claim_id))["payload"] or {}
                 meta = metadata[claim_id] or {"kind": "fact", "scope": {}, "workspace_id": None, "refresh_policy": {}}
                 annotated.append({**all_claims[claim_id], **meta, "validity": validity, "reasons": reasons,
+                    "source_validity": source_validity, "review_required": bool(conflicts), "conflicts": conflicts,
                     "dependencies": dependencies[claim_id], "pre_mutation_probe_required": live or meta["kind"] == "infrastructure",
+                    "last_verified_source_validity": cached.get("source_validity", cached.get("validity", "UNKNOWN")),
                     "last_verified_validity": cached.get("validity", "UNKNOWN"), "validity_history": histories.get(claim_id, [])})
         return {"repository": str(self.store.repo), "project_id": self.store.project_id,
                 "workspace_id": self.store.workspace_id, "revision": revision, "scope": selected_scope,
@@ -497,7 +547,10 @@ class Knowledge:
                 "observation_history": observation_history,
                 "pre_mutation_probe_required": any(claim["pre_mutation_probe_required"] for claim in annotated),
                 "dependency_discovery_complete": False,
+                "semantic_validation": False,
+                "unresolved_applicability_claim_ids": sorted(unresolved_scopes),
                 "limitations": ["CURRENT checks declared dependencies only; it does not establish complete discovery or semantic truth",
+                    "CONFLICT requires review of distinct overlapping same-topic alternatives; it does not prove semantic contradiction",
                     "Historical decisions retain their recorded scope; current user instructions take precedence",
                     "Live resource state must be probed immediately before each mutation; cached observations grant no authority"],
                 "authority": "Historical recorded claims only; verify current code and user authority before acting"}

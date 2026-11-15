@@ -360,198 +360,36 @@ class WorkflowController:
             return self._execute_actions(task_id, stage)
 
     def _access_stage(self, task_id, spec, stage_id=None, *, allow_terminal=False):
-        from .credentials import CredentialError
-        access = validate_access(spec["access"])
-        task = self.tasks.snapshot(task_id)
-        plan = self.tasks.execution_plan(task_id)
-        for stage in task["contract"]["stages"]:
-            if stage_id is not None and stage["id"] != stage_id:
-                continue
-            if access["target"] not in stage["scope"]["resources"]:
-                continue
-            selected = stage_checks(task["contract"], plan["checks"], stage["id"])
-            declared = [*selected, *stage.get("actions", [])]
-            if not any(item.get("id") == spec.get("id") and item.get("access") == access for item in declared):
-                continue
-            try:
-                self.tasks.require_approval(task_id, stage["id"], allow_terminal=allow_terminal)
-            except ValueError:
-                if stage_id is not None:
-                    raise
-                continue
-            return stage
-        raise CredentialError("access_scope_denied")
+        from .execution.actions import ActionService
+        return ActionService(self).access_stage(task_id, spec, stage_id, allow_terminal=allow_terminal)
 
     def _access_client(self):
-        from .access import CredentialAccess
-        from .credentials import CredentialVault
-        return CredentialAccess(CredentialVault(self.store.state_home))
+        from .execution.actions import ActionService
+        return ActionService(self).access_client()
 
     def _execute_command(self, task_id, spec, argv, log, timeout, stage_id=None, *, allow_terminal=False, prerequisite_binding=None, authority_binding=None):
-        from .core import execute
-        if stage_id is None:
-            raise ValueError("Command requires its actual approved stage")
-        stage = next(s for s in self.tasks.snapshot(task_id)["contract"]["stages"] if s["id"] == stage_id)
-        if (stage["depends_on"] and spec in stage.get("actions", [])
-                and list(argv) == spec["argv"] and prerequisite_binding is None):
-            raise ValueError("Dependent effect requires current prerequisite evidence binding")
-        cancel, launch_guard = self._command_control(task_id, spec, stage_id, allow_terminal=allow_terminal,
-            prerequisite_binding=prerequisite_binding, authority_binding=authority_binding)
-        if "access" not in spec:
-            return execute(argv, self.store.repo, log, timeout, cancel_requested=cancel, launch_guard=launch_guard)
-        self._access_stage(task_id, spec, stage_id, allow_terminal=allow_terminal)
-        access = spec["access"]
-        receipt = self._access_client().run(access["credential_ref"], access["target"], argv, self.store.repo,
-            log, timeout=timeout, cancel_requested=cancel, launch_guard=launch_guard)
-        with transaction(self.store.db) as db:
-            append_event(db, "access:" + uuid.uuid4().hex, "access_used", task_id, receipt["access"])
-        return receipt
+        from .execution.actions import ActionService
+        return ActionService(self).execute_command(task_id, spec, argv, log, timeout, stage_id, allow_terminal=allow_terminal, prerequisite_binding=prerequisite_binding, authority_binding=authority_binding)
 
     def _declared_access(self, task_id, stage_id, access):
-        from .credentials import CredentialError
-        validate_access(access)
-        task = self.tasks.snapshot(task_id)
-        stage = next((s for s in task["contract"]["stages"] if s["id"] == stage_id), None)
-        if stage is None:
-            raise CredentialError("access_scope_denied")
-        declared = [*stage_checks(task["contract"], self.tasks.execution_plan(task_id)["checks"], stage_id), *stage.get("actions", [])]
-        spec = next((item for item in declared if item.get("access") == access), None)
-        if spec is None:
-            raise CredentialError("access_not_planned")
-        self._access_stage(task_id, spec, stage_id)
-        return spec
+        from .execution.actions import ActionService
+        return ActionService(self).declared_access(task_id, stage_id, access)
 
     def ensure_access(self, task_id, stage_id, access):
-        with self._ownership(task_id):
-            with transaction(self.store.db):
-                self.tasks.require_approval(task_id, stage_id)
-                authority = self._authority_binding(task_id)
-            spec = self._declared_access(task_id, stage_id, access)
-            cancel, launch_guard = self._command_control(task_id, spec, stage_id, authority_binding=authority)
-            return self._call(task_id, lambda timeout: self._access_client().ensure(
-                access["credential_ref"], access["target"], timeout=timeout,
-                cancel_requested=cancel, launch_guard=launch_guard), 60)
+        from .execution.actions import ActionService
+        return ActionService(self).ensure_access(task_id, stage_id, access)
 
-    def request_access(self, task_id, stage_id, access, path="/", method="GET"):
-        with self._ownership(task_id):
-            with transaction(self.store.db):
-                self.tasks.require_approval(task_id, stage_id)
-                authority = self._authority_binding(task_id)
-            spec = self._declared_access(task_id, stage_id, access)
-            cancel, launch_guard = self._command_control(task_id, spec, stage_id, authority_binding=authority)
-            return self._call(task_id, lambda timeout: self._access_client().request(
-                access["credential_ref"], access["target"], path=path, method=method, timeout=timeout,
-                cancel_requested=cancel, launch_guard=launch_guard), 30)
+    def request_access(self, task_id, stage_id, access, path='/', method='GET'):
+        from .execution.actions import ActionService
+        return ActionService(self).request_access(task_id, stage_id, access, path, method)
 
     def _observe_action(self, task_id, stage, action, folder, *, allow_terminal=False, authority_binding=None):
-        # Capture the observer's declaration before any authentication/process
-        # work. Later aliases must retain this origin rather than relabel it.
-        with transaction(self.store.db):
-            current_authority = self._command_authority(task_id, action, stage["id"], allow_terminal=allow_terminal)
-            authority = current_authority if authority_binding is None else authority_binding
-            if current_authority != authority:
-                raise ValueError("Approved observation authority changed during preparation")
-            task = self.tasks.snapshot(task_id)
-            declared_stage = next(item for item in task["contract"]["stages"] if item["id"] == stage["id"])
-            if "scope" in stage and stage["scope"] != declared_stage["scope"]:
-                raise ValueError("Observation stage scope differs from current declaration")
-            provenance = {"version": 2, "kind": "observation", "task_id": task_id, "stage_id": stage["id"],
-                "project_id": self.store.project_id, "workspace_id": self.store.workspace_id,
-                "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"], "plan_hash": authority["plan_hash"],
-                "action_sha256": hash_value(action), "argv_sha256": hash_value(action["argv"]),
-                "observation_argv_sha256": hash_value(action["observation_argv"]), "declared_stage": declared_stage,
-                "authority": authority, "execution_plan_checks": self.tasks.execution_plan(task_id)["checks"]}
-        proof = self._call(task_id, lambda timeout: self._execute_command(task_id, action,
-            action["observation_argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"],
-            allow_terminal=allow_terminal, authority_binding=authority), action.get("timeout", 300))
-        if proof.get("exit_code") != 0 or proof.get("error") or proof.get("timed_out") or proof.get("cancelled"):
-            raise ValueError("Resource observation failed; effect remains UNKNOWN")
-        try:
-            value = json.loads(state_io(proof["log"]).read_text(encoding="utf-8"))
-        except ValueError:
-            raise ValueError("Resource observation is not structured JSON; effect remains UNKNOWN") from None
-        if (not isinstance(value, dict) or type(value.get("exists")) is not bool
-                or (value["exists"] and (not isinstance(value.get("resource_id"), str)
-                    or "[REDACTED]" in value["resource_id"]))):
-            raise ValueError("Resource observation must prove exists and a nonsecret resource_id")
-        observation = {"exists": value["exists"], "resource_id": value.get("resource_id"), "proof_ref": proof["log"] + "#sha256=" + proof["log_sha256"],
-                       "action_hash": hash_value(action), "observing_task_id": task_id, "observing_stage_id": stage["id"],
-                       "observing_workspace_id": self.store.workspace_id}
-        if "absence_confirmed" in value:
-            if type(value["absence_confirmed"]) is not bool:
-                raise ValueError("Resource absence_confirmed must be boolean")
-            observation["absence_confirmed"] = value["absence_confirmed"]
-        if "provider_attempt_id" in value:
-            text(value["provider_attempt_id"], "Provider attempt ID", limit=2000)
-            if "[REDACTED]" in value["provider_attempt_id"]:
-                raise ValueError("Provider attempt identity must be nonsecret and actual")
-            observation["provider_attempt_id"] = value["provider_attempt_id"]
-        if "access" in proof:
-            observation["access"] = proof["access"]
-        provenance["command_receipt"] = proof
-        provenance["command_receipt_sha256"] = hash_value(proof)
-        provenance["sha256"] = hash_value(provenance)
-        observation["provenance"] = provenance
-        return observation
+        from .execution.actions import ActionService
+        return ActionService(self).observe_action(task_id, stage, action, folder, allow_terminal=allow_terminal, authority_binding=authority_binding)
 
     def _execute_actions(self, task_id, stage):
-        """Probe actual state before every effect, including uncertain resumes."""
-        from .core import execute
-        from .operations import OperationLedger
-        task = self.tasks.snapshot(task_id)
-        authority = self._stage_authority(task, stage)
-        ledger = OperationLedger(self.store)
-        results = []
-        for action in stage.get("actions", []):
-            intent = {"project_id": self.store.project_id, "workspace_id": self.store.workspace_id, "action": action, "effect_scope": stage["scope"]}
-            action_id = hash_value({"task": task_id, "stage": stage["id"], "action": action["id"]})
-            prepared = ledger.prepare(task_id, stage["id"], action_id, intent)
-            action_id = prepared["action_id"]
-            folder = self.store.root / "tasks" / task_id / "actions" / action_id
-            _safe_state(folder)
-            state_io(folder).mkdir(parents=True, exist_ok=True)
-
-            def observe():
-                observation = self._observe_action(task_id, stage, action, folder, authority_binding=authority)
-                if self._stage_authority(task, stage) != authority:
-                    raise ValueError("Approved action authority changed during observation")
-                return observation
-
-            observation = observe()
-            reconciled = ledger.reconcile(action_id, observation)
-            if reconciled["state"] == "UNKNOWN":
-                raise ValueError("External effect remains UNKNOWN; reconcile authoritative state before retry")
-            if reconciled["state"] == "ABSENT":
-                # A prior action or its observation may have changed a shared
-                # prerequisite since the stage's candidate was checked.
-                prerequisite_blockers, prerequisite_binding = self._revalidate_prerequisites(task, stage)
-                if prerequisite_blockers:
-                    raise ValueError("; ".join(prerequisite_blockers))
-                action_source = source_snapshot(self.store, task["contract"], task_id=task_id)
-                execution_context = {"version": 2, "task_id": task_id, "stage_id": stage["id"], "workspace_id": self.store.workspace_id,
-                    "project_id": self.store.project_id, "contract_hash": task["contract_hash"], "proposal_hash": task["proposal_hash"],
-                    "plan_hash": authority["plan_hash"], "action_sha256": hash_value(action), "argv_sha256": hash_value(action["argv"]),
-                    "declared_stage": stage, "authority": authority,
-                    "execution_plan_checks": self.tasks.execution_plan(task_id)["checks"],
-                    "source_fingerprint_before": action_source["fingerprint"], "source_files": action_source["files"],
-                    "source_files_sha256": hash_value(action_source["files"])}
-                if len(encode(execution_context).encode()) > 131072:
-                    raise ValueError("Action source evidence exceeds bound before submission")
-                with transaction(self.store.db):
-                    if self._stage_authority(task, stage) != authority:
-                        raise ValueError("Approved action authority changed during prerequisite verification")
-                    self._available(task_id, action.get("timeout", 300))
-                    ledger.started(action_id)
-                execution = self._call(task_id, lambda timeout: self._execute_command(task_id, action,
-                    action["argv"], folder / (uuid.uuid4().hex + ".log"), timeout, stage["id"],
-                    prerequisite_binding=prerequisite_binding, authority_binding=authority), action.get("timeout", 300))
-                ledger.record_submission(action_id, execution, context=execution_context)
-                observation = observe()
-                ledger.reconcile(action_id, observation)
-                if execution.get("exit_code") != 0 or not observation["exists"]:
-                    raise ValueError("Infrastructure action did not establish its actual postcondition")
-            results.append(observation)
-        return results
+        from .execution.actions import ActionService
+        return ActionService(self).execute_actions(task_id, stage)
 
     def record_failure(self, task_id, stage_id, reasons):
         return self._record_recovery(task_id, stage_id, reasons, failed=True)
@@ -824,81 +662,8 @@ class WorkflowController:
             return self._check(task_id, stage_id)
 
     def _check(self, task_id, stage_id=None):
-        from .core import execute
-        with transaction(self.store.db):
-            task = self.tasks.snapshot(task_id)
-            authority = self._authority_binding(task_id)
-        allowed = []
-        for stage in task["contract"]["stages"]:
-            if stage_id is not None and stage["id"] != stage_id:
-                continue
-            try:
-                self.tasks.require_approval(task_id, stage["id"], allow_terminal=task["state"] == "COMPLETED")
-            except ValueError:
-                if stage_id is not None:
-                    raise
-                continue
-            allowed.append(stage["id"])
-        if not allowed:
-            raise ValueError("Checks require current proposal approval")
-        if task["state"] == "COMPLETED":
-            # Credential rotation permits fresh observations/checks, never replay
-            # a completed resource mutation or reopen its business authority.
-            from .operations import OperationLedger
-            ledger = OperationLedger(self.store)
-            for stage in task["contract"]["stages"]:
-                if stage["id"] not in allowed:
-                    continue
-                for action in stage.get("actions", []):
-                    if "access" not in action:
-                        continue
-                    action_id = hash_value({"task": task_id, "stage": stage["id"], "action": action["id"]})
-                    intent = {"project_id": self.store.project_id, "workspace_id": self.store.workspace_id, "action": action, "effect_scope": stage["scope"]}
-                    operation = ledger.lookup(task_id, stage["id"], action_id, intent)
-                    if operation:
-                        action_id = operation["action_id"]
-                        folder = self.store.root / "tasks" / task_id / "actions" / action_id
-                        _safe_state(folder)
-                        state_io(folder).mkdir(parents=True, exist_ok=True)
-                        ledger.reconcile(action_id, self._observe_action(task_id, stage, action, folder,
-                            allow_terminal=True, authority_binding=authority))
-        plan = self.tasks.execution_plan(task_id)
-        before = source_snapshot(self.store, task["contract"], task_id=task_id)
-        folder = self.store.root / "tasks" / task_id / "checks" / uuid.uuid4().hex
-        _safe_state(folder)
-        state_io(folder).mkdir(parents=True)
-        results = []
-        check_stages = {}
-        for approved_stage in allowed:
-            stage = next(s for s in task["contract"]["stages"] if s["id"] == approved_stage)
-            for raw in stage_checks(task["contract"], plan["checks"], approved_stage):
-                if self._stage_permits_command(stage, raw):
-                    check_stages.setdefault(raw["id"], approved_stage)
-                elif stage_id is not None:
-                    raise ValueError("Check access or scope exceeds the explicitly selected approved stage")
-        for raw in plan["checks"]:
-            if raw["id"] not in check_stages:
-                continue
-            actual_stage = check_stages[raw["id"]]
-            self.tasks.require_approval(task_id, actual_stage, allow_terminal=task["state"] == "COMPLETED")
-            spec = validate_evidence_spec(raw, task["contract"]["profile"])
-            if spec["kind"] == "artifact":
-                path = _target(self.store.repo.resolve(), spec["path"])
-                result = {"id": spec["id"], "kind": "artifact", "path": str(path),
-                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None}
-            elif spec["kind"] == "manual":
-                result = read_record(self.store.db, "manual_evidence", task_id + ":" + spec["id"])["payload"] or {"id": spec["id"], "kind": "manual", "confirmed": False}
-            else:
-                result = self._call(task_id, lambda timeout: self._execute_command(task_id, spec, spec["argv"],
-                    folder / (spec["id"] + ".log"), timeout, actual_stage, allow_terminal=task["state"] == "COMPLETED",
-                    authority_binding=authority), spec.get("timeout", 300))
-                result.update(id=spec["id"], kind=spec["kind"], parser=spec.get("parser"), configured_argv=spec["argv"])
-            results.append(result)
-        after = source_snapshot(self.store, task["contract"], task_id=task_id)
-        bundle = {"kind": "checks", "task_id": task_id, "fingerprint": before["fingerprint"], "workspace_id": self.store.workspace_id,
-                  "contract_hash": task["contract_hash"], "plan_hash": plan["plan_hash"], "results": results,
-                  "source_changed_during_checks": before["fingerprint"] != after["fingerprint"], "timestamp": now()}
-        return self._save("checks", task_id, bundle)
+        from .testing.execution import CheckService
+        return CheckService(self, target=_target).check(task_id, stage_id)
 
     def _capture_stage(self, task_id, stage_id, verdict):
         task = self.tasks.snapshot(task_id)
@@ -1032,190 +797,8 @@ class WorkflowController:
         return history, missing
 
     def _packet(self, task_id, stage_id=None):
-        from .source_coverage import source_availability, availability_gaps, source_bytes, bound_representation, read_persisted_intake
-        task = self.tasks.snapshot(task_id)
-        row = self.store.db.execute("SELECT payload FROM task_discoveries WHERE task_id=? ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
-        discovery = json.loads(row[0]) if row else None
-        intake_state = read_persisted_intake(discovery)
-        availability = source_availability(self.store, task["contract"], discovery, stage_id)
-        policies = {item["path"]: item for item in availability}
-        representations = {item["artifact_path"]: item for item in (discovery or {}).get("representations", [])}
-        plan = self.tasks.execution_plan(task_id)
-        stage = next((item for item in task["contract"]["stages"] if item["id"] == stage_id), None)
-        if stage_id is not None and stage is None:
-            raise ValueError("Unknown source packet stage")
-        must_review = {Path(item["path"]).as_posix() for item in stage_checks(task["contract"], plan["checks"], stage_id)
-                       if item["kind"] == "artifact" and item.get("required", True)}
-
-        def source_policy(path):
-            matching = [item for resource, item in policies.items() if Path(path).is_relative_to(Path(resource))]
-            return max(matching, key=lambda item: len(Path(item["path"]).parts)) if matching else None
-
-        def coverage_required(path):
-            if body_omission(path) is not None:
-                return False
-            policy = source_policy(path)
-            return path in must_review or policy is None or (policy["relevant"] and (policy["required"] or policy["role"] in {"output", "workspace", "representation"}))
-
-        def direct_body_omission(path):
-            if path in must_review:
-                return None
-            policy = source_policy(path)
-            if policy is not None:
-                if not policy["relevant"]:
-                    return "OMITTED_IRRELEVANT_STAGE"
-                if policy["role"] == "input" and not policy["required"]:
-                    return "OMITTED_OPTIONAL_INPUT"
-            return None
-
-        def body_omission(path):
-            if path in must_review:
-                return None
-            owners = [artifact for artifact, declaration in representations.items() if declaration["path"] == path]
-            if owners:
-                policy = source_policy(path)
-                if policy is not None and policy["role"] != "representation" and direct_body_omission(path) is None:
-                    return None  # Independently required as a source or output.
-                decisions = [direct_body_omission(artifact) for artifact in owners]
-                if all(decisions):
-                    return "OMITTED_OPTIONAL_INPUT" if "OMITTED_OPTIONAL_INPUT" in decisions else "OMITTED_IRRELEVANT_STAGE"
-                return None  # At least one included artifact needs this body.
-            return direct_body_omission(path)
-
-        snapshot = source_snapshot(self.store, task["contract"], task_id=task_id)
-        baseline = read_record(self.store.db, "baseline", task_id)["payload"]
-        changes = None
-        if baseline:
-            paths = set(baseline["files"]) | set(snapshot["files"])
-            changed = sorted(p for p in paths if baseline["files"].get(p) != snapshot["files"].get(p))
-            if len(changed) > 1000:
-                raise ValueError("Source change inventory exceeds the bounded review packet")
-            unchanged = sorted(p for p in paths if baseline["files"].get(p) == snapshot["files"].get(p))
-            changes = {"baseline_fingerprint": baseline["fingerprint"], "current_fingerprint": snapshot["fingerprint"],
-                       "baseline_dirty": baseline.get("dirty"), "coverage": "Actual content/mode hashes from baseline and current source observations; software covers tracked and nonignored untracked files plus declared dependencies",
-                       "changes": [{"path": p, "before_sha256": baseline["files"].get(p), "after_sha256": snapshot["files"].get(p)} for p in changed],
-                       "unchanged_paths": unchanged[:1000], "unchanged_path_count": len(unchanged), "unchanged_paths_truncated": len(unchanged) > 1000}
-            review_scope = stage["scope"] if stage is not None else task["contract"]["scope"]
-            if set(review_scope["effects"]) & {"file_write", "command"}:
-                must_review.update(path for path in changed if any(Path(path).is_relative_to(Path(resource)) for resource in review_scope["resources"]))
-        must_review.update(item["path"] for artifact, item in representations.items() if artifact in must_review)
-        files = []
-        missing = [gap["id"] + ": " + gap["text"] for gap in [*availability_gaps(availability), *intake_state["compatibility_gaps"]]]
-        for path, observation in snapshot.get("unavailable", {}).items():
-            availability.append({"path": path, **observation, "reason": "Source snapshot could not read this declared resource"})
-            if coverage_required(path):
-                missing.append(path + ": source snapshot unavailable (" + observation["error"] + ")")
-        representation_metadata = []
-        for artifact, declaration in representations.items():
-            omission = body_omission(artifact)
-            if omission:
-                artifact_hash = snapshot["files"].get(artifact, "").removesuffix(":x")
-                readable_hash = snapshot["files"].get(declaration["path"], "").removesuffix(":x")
-                current = artifact_hash == declaration["artifact_sha256"] and readable_hash == declaration["sha256"]
-                representation_metadata.append({**declaration, "body_status": omission,
-                                                "observed_artifact_sha256": artifact_hash or None, "observed_representation_sha256": readable_hash or None,
-                                                "integrity": "CURRENT_SNAPSHOT_HASHES" if current else "STALE_OR_UNAVAILABLE_SNAPSHOT_BINDING",
-                                                "limitation": "Artifact/representation bodies were omitted from review; the declared binding and current source hashes remain visible"})
-        omitted_sources = []
-        selected = set()
-        for resource in source_resources(self.store, task["contract"], task_id):
-            candidate = self.store.repo / resource
-            if candidate.resolve().is_relative_to(self.store.repo.resolve()):
-                if candidate.is_dir():
-                    selected.update(p for p in snapshot["files"] if (self.store.repo / p).is_relative_to(candidate.resolve()))
-                else:
-                    selected.add(resource.replace("\\", "/"))
-        for path in sorted(selected):
-            candidate = self.store.repo / path
-            try:
-                candidate = _target(self.store.repo.resolve(), path)
-                if any(p.lower() == ".git" for p in candidate.resolve().relative_to(self.store.repo.resolve()).parts):
-                    raise ValueError("Private Git data is not a source packet")
-                if not candidate.exists():
-                    continue
-                omission = body_omission(path)
-                if omission:
-                    policy = source_policy(path)
-                    observed_hash = snapshot["files"].get(path)
-                    omitted_sources.append({"path": path, "sha256": observed_hash,
-                                            "status": "AVAILABLE" if observed_hash is not None else "UNAVAILABLE",
-                                            "body_status": omission, "required": policy["required"], "relevant": policy["relevant"],
-                                            "blocking_stage_ids": policy["blocking_stage_ids"], "reason": policy["reason"],
-                                            "limitation": "Body was not supplied or reviewed in this packet; current source hashes and declared stage impact remain visible"})
-                    continue
-                if path in representations:
-                    represented = bound_representation(self.store.repo, representations[path])
-                    if not any(item["path"] == represented["path"] for item in files):
-                        files.append(represented)
-                    representation_metadata.append({**representations[path], "integrity": "Current artifact and readable representation bytes match both declared hashes",
-                                                    "limitation": "Representation adequacy requires independent domain judgment; native binary bytes are not interpreted by this transport"})
-                    continue
-                data = source_bytes(self.store.repo, path)
-                content = data.decode("utf-8")
-                if "\0" in content:
-                    raise ValueError("source contains binary NUL bytes")
-                if not any(item["path"] == path for item in files):
-                    files.append({"path": path, "content": content, "sha256": hashlib.sha256(data).hexdigest()})
-            except (UnicodeError, OSError, ValueError) as ex:
-                if coverage_required(path):
-                    missing.append(path + ": " + str(ex))
-                else:
-                    availability.append({"path": path, "status": "UNCOVERED", "required": False,
-                                         "limitation": str(ex), "reason": "Optional or outside the current stage's source requirement"})
-        historical = read_record(self.store.db, "baseline_implementation", task_id)["payload"]
-        if historical and changes:
-            try:
-                if not Path(historical["artifact_root"]).resolve().is_relative_to(self.store.root.resolve()):
-                    raise ValueError("Historical source capture escapes project state")
-                verify_receipt(historical, require_current_policy=False)
-                original = json.loads(Path(historical["artifacts"]["request"]["path"]).read_bytes())
-                changed_paths = {entry["path"] for entry in changes["changes"]}
-                for before in original["source_packet"]["files"]:
-                    if before["path"] in changed_paths and body_omission(before["path"]) is None:
-                        files.append({**before, "path": "_ase_before/" + before["path"]})
-            except (ValueError, OSError, KeyError, TypeError) as ex:
-                missing.append("Historical source capture unavailable: " + str(ex))
-        stage_history, history_missing = self._stage_history(task)
-        missing.extend(history_missing)
-        from .action_evidence import action_packet_evidence
-        action_files, action_missing = action_packet_evidence(self.store, task, plan, snapshot, stage_id=stage_id)
-        files.extend(action_files)
-        missing.extend(action_missing)
-        from .delegations import DelegationRegistry
-        try:
-            delegation_evidence = DelegationRegistry(self.store).packet_evidence(task_id, stage_id=stage_id)
-        except (ValueError, OSError, KeyError, TypeError) as ex:
-            from .core import redact
-            reason = 'Native delegation evidence unavailable: ' + redact(ex)
-            missing.append(reason)
-            delegation_evidence = {'status': 'UNAVAILABLE', 'reason': reason}
-        for name, data in (("contract", task["contract"]), ("execution_plan", plan), ("source_changes", changes), ("stage_history", stage_history),
-                           ("discovery", discovery), ("intake_validation", intake_state["validation"]), ("source_availability", availability), ("artifact_representations", representation_metadata), ("omitted_sources", omitted_sources),
-                           ('delegations', delegation_evidence), ("actual_checks", read_record(self.store.db, "checks", task_id)["payload"])):
-            content = encode(data)
-            files.append({"path": "_ase_context/" + name + ".json", "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest()})
-        check = read_record(self.store.db, "checks", task_id)["payload"]
-        for result in (check or {}).get("results", []):
-            if result.get("log"):
-                try:
-                    log = logical_path(result["log"])
-                    if not log.is_relative_to(self.store.root.resolve()):
-                        raise ValueError("Log is outside project state")
-                    physical = state_io(log)
-                    if not physical.is_file():
-                        raise ValueError("Log is unavailable")
-                    content = physical.read_bytes().decode("utf-8", errors="replace")
-                except (OSError, ValueError):
-                    missing.append("Actual check log unavailable: " + result["id"])
-                    continue
-                files.append({"path": "_ase_context/logs/" + result["id"] + ".txt", "content": content,
-                              "sha256": hashlib.sha256(content.encode()).hexdigest()})
-        packet = {"requirements": [task["contract"]["request"], *[ac["id"] + ": " + ac["expected"] for ac in task["contract"]["acceptance"]]],
-                "files": files, "coverage": {"scope": "Current stage source plus task contract and actual check logs; known irrelevant/optional bodies are explicitly disclosed in omitted_sources; undeclared dependencies are not proven complete",
-                                               "included": [f["path"] for f in files], "missing": missing,
-                                               "omitted": [item["path"] for item in omitted_sources]}}
-        from .protocol import validate_packet
-        return validate_packet(packet)
+        from .evidence.packets import PacketService
+        return PacketService(self, target=_target).packet(task_id, stage_id)
 
     def _request(self, task_id, role, schema, handoff=None):
         task = self.tasks.snapshot(task_id)
@@ -1272,19 +855,8 @@ class WorkflowController:
             return self._verify(task_id, stage_id)
 
     def _verify(self, task_id, stage_id=None):
-        task = self.tasks.snapshot(task_id)
-        approved = task["approved_stage_ids"] or ([task["contract"]["stages"][0]["id"]] if task["contract"].get("parent_task_id") else [])
-        if not approved:
-            raise ValueError("Independent verification requires current proposal approval")
-        self.tasks.require_approval(task_id, stage_id or approved[0], allow_terminal=task["state"] == "COMPLETED")
-        runner = self._runner(task_id)
-        adapter = get_adapter(task["contract"]["execution_policy"]["backend"])
-        for role, schema in (("ac", AC_SCHEMA), ("review", REVIEW_SCHEMA)):
-            instruction = ("Independently assess the configured criteria against the original request, actual packet source, source_changes baseline manifest, captured before-files and command logs. Return exactly the configured criterion IDs and preserve expected wording. Evaluate original-request constraints under the relevant criteria; a missing material constraint is UNVERIFIED/BLOCKED, never an extra ignored criterion. PASS needs meaningful evidence. Broader limitations do not invalidate concrete evidenced behavior."
-                           if role == "ac" else "Independently review actual source for actionable defects P0-P3. P0/P1/P2 block. Do not downgrade to obtain approval. State coverage limits in summary.")
-            result = self._call(task_id, lambda timeout: runner.run(adapter, self._request(task_id, role, schema, {"instruction": instruction, "stage_id": stage_id}), timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id)))
-            self._save("verification", task_id + ":" + role, result["receipt"])
-        return GateService(self.store).gate(task_id, stage_id=stage_id)
+        from .review.service import VerificationService
+        return VerificationService(self, ac_schema=AC_SCHEMA, review_schema=REVIEW_SCHEMA).verify(task_id, stage_id)
 
     def run(self, task_id, *, resume=False):
         from .journal import Journal
@@ -1354,11 +926,11 @@ class WorkflowController:
         summary = "All approved task obligations verified" if reason == "completed" else "; ".join(verdict.get("reasons", verdict.get("blocked_reasons", ["Work paused"])))[:3500]
         checkpoint_revision = self.store.db.execute("SELECT COALESCE(MAX(revision),0) FROM checkpoints WHERE task_id=?", (task_id,)).fetchone()[0]
         resolved = []
-        if reason == "completed" and any(b["task_id"] == task_id and b["id"] == "execution-blocker" for b in journal._active_blockers(journal._events())):
+        if reason == "completed" and any(b["task_id"] == task_id and b["id"] == "execution-blocker" for b in journal.active_blockers()):
             resolved = [{"kind": "blocker_resolved", "blocker_id": "execution-blocker", "summary": "Current task verification resolved the framework execution blocker"}]
         closure = journal.finish_session(task_id, session_id, {"finish_reason": reason, "summary": summary,
             "next_action": "No remaining task work" if reason == "completed" else "Inspect reported blockers, reconcile effects, then approve revised scope or resume",
-            "context": {"summary": task["contract"]["request"], "limitations": ["This context describes the most recent task; earlier dated snapshots remain available"]},
+            "context": {"summary": task["contract"]["request"], "limitations": ["Dated task context is retained alongside other tasks; verify current sources before reuse"]},
             "remaining": remaining, "workflow_outcome": verdict["status"], "events": resolved,
             "blockers": [] if reason == "completed" else [{"id": "execution-blocker", "reason": summary, "next_probe": "Inspect current gate and stage state before resume"}]},
             closure_key=session_id + ":finish", expected_revision=checkpoint_revision, expected_context_revision=journal.context()["revision"])

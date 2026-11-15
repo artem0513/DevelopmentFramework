@@ -8,4 +8,6 @@ Store dated, concise local records rather than raw chats, full transcripts, cred
 
 Use `ase --project PROJECT worklog --from YYYY-MM-DD --until YYYY-MM-DD --timezone Europe/Bucharest` or `meeting-report` for local calendar dates; `--until` is exclusive. Missing timezone rules block the local summary instead of silently using the host zone. Worklog reports events; meeting reports include results, decisions, blockers and next steps. `--as-of-end` reports historical state; current carried blockers must be labelled. These commands do not infer billable hours or change legacy daily/weekly time semantics.
 
+Raw events remain immutable. Effective meeting facts apply explicit corrections, including relevant later amendments; plain correction prose retracts the target and is not an inferred replacement. `--as-of-end` uses the occurrence cutoff, not a reconstruction of what was known at recording time. Completed follow-up publication sessions do not duplicate completion, and completed/cancelled tasks have no active next step. Closure retains dated per-task context; its summary alone is not a verified current project fact.
+
 Give a short final report separating implemented work, executed checks, independent judgments, unavailable checks and actual publication. Drafting reports does not authorize external sending.

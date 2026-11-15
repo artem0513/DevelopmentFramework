@@ -5,13 +5,14 @@ approval, infer human time, execute actions or send reports to external systems.
 """
 import copy
 from contextlib import contextmanager
-from datetime import date, datetime, time, timezone as utc_timezone
+from datetime import datetime, timezone as utc_timezone
 import hashlib
-import json
 from pathlib import Path
 
 from .state import append_event, encode, hash_value, identifier, read_record, text, transaction, write_record
 from .store import now
+from .memory.repository import JournalRepository
+from .memory.reports import ReportService
 from .tasks import TaskService
 from .timezones import resolve_timezone
 
@@ -89,12 +90,10 @@ class Journal:
         self.store = store
         self.tasks = TaskService(store)
         self.gate_provider = gate_provider
+        self.repository = JournalRepository(store)
 
     def _event_row(self, event_key):
-        row = self.store.db.execute("SELECT sequence,event_key,payload FROM runtime_events WHERE event_key=? AND kind='journal'", (event_key,)).fetchone()
-        if row is None:
-            return None
-        return {**json.loads(row["payload"]), "sequence": row["sequence"], "event_key": row["event_key"]}
+        return self.repository.event(event_key)
 
     def _validate_event(self, event):
         allowed = {"kind", "task_id", "session_id", "summary", "occurred_at_utc", "source_refs", "evidence_refs",
@@ -161,8 +160,8 @@ class Journal:
             return self._event_row(event_key)
 
     def context(self):
-        record = read_record(self.store.db, "project_context", self.store.project_id)
-        return {"project_id": self.store.project_id, **record}
+        from .memory.context import ContextService
+        return ContextService(self.store).snapshot()
 
     def session(self, task_id, session_id):
         self.store.task(identifier(task_id, "task id"))
@@ -286,7 +285,7 @@ class Journal:
                                "fingerprint": None, "worktree": None,
                                "limitation": "Root identity only; scoped content is observed by the evidence gate"}
             db.execute("INSERT INTO checkpoints VALUES(?,?,?,?,?)", (task_id, expected_revision + 1, encode(checkpoint), encode(observation), stamp))
-            next_context = {**value["context"], "task_id": task_id, "next_action": value["next_action"], "updated_at_utc": stamp}
+            next_context = {**value["context"], "workspace_id": self.store.workspace_id, "task_id": task_id, "next_action": value["next_action"], "updated_at_utc": stamp}
             write_record(db, "project_context", self.store.project_id, next_context, expected_revision=expected_context_revision)
             write_record(db, "project_context_version", self.store.project_id + ":" + str(expected_context_revision + 1), next_context, expected_revision=0)
             events = []
@@ -298,10 +297,16 @@ class Journal:
                 events.append(self.append({"kind": "blocker_opened", "task_id": task_id, "session_id": session_id,
                                            "summary": blocker["reason"], "blocker": blocker, "occurred_at_utc": stamp},
                                           event_key="closure:" + closure_key + ":blocker:" + blocker["id"]))
+            if reason == "completed" and task["state"] != "COMPLETED":
+                events.append(self.append({"kind": "work_completed", "task_id": task_id, "session_id": session_id,
+                    "summary": value["summary"], "source_refs": value.get("source_refs", []), "occurred_at_utc": stamp},
+                    event_key="closure:" + closure_key + ":completed"))
             events.append(self.append({"kind": "session_finished", "task_id": task_id, "session_id": session_id,
                                        "summary": value["summary"], "next_action": value["next_action"], "finish_reason": reason,
                                        "occurred_at_utc": stamp, "workflow_outcome": value.get("workflow_outcome", target)},
                                       event_key="closure:" + closure_key + ":summary"))
+            from .memory.context import ContextService
+            ContextService(self.store).record_task(task_id, next_context, summary_event=events[-1], finish_reason=reason)
             started = session["payload"]["started_at_utc"] if session["payload"] else stamp
             legacy = db.execute("INSERT INTO sessions(task_id,started,ended,summary,important_decisions,unresolved_questions) VALUES(?,?,?,?,?,?)",
                                 (task_id, started, stamp, value["summary"], "\n".join(value.get("decisions", [])), "\n".join(b["reason"] for b in value["blockers"])))
@@ -321,64 +326,21 @@ class Journal:
             return result
 
     def _events(self):
-        return [{**json.loads(row["payload"]), "sequence": row["sequence"], "event_key": row["event_key"]}
-                for row in self.store.db.execute("SELECT sequence,event_key,payload FROM runtime_events WHERE kind='journal' ORDER BY sequence")]
+        return self.repository.events()
 
     @staticmethod
     def _active_blockers(events):
-        active = {}
-        for event in sorted(events, key=lambda e: (e["occurred_at_utc"], e["sequence"])):
-            if event["kind"] == "blocker_opened":
-                active[(event["task_id"], event["blocker"]["id"])] = {**event["blocker"], "task_id": event["task_id"],
-                     "opened_at_utc": event["occurred_at_utc"], "event_key": event["event_key"]}
-            elif event["kind"] == "blocker_resolved":
-                active.pop((event["task_id"], event["blocker_id"]), None)
-        return list(active.values())
+        return ReportService._active_blockers(events)
+
+    def _reports(self):
+        # Preserve the Journal clock/timezone seams used by existing callers.
+        return ReportService(self.store, self.repository, clock=now, timezone_resolver=resolve_timezone)
 
     def worklog(self, start_date, until_date, *, timezone):
-        zone = resolve_timezone(timezone)
-        try:
-            start, until = date.fromisoformat(start_date), date.fromisoformat(until_date)
-            if start.isoformat() != start_date or until.isoformat() != until_date or start >= until:
-                raise ValueError()
-        except (ValueError, TypeError):
-            raise ValueError("Dates require an ascending half-open YYYY-MM-DD range") from None
-        start_utc = datetime.combine(start, time.min, zone).astimezone(utc_timezone.utc).isoformat()
-        until_utc = datetime.combine(until, time.min, zone).astimezone(utc_timezone.utc).isoformat()
-        all_events = self._events()
-        period = []
-        for event in sorted(all_events, key=lambda e: (e["occurred_at_utc"], e["sequence"])):
-            if start_utc <= event["occurred_at_utc"] < until_utc:
-                local = datetime.fromisoformat(event["occurred_at_utc"]).astimezone(zone)
-                period.append({**event, "local_date": local.date().isoformat(), "local_time": local.isoformat()})
-        as_of = self._active_blockers([e for e in all_events if e["occurred_at_utc"] < until_utc])
-        current = self._active_blockers([e for e in all_events if e["occurred_at_utc"] <= now()])
-        return {"project_id": self.store.project_id, "start_date": start_date, "until_date": until_date, "timezone": timezone,
-                "start_at_utc": start_utc, "until_at_utc": until_utc, "events": period,
-                "current_blockers": current, "blockers_as_of_end": as_of,
-                "period_blockers": [e for e in period if e["kind"] in {"blocker_opened", "blocker_resolved"}],
-                "carried_blockers": self._active_blockers([e for e in all_events if e["occurred_at_utc"] < start_utc]),
-                "note": "Occurrence dates, not recording dates. Structured history is observational; no human time inferred."}
+        return self._reports().worklog(start_date, until_date, timezone=timezone)
+
+    def active_blockers(self):
+        return self._reports().current_blockers()
 
     def meeting_report(self, start_date, until_date, *, timezone, as_of_end=False):
-        if type(as_of_end) is not bool:
-            raise ValueError("as_of_end must be boolean")
-        report = self.worklog(start_date, until_date, timezone=timezone)
-        events = report["events"]
-        report.update(done=[e for e in events if e["kind"] == "work_completed"],
-                      checked=[e for e in events if e["kind"] == "check"],
-                      verified=[e for e in events if e["kind"] == "check" and e["status"] == "PASS"],
-                      stage_results=[e for e in events if e["kind"] == "stage_result"],
-                      decisions=[e for e in events if e["kind"] == "decision"],
-                      corrections=[e for e in events if e["kind"] == "correction"],
-                      blockers=report["blockers_as_of_end"] if as_of_end else report["current_blockers"], as_of_end=as_of_end)
-        for kind in ("committed", "published", "deployed", "merged"):
-            report[kind] = [e for e in events if e["kind"] == kind]
-        cutoff = report["until_at_utc"] if as_of_end else now()
-        latest = {}
-        for event in sorted(self._events(), key=lambda e: (e["occurred_at_utc"], e["sequence"])):
-            if event["occurred_at_utc"] < cutoff and event.get("next_action"):
-                latest[event["task_id"]] = {"task_id": event["task_id"], "next_action": event["next_action"], "event_key": event["event_key"]}
-        report["next_steps"] = list(latest.values())
-        report["detail_refs"] = ["journal:" + str(e["sequence"]) for e in events]
-        return report
+        return self._reports().meeting_report(start_date, until_date, timezone=timezone, as_of_end=as_of_end)

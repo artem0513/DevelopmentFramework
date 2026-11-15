@@ -252,6 +252,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(any(b["task_id"] == task["task_id"] for b in report["current_blockers"]))
         self.assertEqual([e["kind"] for e in report["period_blockers"] if e["task_id"] == task["task_id"]], ["blocker_opened", "blocker_resolved"])
 
+    def test_completed_resume_resolves_effectively_reopened_execution_blocker(self):
+        """Gate double isolates corrected blocker projection, not semantic AC."""
+        c = contract("corrected-blocker-recovery")
+        c["unknowns"], c["stages"] = [], c["stages"][:1]
+        task = self.tasks.create(c)
+        task = self.tasks.propose(task["task_id"], {"summary": "Create guide", "stage_ids": ["draft"]}, expected_revision=task["revision"])
+        self.tasks.approve(task["task_id"], proposal_hash=task["proposal_hash"], user_message_ref="chat:approved", approved_stage_ids=["draft"])
+        self.assertEqual(self.controller.run(task["task_id"])["status"], "BLOCKED")
+        journal = Journal(self.store)
+        journal.append({"kind": "blocker_resolved", "task_id": task["task_id"], "blocker_id": "execution-blocker", "summary": "Incorrect resolution"}, event_key="wrong-resolution")
+        journal.append({"kind": "correction", "task_id": task["task_id"], "corrects": "wrong-resolution", "summary": "Resolution was premature"}, event_key="withdraw-resolution")
+        self.assertTrue(any(b['task_id'] == task['task_id'] for b in journal.worklog('2026-01-01', '2030-01-01', timezone='UTC')['current_blockers']))
+        plan = self.tasks.execution_plan(task["task_id"])
+        gate = {"status": "APPROVED", "contract_hash": task["contract_hash"], "plan_hash": plan["plan_hash"]}
+        with patch.object(self.controller, "_run", return_value=gate), patch("ase.gates.GateService.gate", return_value=gate):
+            self.controller.run(task["task_id"], resume=True)
+        report = journal.worklog('2026-01-01', '2030-01-01', timezone='UTC')
+        self.assertFalse(any(b['task_id'] == task['task_id'] for b in report['current_blockers']))
+
 
 if __name__ == "__main__":
     unittest.main()
