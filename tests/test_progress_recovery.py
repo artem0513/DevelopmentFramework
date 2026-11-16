@@ -1100,15 +1100,28 @@ class RecoveryBoundRepairTests(unittest.TestCase):
 
     def test_unowned_legacy_cycle_counter_does_not_reset_existing_child_cap(self):
         self.create("r", max_stage_cycles=10)
-        self.create("c", parent="r", max_stage_cycles=1)
-        write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
+        with patch("ase.tasks.now", return_value="2026-01-01T00:00:00+00:00"):
+            self.create("c", parent="r", max_stage_cycles=1)
+        with patch("ase.state.now", return_value="2026-01-01T00:00:01+00:00"):
+            write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
+        with self.assertRaisesRegex(ValueError, "cycle budget"):
+            self.controller.reserve_cycle("c", "draft")
+
+    def test_equal_legacy_cycle_timestamp_cannot_reset_child_cap(self):
+        self.create("r", max_stage_cycles=10)
+        # Equal timestamps cannot prove the child postdates legacy spending.
+        with patch("ase.tasks.now", return_value="2026-01-01T00:00:00+00:00"), patch("ase.state.now", return_value="2026-01-01T00:00:00+00:00"):
+            self.create("c", parent="r", max_stage_cycles=1)
+            write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
         with self.assertRaisesRegex(ValueError, "cycle budget"):
             self.controller.reserve_cycle("c", "draft")
 
     def test_new_child_does_not_own_older_unowned_legacy_cycles(self):
         self.create("r", max_stage_cycles=10)
-        write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
-        self.create("c", parent="r", max_stage_cycles=1)
+        with patch("ase.state.now", return_value="2026-01-01T00:00:00+00:00"):
+            write_record(self.store.db, "budget", "r", {"task_cycles": 1, "stages": {"draft": 1}, "diagnostics": {}, "failures": {}}, expected_revision=0)
+        with patch("ase.tasks.now", return_value="2026-01-01T00:00:01+00:00"):
+            self.create("c", parent="r", max_stage_cycles=1)
         self.controller.reserve_cycle("c", "draft")
         with self.assertRaisesRegex(ValueError, "cycle budget"):
             self.controller.reserve_cycle("c", "draft")
@@ -1131,15 +1144,28 @@ class RecoveryBoundRepairTests(unittest.TestCase):
 
     def test_legacy_unattributed_time_cannot_reset_existing_child_allowance(self):
         self.create("r")
-        self.create("c", parent="r", active_time_budget_seconds=2)
-        write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
+        with patch("ase.tasks.now", return_value="2026-01-01T00:00:00+00:00"):
+            self.create("c", parent="r", active_time_budget_seconds=2)
+        with patch("ase.state.now", return_value="2026-01-01T00:00:01+00:00"):
+            write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
+        with self.assertRaisesRegex(ValueError, "time budget"):
+            self.controller._available("c", 30)
+
+    def test_equal_legacy_time_timestamp_cannot_reset_child_allowance(self):
+        self.create("r")
+        # Equal timestamps cannot prove the child postdates legacy spending.
+        with patch("ase.tasks.now", return_value="2026-01-01T00:00:00+00:00"), patch("ase.state.now", return_value="2026-01-01T00:00:00+00:00"):
+            self.create("c", parent="r", active_time_budget_seconds=2)
+            write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
         with self.assertRaisesRegex(ValueError, "time budget"):
             self.controller._available("c", 30)
 
     def test_child_created_after_legacy_timing_has_fresh_local_allowance(self):
         self.create("r")
-        write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
-        self.create("c", parent="r", active_time_budget_seconds=2)
+        with patch("ase.state.now", return_value="2026-01-01T00:00:00+00:00"):
+            write_record(self.store.db, "budget", "r", {"task_cycles": 0, "stages": {}, "diagnostics": {}, "failures": {}, "active_seconds": 3}, expected_revision=0)
+        with patch("ase.tasks.now", return_value="2026-01-01T00:00:01+00:00"):
+            self.create("c", parent="r", active_time_budget_seconds=2)
         self.assertEqual(self.controller._available("c", 30), 2)
 
     def test_interrupted_call_time_belongs_to_saved_child_not_resuming_sibling(self):

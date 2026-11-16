@@ -16,3 +16,16 @@ Owner authorized all three outcomes. Current main baseline:06b5ac14fe4692ae4b697
 ## Additional owner steering
 
 The server/OS story is only an example of a general inspect-before-question rule. Make the rule explicit in always-loaded project/native routing and early intake, preserve relevant read-only evidence/owner-only decision boundaries, and validate all three installed targets plus controlled current Codex decisions. Retain the successful original1340-test run as history, then perform final current checks after this guidance change. The owner set a wall-clock stop at2026-11-16T01:44:50Z; start safe wrap-up at01:39:50Z.
+
+
+## Resumed final Windows CI acceptance
+
+Owner resumed after the completed overnight pause. Real run43786514575 on da8aa68 completed1342tests per job: Linux3.11/3.13 passed; Windows3.13 had one359vs360fixture assertion, Windows3.11 additionally exhausted the timing fixture allowance.
+
+- [x] Preserve actual current CI logs and original publication; reproduce padding residue1 and equal-clock allowance/cycle cases with actual I/O/SQLite.
+- [x] Repair only long-path fixture padding and explicit temporal fixture boundaries; preserve runtime safety and add equality-conservative coverage.
+- [ ] Run affected suites and full current suite on frozen source.
+- [ ] Independent focused review plus separate original Codex acceptance/review and source gate.
+- [ ] Publish exact reviewed correction to main, observe all four actual current CI jobs, then close a new resumed session and dated project context.
+
+No sleeps, weakened budget/path assertions, runtime changes, skipped tests or new dependencies. Global scope/authority, local memory, source-bound evidence and live Claude/Copilot limits remain unchanged. Root/helper and clock review outputs remain distinct from original acceptance.

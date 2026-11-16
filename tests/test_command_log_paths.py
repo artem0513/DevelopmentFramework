@@ -48,7 +48,8 @@ class CommandLogPathTests(unittest.TestCase):
         root = root or self.base
         parent = root
         target = length - 37  # slash + full uuid4 hexadecimal + .log
-        while len(str(parent)) + 61 < target:
+        # A segment consumes its separator too; reserve a nonempty final component.
+        while len(str(parent)) + 62 < target:
             parent /= "p" * 60
         if len(str(parent)) < target:
             parent /= "p" * (target - len(str(parent)) - 1)
@@ -58,7 +59,7 @@ class CommandLogPathTests(unittest.TestCase):
         return log
 
     def test_execute_reads_writes_and_hashes_263_and_longer_log_paths(self):
-        for length in (263, 360):
+        for length in (263, 360, len(str(self.base)) + 37 + 245, len(str(self.base)) + 37 + 306):
             with self.subTest(length=length):
                 log = self.long_log(length)
                 proof = execute([sys.executable, "-c", "print('native command output')"], self.base, log, timeout=5)
@@ -228,7 +229,7 @@ if 'REQUEST_JSON:\\n' in input_text:
 
     def sqlite_home(self, length):
         home = self.base
-        while len(str(home)) + 61 < length:
+        while len(str(home)) + 62 < length:
             home /= "s" * 60
         if len(str(home)) < length:
             home /= "s" * (length - len(str(home)) - 1)
