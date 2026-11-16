@@ -89,6 +89,7 @@ class Continuity:
 
     def restore(self, task_id):
         from .delegations import DelegationRegistry
+        from .coordinator import CoordinatorEvents
         checkpoint = self.snapshot(task_id)
         current = _observation(self.store.repo)
         previous = checkpoint["observation"]
@@ -100,6 +101,7 @@ class Continuity:
                 "sessions": [dict(r) for r in self.store.db.execute("SELECT * FROM sessions WHERE task_id=? ORDER BY id DESC LIMIT 10", (task_id,))],
                 "checkpoint": checkpoint, "current": current, "drift": drift,
                 "coverage": self.coverage(task_id), "delegations": DelegationRegistry(self.store).snapshot(task_id),
+                "coordinator_events": CoordinatorEvents(self.store).snapshot(task_id),
                 "authority": "Observations only; no execution or publication authorization"}
 
     def source_record(self, task_id, payload, expected_sequence):

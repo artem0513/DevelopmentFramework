@@ -322,6 +322,20 @@ def verify_receipt(receipt, *, expected_bindings=None, require_current_policy=Tr
         raise ValueError("No completed v2 subprocess receipt")
     if type(receipt.get("pid")) is not int or receipt["pid"] <= 0 or type(receipt.get("exit_code")) is not int or receipt["exit_code"] != 0 or any(receipt.get(k) for k in ("error", "timed_out", "output_limited", "cancelled")):
         raise ValueError("Subprocess did not finish successfully")
+    return _verify_capture(receipt, expected_bindings=expected_bindings,
+        require_current_policy=require_current_policy, require_success=True)
+
+
+def verify_capture(receipt, *, expected_bindings=None, require_current_policy=True):
+    """Validate terminal captured facts, including failures. Never grants acceptance."""
+    if (not isinstance(receipt, dict) or receipt.get('receipt_version') != 2
+            or receipt.get('status') not in {'COMPLETE', 'BLOCKED'}):
+        raise ValueError('No terminal v2 captured attempt')
+    return {**_verify_capture(receipt, expected_bindings=expected_bindings,
+        require_current_policy=require_current_policy, require_success=False), 'capture_only': True}
+
+
+def _verify_capture(receipt, *, expected_bindings, require_current_policy, require_success):
     if expected_bindings is not None and receipt.get("bindings") != expected_bindings:
         raise ValueError("Receipt inputs are stale")
     root = checked_path(receipt["artifact_root"], directory=True)
@@ -335,26 +349,47 @@ def verify_receipt(receipt, *, expected_bindings=None, require_current_policy=Tr
         value = _read(path, 8388608)
         if sha256(value) != artifact["sha256"] or len(value) != artifact["bytes"]: raise ValueError("Artifact hash mismatch")
         data[name] = value
-    for name in ("request", "schema", "stdin", "stdout", "stderr", "result"):
+    required = ('request', 'schema', 'result')
+    if receipt.get('capabilities', {}).get('available'):
+        required += ('stdin', 'stdout', 'stderr')
+    for name in required:
         if name not in data: raise ValueError("Required captured artifact missing")
     request = decode_json(data["request"])
     if sha256(data["request"]) != receipt["request_sha256"] or request["bindings"] != receipt["bindings"] or request["role"] != receipt["role"]:
         raise ValueError("Captured request binding mismatch")
-    if canonical(decode_json(data["schema"])) != canonical(request["schema"]) or sha256(data["stdin"]) != receipt["stdin_sha256"]:
+    if (canonical(decode_json(data["schema"])) != canonical(request["schema"])
+            or ('stdin' in data and sha256(data['stdin']) != receipt.get('stdin_sha256'))):
         raise ValueError("Schema or input mismatch")
     from .runtime_policy import validate_policy
     from .protocol import packet_prompt
     policy = validate_policy(request, require_current=require_current_policy)
     prompt = packet_prompt(request)
-    if receipt['backend'] == 'codex':
-        delivered = data['stdin'] == prompt.encode('utf-8')
-    else:
-        delivered = not data['stdin'] and receipt.get('argv', [])[-2:] == ['-p', prompt]
-    if not delivered:
-        raise ValueError('Captured policy/request differs from the delivered prompt')
+    if 'stdin' in data:
+        if receipt['backend'] == 'codex':
+            delivered = data['stdin'] == prompt.encode('utf-8')
+        else:
+            delivered = not data['stdin'] and receipt.get('argv', [])[-2:] == ['-p', prompt]
+        if not delivered:
+            raise ValueError('Captured policy/request differs from the delivered prompt')
+    elif receipt.get('pid') is not None or receipt.get('argv') or not receipt.get('error'):
+        raise ValueError('Missing model input is not an established unavailable-backend attempt')
     validate_packet(request["source_packet"], max_bytes=8388608)
     from .adapters import get_adapter
-    result = _parse(get_adapter(receipt["backend"]), request, data["stdout"], data.get("final"))
-    if result["status"] != "COMPLETE" or canonical(result) != canonical(decode_json(data["result"])) or canonical(result["terminal"]) != canonical(receipt["terminal"]) or result["session_id"] != receipt["session_id"]:
+    if 'stdin' in data:
+        result = _parse(get_adapter(receipt['backend']), request, data['stdout'], data.get('final'))
+        failure = ('PROCESS_TIMEOUT' if receipt.get('timed_out') else 'OUTPUT_LIMIT' if receipt.get('output_limited') else
+            'PROCESS_CANCELLED' if receipt.get('cancelled') else 'PROCESS_FAILED' if receipt.get('exit_code') != 0 or receipt.get('error') else None)
+        if failure:
+            result.update(status='BLOCKED', blocker=failure)
+    else:
+        result = normalized(blocker=receipt['error'])
+    if ((require_success and result['status'] != 'COMPLETE') or result['status'] != receipt['status']
+            or canonical(result) != canonical(decode_json(data["result"]))
+            or canonical(result["terminal"]) != canonical(receipt["terminal"]) or result["session_id"] != receipt["session_id"]):
         raise ValueError("Terminal or normalized result mismatch")
-    return {"valid": True, "evidence_kind": receipt["evidence_kind"], "execution_id": receipt["execution_id"], "result": result, **policy}
+    handoff = request.get('handoff', {})
+    identity = {'role': request['role'], 'purpose': handoff.get('purpose'),
+        'stage_id': handoff.get('stage_id'), 'schema_sha256': sha256(canonical(request['schema'])),
+        'project_id': request['project'].get('project_id'), 'test_plan_sha256': handoff.get('test_plan_sha256')}
+    return {"valid": True, "evidence_kind": receipt["evidence_kind"], "execution_id": receipt["execution_id"],
+        "result": result, 'request_identity': identity, **policy}

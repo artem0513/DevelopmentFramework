@@ -5,7 +5,7 @@ import uuid
 
 from .state import append_event, encode, hash_value, identifier, read_record, text, transaction, write_record
 from .store import now
-from .profiles import stage_profile, validate_access, validate_evidence_spec, validate_mixed_mapping, stage_evidence_specs
+from .profiles import stage_profile, validate_access, validate_evidence_spec, validate_mixed_mapping, stage_evidence_specs, has_software
 from .projects import _safe_state
 
 
@@ -46,7 +46,7 @@ def _unique(items, name):
 def validate_contract_v2(value):
     allowed = {"id", "schema_version", "profile", "request", "scope", "acceptance", "evidence", "commands",
                "stages", "assumptions", "unknowns", "sources", "capabilities", "execution_policy", "reporting",
-               "risk", "protected_paths", "parent_task_id", "parent_stage_id"}
+               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("Unknown task field; approval must be recorded separately")
     c = copy.deepcopy(value)
@@ -119,6 +119,12 @@ def validate_contract_v2(value):
     if len(required_children) != len(set(required_children)):
         raise ValueError("A required child must map to exactly one parent stage")
     validate_mixed_mapping(c)
+    if 'test_adequacy' in c:
+        quality = c['test_adequacy']
+        if (not isinstance(quality, dict) or set(quality) != {'version', 'required'}
+                or type(quality['version']) is not int or quality['version'] != 1
+                or quality['required'] is not True or not has_software(c)):
+            raise ValueError('test_adequacy requires version 1, required true and software scope')
     visiting, visited = set(), set()
     by_id = {s["id"]: s for s in stages}
 
@@ -205,6 +211,8 @@ class TaskService:
             parent_stage = next(s for s in parent["contract"]["stages"] if s["id"] == c["parent_stage_id"])
             if not _within(c["scope"], parent_stage["scope"]):
                 raise ValueError("Child scope exceeds approved parent stage")
+            if parent['contract'].get('test_adequacy') and has_software(c):
+                c['test_adequacy'] = copy.deepcopy(parent['contract']['test_adequacy'])
             validate_child_obligations(c, parent["contract"], parent_stage, task_id)
         payload = {"task_id": task_id, "state": "DRAFT", "contract": c, "contract_hash": hash_value(c),
                    "proposal_hash": None, "approved_stage_ids": [], "created": now()}
@@ -236,6 +244,8 @@ class TaskService:
             if "recovery_mode" not in policy:
                 policy["recovery_mode"] = "fixed"
             incoming["execution_policy"] = policy
+            if current['contract'].get('test_adequacy'):
+                incoming.setdefault('test_adequacy', copy.deepcopy(current['contract']['test_adequacy']))
         c = validate_contract_v2(incoming)
         supplied_id = c.pop("id", task_id)
         if supplied_id != task_id:

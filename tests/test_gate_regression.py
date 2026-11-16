@@ -28,6 +28,18 @@ class GateRegressionTests(unittest.TestCase):
     def test_missing_independent_roles_block_approval(self):
         self.assertEqual(evaluate_gate(self.contract, self.current, [self.checks], [])["status"], "BLOCKED")
 
+    def test_test_adequacy_receipt_cannot_replace_substantive_review(self):
+        def adequacy_only(receipt, **kwargs):
+            value = self.judgment(receipt)
+            if receipt['role'] == 'review':
+                value['request_identity'] = {'role': 'review', 'purpose': 'test_adequacy'}
+                value['result']['payload'] = {'scenarios': [], 'additional_scenarios': [],
+                    'missing_coverage': [], 'summary': 'Only test adequacy was assessed'}
+            return value
+        with patch('ase.gates.verify_receipt', side_effect=adequacy_only):
+            result = evaluate_gate(self.contract, self.current, [self.checks, self.ac, self.review], [])
+        self.assertEqual(result['status'], 'BLOCKED', result)
+
     def test_protocol_fixtures_cannot_supply_semantic_approval(self):
         def fixture(receipt, **kwargs):
             return {**self.judgment(receipt), "evidence_kind": "protocol_only"}

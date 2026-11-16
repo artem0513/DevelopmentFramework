@@ -705,6 +705,10 @@ class WorkflowController:
         with transaction(self.store.db) as db:
             old = read_record(db, kind, task_id)
             write_record(db, kind, task_id, value, expected_revision=old["revision"])
+            if kind == 'verification' and value.get('receipt_version') == 2:
+                from .coordinator import CoordinatorEvents
+                owner, role = task_id.split(':', 1)
+                CoordinatorEvents(self.store).record_receipt(owner, role, value)
         return value
 
     def check(self, task_id, stage_id=None):
@@ -1036,6 +1040,7 @@ class WorkflowController:
     def _prerequisite_current_inputs(self, owner, stage_id):
         """Read exact prerequisite inputs and scoped closure under one writer."""
         from .delegations import DelegationRegistry
+        from .testing.adequacy import TestAdequacy
         with transaction(self.store.db):
             owner = self.tasks.require_approval(owner["task_id"], stage_id)
             record = read_record(self.store.db, "stage", owner["task_id"] + ":" + stage_id)
@@ -1046,12 +1051,16 @@ class WorkflowController:
             blockers = DelegationRegistry(self.store).closure_blockers(owner["task_id"], stage_id=stage_id)
             if blockers:
                 raise ValueError("Prerequisite delegation closure requires reconciliation: " + "; ".join(blockers))
-            return {"task_id": owner["task_id"], "stage_id": stage_id, "workspace_id": self.store.workspace_id,
+            result={"task_id": owner["task_id"], "stage_id": stage_id, "workspace_id": self.store.workspace_id,
                 "contract_hash": owner["contract_hash"], "proposal_hash": owner["proposal_hash"],
                 "plan_hash": self.tasks.execution_plan(owner["task_id"])["plan_hash"],
                 "fingerprint": source_snapshot(self.store, owner["contract"], task_id=owner["task_id"])["fingerprint"],
                 "stage_revision": record["revision"], "authority": self._authority_binding(owner["task_id"]),
                 "verification_context_sha256": verification_context_hash(self.store, owner["contract"], owner["task_id"], stage_id)}
+            quality=TestAdequacy(self.store).binding(owner['task_id'],stage_id)
+            if quality is not None:
+                result['test_adequacy_sha256']=quality
+            return result
 
     def _revalidate_prerequisites(self, task, stage):
         """Refresh inherited and local proof without replaying completed work."""
@@ -1088,6 +1097,8 @@ class WorkflowController:
                     "plan_hash": checks["plan_hash"], "fingerprint": checks["fingerprint"],
                     "stage_revision": record["revision"], "authority": authority,
                     "verification_context_sha256": verdict.get("verification_context_sha256")}
+                if verdict.get('test_adequacy_sha256') is not None:
+                    observed['test_adequacy_sha256']=verdict['test_adequacy_sha256']
                 if (checks.get("source_changed_during_checks") or verdict.get("fingerprint") != observed["fingerprint"]
                         or observed["verification_context_sha256"] != verification_context_hash(
                             self.store, owner["contract"], owner["task_id"], stage_id)):

@@ -122,6 +122,16 @@ class TransportFixture(unittest.TestCase):
 
 
 class RunnerTests(TransportFixture):
+    def test_verified_identity_comes_from_captured_purpose_schema_stage_and_plan(self):
+        request = self.request('review')
+        request['project']['project_id'] = 'fixture-project'
+        request['handoff'] = {'purpose': 'test_adequacy', 'stage_id': 'implement', 'test_plan_sha256': 'f' * 64}
+        run = Runner(self.config(), self.base / 'artifacts').run(CodexAdapter(), request, timeout=3)
+        identity = verify_receipt(run['receipt']).get('request_identity')
+        self.assertEqual(identity, {'role': 'review', 'purpose': 'test_adequacy', 'stage_id': 'implement',
+            'schema_sha256': hashlib.sha256(json.dumps(SCHEMA, sort_keys=True, ensure_ascii=False,
+                separators=(',', ':')).encode()).hexdigest(), 'project_id': 'fixture-project', 'test_plan_sha256': 'f' * 64})
+
     def test_receipt_requires_real_subprocess(self):
         outcome = self.run_backend()
         self.assertEqual(outcome["result"]["status"], "COMPLETE", outcome)

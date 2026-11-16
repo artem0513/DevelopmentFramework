@@ -62,6 +62,13 @@ def evaluate_gate(contract, current, receipts, judgments):
             if verified["evidence_kind"] != "independent_cli":
                 blocked.append("Protocol fixtures are not independent semantic approval: " + role)
                 continue
+            payload=verified['result']['payload']
+            if (verified.get('request_identity',{}).get('purpose')=='test_adequacy'
+                    or (role=='review' and (not isinstance(payload,dict)
+                        or not isinstance(payload.get('findings'),list)
+                        or not isinstance(payload.get('summary'),str) or not payload['summary'].strip()))):
+                blocked.append('Independent '+role+' receipt is not substantive '+role+' evidence')
+                continue
             session_id = verified["result"].get("session_id")
             if session_id and session_id in session_ids:
                 rejected.append("Independent roles reused the same provider session")
@@ -402,6 +409,11 @@ class GateService:
         current["verification_context_sha256"] = current["verification_context_sha256s"][0]
         implementation = read_record(self.store.db, "implementation", task_id)["payload"]
         current["implementation_execution_id"] = (implementation or {}).get("execution_id")
+        from .testing.adequacy import TestAdequacy
+        quality_service=TestAdequacy(self.store)
+        current['test_adequacy_sha256']=quality_service.binding(task_id,stage_id)
+        verification_inputs=hash_value({role:read_record(self.store.db,'verification',task_id+':'+role)['payload']
+            for role in ('ac','review')})
         receipts = [check] if check else []
         for role in ("ac", "review"):
             record = read_record(self.store.db, "verification", task_id + ":" + role)["payload"]
@@ -421,7 +433,16 @@ class GateService:
         high = read_record(self.store.db, "high_risk_approval", task_id)["payload"]
         current["high_risk_approved"] = bool(high and high.get("fingerprint") == source["fingerprint"] and high.get("contract_hash") == task["contract_hash"])
         result = evaluate_gate(task["contract"], current, receipts, [])
+        result['test_adequacy_sha256']=current['test_adequacy_sha256']
         extra = []
+        from .testing.adequacy import TestAdequacy
+        adequacy = TestAdequacy(self.store).gate(task_id, current=current, stage_id=stage_id)
+        result['test_adequacy'] = adequacy
+        extra.extend(adequacy['blocked_reasons'])
+        if adequacy.get('rejected_reasons'):
+            result['rejected_reasons'] = list(dict.fromkeys(result['rejected_reasons'] + adequacy['rejected_reasons']))
+            result['reasons'] = list(dict.fromkeys(result['reasons'] + adequacy['rejected_reasons']))
+            result['status'] = 'REJECTED'
         from .delegations import DelegationRegistry
         extra.extend(DelegationRegistry(self.store).closure_blockers(task_id, stage_id=stage_id))
         readiness = tasks.readiness(task_id, stage_id=stage_id)
@@ -543,6 +564,22 @@ class GateService:
         if stage_id is not None:
             result["stage_id"] = stage_id
         with transaction(self.store.db) as db:
+            if adequacy.get('configured'):
+                latest = tasks.snapshot(task_id)
+                current_check = read_record(db, 'checks', task_id)['payload']
+                if (latest['contract_hash'] != current['contract_hash']
+                        or latest['proposal_hash'] != current['proposal_hash']
+                        or tasks.execution_plan(task_id)['plan_hash'] != current['plan_hash']
+                        or (hash_value(current_check) if current_check else 'missing') != current['check_hash']
+                        or source_snapshot(self.store, latest['contract'], task_id=task_id)['fingerprint'] != current['fingerprint']
+                        or quality_service.binding(task_id,stage_id) != current['test_adequacy_sha256']
+                        or hash_value({role:read_record(db,'verification',task_id+':'+role)['payload'] for role in ('ac','review')}) != verification_inputs
+                        or verification_context_hashes(self.store, latest['contract'], task_id, stage_id) != current['verification_context_sha256s']):
+                    reason = 'Source or current evidence changed during gate'
+                    result['blocked_reasons'] = list(dict.fromkeys(result['blocked_reasons'] + [reason]))
+                    result['reasons'] = list(dict.fromkeys(result['reasons'] + [reason]))
+                    if result['status'] == 'APPROVED':
+                        result['status'] = 'BLOCKED'
             key = task_id if stage_id is None else task_id + ":" + stage_id
             old = read_record(db, "gate", key)
             write_record(db, "gate", key, result, expected_revision=old["revision"])

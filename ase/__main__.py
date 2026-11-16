@@ -49,12 +49,68 @@ def _delegation_command(store, args):
     return registry.cancel(args.task_id, args.work_id, reason=args.reason, **kwargs)
 
 
+def _events_command(store, args):
+    from .coordinator import CoordinatorEvents
+    service = CoordinatorEvents(store)
+    if args.action == 'list':
+        return service.snapshot(args.task_id)
+    if args.action == 'recover':
+        return service.recover(args.task_id)
+    if args.action == 'bind':
+        return service.bind(args.task_id, load(args.file),
+            user_message_ref=args.user_message_ref, expected_revision=args.expected_revision)
+    if args.action == 'bind-local':
+        return service.bind_local(args.task_id,backend=args.backend,
+            user_message_ref=args.user_message_ref,expected_revision=args.expected_revision)
+    kwargs = {'expected_revision': args.expected_revision}
+    if args.action == 'dispatch':
+        return service.dispatch(args.task_id, args.event_id, **kwargs)
+    if args.action == 'observe':
+        return service.observe(args.task_id, args.event_id, attempt_id=args.attempt,
+            observation=load(args.file), **kwargs)
+    if args.action == 'claim':
+        return service.claim(args.task_id, args.event_id, thread_id=args.thread_id, **kwargs)
+    return service.ack(args.task_id, args.event_id, processing_id=args.processing_id,
+        thread_id=args.thread_id, outcome=args.outcome, evidence=args.evidence, **kwargs)
+
+
 def parser():
     p = JSONArgumentParser(description="Project-local, evidence-driven supervised workflow")
     p.add_argument("--repo", default=".")
     p.add_argument("--home", help="Explicit state home (outside source or validated project-local state)")
     p.add_argument("--project", help="Registered project UUID or workspace alias")
     commands = p.add_subparsers(dest="command", required=True)
+    events = commands.add_parser('events', help='Durable original-coordinator result inbox; native host owns delivery')
+    event_commands = events.add_subparsers(dest='action', required=True)
+    for name in ('bind', 'bind-local', 'list', 'recover', 'dispatch', 'observe', 'claim', 'ack'):
+        command = event_commands.add_parser(name)
+        command.add_argument('task_id')
+        if name not in {'bind', 'bind-local', 'list', 'recover'}:
+            command.add_argument('event_id')
+        if name not in {'list', 'recover'}:
+            command.add_argument('--expected-revision', type=int, required=True)
+        if name in {'bind', 'observe'}:
+            command.add_argument('--file', required=True)
+        if name in {'bind','bind-local'}:
+            command.add_argument('--user-message-ref', required=True)
+        if name=='bind-local':
+            command.add_argument('--backend',choices=('codex','claude','copilot'),required=True)
+        if name == 'observe':
+            command.add_argument('--attempt', required=True)
+        if name in {'claim', 'ack'}:
+            command.add_argument('--thread-id', required=True)
+        if name == 'ack':
+            command.add_argument('--processing-id', required=True)
+            command.add_argument('--outcome', choices=('handled', 'stale', 'blocked'), required=True)
+            command.add_argument('--evidence', required=True)
+    adequacy = commands.add_parser('adequacy', help='Original scenario plans for independent software test adequacy')
+    adequacy_commands = adequacy.add_subparsers(dest='action', required=True)
+    for name in ('plan', 'status'):
+        command = adequacy_commands.add_parser(name)
+        command.add_argument('task_id')
+        if name == 'plan':
+            command.add_argument('--file', required=True)
+            command.add_argument('--expected-revision', required=True, type=int)
     delegation = commands.add_parser('delegation', help='Persist native delegated work; bots keep creating subagents')
     delegation_commands = delegation.add_subparsers(dest='action', required=True)
     for name in ('register', 'list', 'dispatch', 'attach', 'result', 'accept', 'cancel', 'recover'):
@@ -256,7 +312,7 @@ def parser():
 def _task_command(store, action, args):
     tasks = TaskService(store)
     if action == "create":
-        return tasks.create(load(args.file))
+        return tasks.create(_new_contract(args.file))
     task = tasks.snapshot(args.task_id)
     if action == "status":
         return {**task, "readiness": tasks.readiness(args.task_id)}
@@ -331,6 +387,14 @@ def _task_command(store, action, args):
             return controller.verify(args.task_id)
         return controller.run(args.task_id, resume=action == "resume")
     raise ValueError("Unknown task command")
+
+
+def _new_contract(path):
+    from .profiles import has_software
+    contract = load(path)
+    if isinstance(contract, dict) and contract.get('schema_version') == 2 and has_software(contract):
+        contract.setdefault('test_adequacy', {'version': 1, 'required': True})
+    return contract
 
 
 def _state_project(args):
@@ -420,6 +484,13 @@ def main(argv=None):
                 result = _task_command(store, args.action, args)
             elif cmd == 'delegation':
                 result = _delegation_command(store, args)
+            elif cmd == 'events':
+                result = _events_command(store, args)
+            elif cmd == 'adequacy':
+                from .testing.adequacy import TestAdequacy
+                service = TestAdequacy(store)
+                result = (service.snapshot(args.task_id) if args.action == 'status' else
+                    service.plan(args.task_id, load(args.file), expected_revision=args.expected_revision))
             elif cmd == "access":
                 controller = WorkflowController(store)
                 access = {"credential_ref": args.credential, "target": args.target}
@@ -484,12 +555,14 @@ def main(argv=None):
                 result = (journal.worklog(args.start, args.until, timezone=args.timezone or store.project.timezone) if cmd == "worklog" else
                           journal.meeting_report(args.start, args.until, timezone=args.timezone or store.project.timezone, as_of_end=args.as_of_end))
             elif cmd == "start" and load(args.contract).get("schema_version") == 2:
-                result = TaskService(store).create(load(args.contract))
+                result = TaskService(store).create(_new_contract(args.contract))
             elif cmd == "report" and not TaskService(store).snapshot(args.task_id)["legacy_v1"]:
                 from .delegations import DelegationRegistry
+                from .coordinator import CoordinatorEvents
                 result = {"task": TaskService(store).snapshot(args.task_id), "quality_gate": GateService(store).gate(args.task_id),
                           "project_id": store.project_id, "workspace_id": store.workspace_id,
-                          "delegations": DelegationRegistry(store).snapshot(args.task_id)}
+                          "delegations": DelegationRegistry(store).snapshot(args.task_id),
+                          "coordinator_events": CoordinatorEvents(store).snapshot(args.task_id)}
             else:
                 # Existing Git-only tools remain available for legacy history,
                 # time and continuity. Public execution never reaches Engine.run.

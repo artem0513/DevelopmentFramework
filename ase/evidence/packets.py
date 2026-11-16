@@ -171,6 +171,9 @@ class PacketService:
         files.extend(action_files)
         missing.extend(action_missing)
         from ..delegations import DelegationRegistry
+        from ..testing.adequacy import TestAdequacy
+        test_adequacy_plan = TestAdequacy(context.store).snapshot(task_id)
+        test_adequacy_assessment = TestAdequacy(context.store).assessment(task_id,stage_id)
         try:
             delegation_evidence = DelegationRegistry(context.store).packet_evidence(task_id, stage_id=stage_id)
         except (ValueError, OSError, KeyError, TypeError) as ex:
@@ -180,7 +183,9 @@ class PacketService:
             delegation_evidence = {'status': 'UNAVAILABLE', 'reason': reason}
         for name, data in (("contract", task["contract"]), ("execution_plan", plan), ("source_changes", changes), ("stage_history", stage_history),
                            ("discovery", discovery), ("intake_validation", intake_state["validation"]), ("source_availability", availability), ("artifact_representations", representation_metadata), ("omitted_sources", omitted_sources),
-                           ('delegations', delegation_evidence), ("actual_checks", read_record(context.store.db, "checks", task_id)["payload"])):
+                           ('delegations', delegation_evidence), ('test_adequacy_plan', test_adequacy_plan),
+                           ('test_adequacy_assessment', test_adequacy_assessment),
+                           ("actual_checks", read_record(context.store.db, "checks", task_id)["payload"])):
             content = encode(data)
             files.append({"path": "_ase_context/" + name + ".json", "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest()})
         check = read_record(context.store.db, "checks", task_id)["payload"]

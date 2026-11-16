@@ -16,7 +16,8 @@ ROLE_FILES = {
     'ac': ('skills/independent-ac-verifier/SKILL.md', *COMMON,
         'skills/task-orchestrator/references/profile-evidence.md'),
     'review': ('skills/independent-code-reviewer/SKILL.md', *COMMON,
-        'skills/task-orchestrator/references/profile-evidence.md'),
+        'skills/task-orchestrator/references/profile-evidence.md',
+        'skills/quality-gate/references/test-adequacy.md'),
     'diagnostic': ('skills/task-discovery/SKILL.md', *COMMON),
 }
 

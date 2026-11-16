@@ -53,7 +53,16 @@ class DelegationRegistry:
         append_event(self.store.db, 'delegation:' + key + ':' + str(result['revision']), 'delegation_' + value['state'].lower(), value['task_id'],
             {'work_id': value['id'], 'state': value['state'], 'attempt_id': (value.get('attempt') or {}).get('id'),
              'result_sha256': (value.get('result') or {}).get('sha256')})
+        self._notify(value)
         return result
+
+    def _notify(self, value):
+        if value.get('result'):
+            from .coordinator import CoordinatorEvents
+            CoordinatorEvents(self.store).enqueue(value['task_id'], source_kind='delegation',
+                source_id='delegation:' + value['attempt']['id'],
+                status=value['result_summary']['status'], summary=value['result_summary']['summary'],
+                evidence=[{'ref': value['result']['path'], 'sha256': value['result']['sha256']}])
 
     @staticmethod
     def _revision(record, expected_revision):
@@ -314,6 +323,7 @@ class DelegationRegistry:
             reference = seal_result(self.store, value, payload)
             if value.get('result') == reference and value['state'] in {'RESULT_READY', 'ACCEPTED'}:
                 load_result(self.store, value)
+                self._notify(value)
                 return record
             self._revision(record, expected_revision)
             value['result'] = reference
@@ -386,6 +396,7 @@ class DelegationRegistry:
                         value['attempt']['native'] = {'backend': sealed['backend'], 'agent_id': sealed['agent_id']}
                         value['state'] = 'RESULT_READY'
                         record = self._save(record, value)
+                self._notify(value)
                 recovered.append(record)
         return {'task_id': task_id, 'work': recovered, 'authority': 'Recovery observations only; no native launch, target effect or semantic acceptance'}
 

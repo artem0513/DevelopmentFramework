@@ -317,6 +317,8 @@ def _routing(skill_root, project_local=False):
             'research and infrastructure use their own acceptance profiles. Preserve project rules and user authorization. '
             'Restore local context, propose the outcome concisely, and reuse existing scope approval. '
             'Before asking about a missing fact, inspect supplied context and relevant authorized sources or environment with safe read-only checks. '
+            'Keep the original chat as lead, process its durable ase events inbox and return results through available native tools. '
+            'For software, plan relevant risk scenarios and require current independent test adequacy alongside acceptance/review. '
             'Distinguish retrievable facts from owner-only decisions; ask only for a material remaining gap, with checked evidence and a concise hypothesis/recommendation. '
             'Independent acceptance and review plus the evidence gate are required for verified completion.'
             + (' Use this project\'s .devframework/bin/ase.ps1 (PowerShell) or .devframework/bin/ase (shell) '

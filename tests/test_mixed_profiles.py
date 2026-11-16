@@ -112,7 +112,7 @@ class MixedProfileTests(unittest.TestCase):
         task = self.tasks.snapshot(receipt["fixture_task_id"])
         payload = {"criteria": [{"id": ac["id"], "expected": ac["expected"], "status": "PASS",
                    "evidence": ["actual local artifact hashes"], "method": "fixture isolates domain mapping", "missing_coverage": []}
-                   for ac in task["contract"]["acceptance"]]} if receipt["role"] == "ac" else {"findings": []}
+                   for ac in task["contract"]["acceptance"]]} if receipt["role"] == "ac" else {"findings": [], "summary": "Protocol-only fixture for mixed-profile routing; no independent semantic acceptance."}
         return {"evidence_kind": "independent_cli", "result": {"payload": payload, "session_id": receipt["execution_id"]}}
 
     def test_flat_mixed_cannot_pass_as_artifact_only(self):

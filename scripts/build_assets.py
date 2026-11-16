@@ -55,6 +55,9 @@ def generated_assets(root=ROOT):
                             'For managed native delegation, commit ase delegation register/dispatch before native spawn, '
                             'then attach the actual handle, seal the result and separately accept it; unknown launches require reconciliation. '
                             'Native advisory answers do not replace genuine independent Runner receipts. '
+                            'Keep the original chat as lead and consume its durable ase events inbox; native return tools are optional. '
+                            'For software, preserve explicit test_adequacy policy and a scenario plan, and require a separate '
+                            'current adequacy assessment alongside original AC/review. Positive counts alone do not prove coverage. '
                             'This descriptor grants no access, approval or independent execution by itself.')
             if target == 'codex':
                 path = root / 'agents' / (role + '.toml')
