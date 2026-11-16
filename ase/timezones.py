@@ -1,4 +1,4 @@
-"""IANA reporting zones, with a verified Bucharest TZif for Windows."""
+"""Native local reporting time and explicitly selected IANA timezone rules."""
 from datetime import timezone
 import hashlib
 from io import BytesIO
@@ -19,7 +19,13 @@ _from_file = ZoneInfo.from_file
 
 
 def resolve_timezone(name, *, tzif_path=None):
-    """Resolve UTC or IANA rules; never replace missing rules with a fixed offset.
+    """Resolve local, UTC or IANA rules without caching a current fixed offset.
+
+    ``None`` is deliberate for ``local``: datetime.astimezone(None) uses the
+    operating system's rules for that instant, and naive midnight boundaries
+    convert from local time with the rules for their own date. This also works
+    on Windows without installing an IANA database. An explicit named zone
+    still requires its actual rules and never silently falls back to local.
 
     An explicit TZif is checked against the bundled zone's provenance too. This
     permits relocation without silently accepting a different or corrupt file.
@@ -27,6 +33,8 @@ def resolve_timezone(name, *, tzif_path=None):
     """
     if name == "UTC" and tzif_path is None:
         return timezone.utc
+    if name == "local" and tzif_path is None:
+        return None
     if not isinstance(name, str) or not name or "\0" in name:
         raise TimezoneDataUnavailable("Invalid timezone name")
     root = Path(__file__).parent / "data" / "timezones"

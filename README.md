@@ -1,70 +1,72 @@
 # DevelopmentFramework
 
-A local workflow for managed software, infrastructure, document, research and mixed tasks. Portable skills coordinate a Python 3.11+ standard-library CLI, isolated SQLite memory, executed evidence and independent acceptance/review. It needs no framework MCP server or background service.
+Локальный рабочий процесс для Codex, Claude Code и GitHub Copilot: от разбора задачи до проверенного результата и отчёта. Подходит для кода, инфраструктуры, документов и исследований.
 
-Adoption is explicit per project or workspace. A shared runtime, an installed skill or reading another directory does not adopt it. Ordinary questions use domain tools. A financial report with warnings uses document/research evidence; changing its generating code uses the software profile.
+Фреймворк сочетает **скиллы** для бота и **CLI `ase`** для памяти, журнала, проверок и восстановления. MCP-сервер и отдельный сервис не нужны.
 
-For everything in the selected project folder, initialize the selected bots:
+## Что происходит после задачи
+
+1. Бот изучает относящиеся к задаче материалы, текущие возможности и похожие решения коллег.
+2. Понятную задачу выполняет сразу. Перед уточнениями проверяет доступный контекст и относящееся к задаче окружение; затем коротко предлагает решение и спрашивает о реальном блокере.
+3. Выполняет работу, использует подходящие инструменты, запускает независимое ревью и проверки; исправляет подтверждённые ошибки. Независимые части может делегировать доступным сабагентам.
+4. Сохраняет контекст, решения, результаты и блокеры в локальную память и датированный журнал; даёт короткий итог.
+
+## Подключить к существующему проекту
+
+Нужны **Python 3.11+**, **Git** и выбранный бот с настроенным входом. Для независимых сеансов нужны соответствующий CLI (`codex`, `claude` или `copilot`), доступный фреймворку, и разрешения на его запуск. Установщик не устанавливает эти CLI и не предоставляет подписку.
+
+Из папки, где лежит ваш `MyProject`, выполните:
+
+```sh
+git clone https://github.com/artem0513/DevelopmentFramework.git
+python DevelopmentFramework/scripts/install.py --project ./MyProject --project-local --target codex --target claude --target copilot
+```
+
+Замените `./MyProject` своим путём и оставьте только нужные `--target`. Для просмотра изменений без записи добавьте `--preview`. Существующие инструкции сохраняются, изменяемые файлы фреймворка получают резервные копии.
+
+Установка создаёт внутри выбранного проекта:
+
+| Что | Где |
+| --- | --- |
+| Настройки и runtime | `.devframework/config.toml`, `.devframework/autonomous-se/` |
+| CLI | `.devframework/bin/ase.ps1` и `.devframework/bin/ase` |
+| Приватная память, журнал и доказательства проверок | `.devframework/local/` — исключена из Git |
+
+Новые проекты используют **локальное время ПК, где выполняется `ase`**; вручную выбирать регион не нужно. События хранятся в UTC, а дни и время отчётов вычисляются по настройкам ОС. Память не синхронизируется между компьютерами автоматически.
+
+## Работать в Codex, Claude и Copilot
+
+Откройте **папку своего проекта** и начните новый сеанс бота после установки:
+
+| Бот | Инструкции и скиллы проекта |
+| --- | --- |
+| [Codex](https://learn.chatgpt.com/docs/build-skills) — приложение, IDE или CLI | `AGENTS.md` / активный `AGENTS.override.md`, `.agents/skills/` |
+| [Claude Code](https://code.claude.com/docs/en/skills) | `CLAUDE.md`, `.claude/skills/` |
+| [GitHub Copilot](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/add-skills) — режим агента или CLI | `.github/copilot-instructions.md`, `.github/skills/` |
+
+Дальше ставьте задачу обычным сообщением, например:
+
+> Добавь HTTP-клиент для сервиса оплаты. Сначала найди похожие реализации в проекте. Понятные детали решай сам; спрашивай только о существенных блокерах. Проверь результат, сделай независимое ревью и сохрани контекст и итог в журнал.
+
+Вручную создавать JSON-задачи и запускать каждый этап не требуется: это делает бот по установленным скиллам. Можно попросить «сначала покажи короткий план, без изменений», «не ищи похожие реализации» или «сохрани контекст и остановись».
+
+CLI доступен и вручную из папки проекта. PowerShell:
 
 ```powershell
-python scripts/install.py --project D:/path/to/workspace --project-local --target codex --target claude --target copilot --timezone Europe/Bucharest
+.\.devframework\bin\ase.ps1 context
+.\.devframework\bin\ase.ps1 meeting-report --from 2026-11-01 --until 2026-11-02
 ```
 
-This creates project-owned runtime/settings under `.devframework` and ignored memory, dated journal, logs, receipts and backups under `.devframework/local`. Use `.devframework/bin/ase.ps1` in PowerShell or `.devframework/bin/ase` in a shell; no global installation or `ASE_HOME` setting is needed. The bots use their existing native account login. Select only the targets you want. See [project-local usage](docs/project-local.md).
+В shell используйте `./.devframework/bin/ase` с теми же аргументами. Даты — пример; `--until` не включает указанный день. Обновление выполняется повторным запуском установщика из актуальной версии DevelopmentFramework; после клонирования подключённого проекта также повторите установку.
 
-To review exact changes first, add `--preview` and apply its manifest. Shared tooling remains supported with the original project-adoption mode:
+## Ограничения и подробности
 
-```powershell
-python scripts/install.py --project D:/path/to/workspace --target codex --preview > install-manifest.json
-# Apply only within the user-authorized installation scope after reviewing the manifest:
-python scripts/install.py --apply-manifest install-manifest.json
-```
+Живое выполнение проверялось на Codex. Для Claude и Copilot есть адаптеры и проектные файлы с автоматическими проверками; живые сеансы этих ботов пока не проверены. Облачному агенту нужен отдельно подготовленный runtime и доступ к данным: локальная память ПК туда автоматически не переносится.
 
-The manifest lists exact owned files, hashes, prior hashes and backup paths. Preview writes nothing. Explicit targets are `codex`, `claude`, `copilot`; repeat `--target` to prepare several. Codex receives `.agents/skills` and `.codex/agents`; Claude receives `.claude/skills` and `.claude/agents`; Copilot receives `.github/skills` and `.github/agents`. All eleven skill packages come from canonical `skills/`; native descriptors are generated by `python scripts/build_assets.py`. Copied files are not independent sources.
+Локальный gate проверяет доказательства, но не защищает от другого процесса с теми же правами ОС. Для обязательного контроля публикации нужны доверенный CI и защита ветки. Публикация требует отдельной авторизации назначения.
 
-Project instructions, custom configuration/comments, unrelated skills and other projects are preserved. Known destination/link/hardlink/type conflicts fail before any installation write. Changed owned files are backed up. Replanning/reapplying unchanged content is idempotent. `--runtime-only --target codex` prepares shared tooling without routing. Legacy global Codex activation remains available only through explicit `--global`; it is never implied by other modes. See [adoption and rollback](docs/project-adoption.md).
-
-No live Claude/Copilot installation or model acceptance is claimed for this delivery. Their descriptors/adapters are protocol and packaging support pending a separately authorized, available live environment. Codex live evidence is recorded separately from deterministic tests. Native role files and successful fixtures do not establish subscriptions, permissions or independent model execution.
-
-From this checkout use `python -m ase`; installed launchers are named `ase` / `ase.ps1` under the chosen tooling home's `bin`. They do not change authentication or force a provider home. State selection is explicit `--home`, then the selected project's `.devframework/config.toml`, then `ASE_HOME`, then the platform AutonomousSE directory. A local launcher anchors its own project even when called from another directory. Shared tooling defaults to a `tooling` child of the legacy state location, independently of provider configuration.
-
-Explicit local credential import and on-demand service access are shared by all three backends through the same CLI. On Windows, DPAPI encrypts the separate vault under the current OS user; project memory/export contains references only. Approved checks/actions can reuse a session or authenticate lazily, with real interaction/denied access reported as typed blockers. See [local credentials](docs/local-credentials.md) for the outside-workspace JSON import, exact-target approval, supported CLI recipes/HTTP observations and platform limits. No automatic provider-account migration or universal browser login is implied.
-
-A managed task moves through intake, scoped discovery, a concise proposal and recorded exact-version approval, execution, checks, independent acceptance/review, the gate and a dated closure. Existing user authorization is reused for technical repairs in the same scope. Ask only about a material decision that cannot be retrieved and has no safe in-scope default. See the [workflow](docs/workflow.md).
-
-The [functional module map](docs/module-map.md) separates memory, reporting, test design/execution, review, evidence/blockers, delegation, recovery and the other runtime responsibilities. `python -B -m ase.modules` lists their source/test ownership; `python -B -m ase.modules memory --test` runs one block's checks. Session closures retain per-task context and dated historical summaries. Meeting reports apply explicit corrections, avoid completion duplicates and omit terminal next actions; knowledge retrieval flags unresolved overlapping alternatives separately from source freshness.
-
-Useful independent parts may run through available, permitted native subagents. One lead assigns bounded inputs, read/write ownership, outputs, acceptance and dependencies, then integrates results and performs final checks/review. The ready set changes after each result or dependency: waves such as 1 → 4 → 1 → 5 are valid, with excess work queued to the host's current capacity. Shared-root runtime mutations remain serialized. Missing optional delegation uses serial work; native advisory replies do not replace genuine Runner evidence or create new approval/budget.
-
-Managed native work uses the project-local `ase delegation` registry: register assignments/dependencies, commit a dispatch ticket before the bot spawns a worker, attach the real native handle, capture its private output, and separately accept the result. `ase delegation list`/`recover` and `ase restore` retain exact attempts across coordinator crashes. An uncertain launch is held rather than restarted on a timer; unsettled work blocks closure/publication. Bots keep native lifecycle control. Registry acceptance is advisory; original independent AC/review remain required. See [parallel work](skills/task-orchestrator/references/parallel-work.md).
-
-```text
-ase project register --root ROOT --kind document --timezone Europe/Bucharest
-ase --project PROJECT_ID capabilities
-ase --project PROJECT_ID task create --file TASK_V2_JSON
-ase --project PROJECT_ID task propose TASK --file PROPOSAL_JSON --expected-revision N
-ase --project PROJECT_ID task approve TASK --proposal-hash HASH --user-message-ref REF --stage STAGE
-ase --project PROJECT_ID run TASK
-ase --project PROJECT_ID check TASK
-ase --project PROJECT_ID verify TASK
-ase --project PROJECT_ID gate TASK
-ase --project PROJECT_ID report TASK
-ase --project PROJECT_ID worklog --from YYYY-MM-DD --until YYYY-MM-DD --timezone Europe/Bucharest
-ase --project PROJECT_ID meeting-report --from YYYY-MM-DD --until YYYY-MM-DD --timezone Europe/Bucharest
-```
-
-Global `--home` and `--project` options precede the subcommand; `--repo` remains a compatibility selector. Templates are worksheets, not authority. Use each command's `--help` for current payload fields. Old v1 tasks remain historical until explicitly proposed/approved for v2 continuation; they do not gain approval from migration.
-
-Software approval preserves successful mandatory commands, positive actual test counts, no skipped required tests, separate AC/code review and current source/contract/execution-plan fingerprints. P0/P1/P2 block approval; P3 is advisory. Other profiles need their own delivered artifacts, source coverage or actual resource postconditions plus substantive independent judgments. Mixed parents cannot complete with uncovered mandatory children.
-
-`gate` exits **0 APPROVED**, **2 REJECTED**, **3 BLOCKED**. A verifier process finishing or a JSON PASS claim is insufficient. Any unresolved blocked reason stops mutation even when the overall verdict is REJECTED. Candidate budgets persist across resume: at most three cycles per stage, twelve per root task, one 1200-second diagnostic pass per stage, and any stricter legacy maximum. Unknown external effects must be reconciled before retrying.
-
-Session closure records results, checks, decisions, blockers and one next action atomically with revision checks. A closed session is not automatically a completed task. `worklog` and `meeting-report` use explicit local calendar bounds (`--until` exclusive); legacy `daily`/`weekly` time-entry semantics remain separate. Measured agent time is not inferred human or billable time. Reports are drafts until explicit destination authorization permits sending.
-
-Memory stays on this computer, isolated by registered project/workspace identity. It stores concise source-backed facts, freshness, decisions and checkpoints, not raw chats/recordings or credentials. Export/import is explicit and reviewed; cloud agents do not automatically obtain local memory. Known verbose logs may contain source/tool output; review them before sharing and preserve the existing retention policy.
-
-Publication remains a dry run by default, requires an explicitly authorized exact destination, and preserves existing protected-path/high-risk checks and Git hooks. It never force-pushes or merges automatically. This is a local reliability layer: another process with the same OS identity can alter local state. Enforce publishing with a pinned trusted CI runner, separate credentials and server-side branch protection. See [trust boundary](docs/ADR-001.md) and [trusted CI policy](templates/trusted-ci-policy.md).
-
-The old `--register-verifier` option now fails explicitly without changing files/configuration. Existing MCP registrations are not silently removed: [ADR 004](docs/ADR-004.md) and [project adoption](docs/project-adoption.md) document a separate preview and authorized cleanup. [ADR 002](docs/ADR-002.md) remains historical.
-
-Run runtime tests with `python -m unittest discover -s tests -v`; use `python scripts/build_assets.py --check` for generated descriptor consistency. Packaging/file assertions prove structure only; model routing and live execution require separately recorded consuming-agent evidence. Historical validation reports describe their original environment and do not establish current backend support.
+- [Установка, обновление и локальная память](docs/project-local.md)
+- [Рабочий процесс, вопросы и восстановление](docs/workflow.md)
+- [Модули и их проверки](docs/module-map.md)
+- [Учётные данные](docs/local-credentials.md)
+- [Граница доверия](docs/ADR-001.md)

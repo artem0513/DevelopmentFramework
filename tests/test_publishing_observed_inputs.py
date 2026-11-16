@@ -128,6 +128,33 @@ class PythonPublicationScanTests(unittest.TestCase):
         os.link(original, linked)
         self.assertIn("redirected or shared", self.publisher._secret_check({"files": {}}, {"files": {"linked.py": "changed"}}))
 
+    def test_unchanged_link_target_allows_reviewed_target_content_change(self):
+        # Windows without link privilege uses only a filesystem metadata seam;
+        # secret classification and before/current fingerprint logic stay real.
+        link = self.repo / "helper-link"
+        link.write_text("value = 2\n", encoding="utf-8")
+        before = {"files": {"helper-link": "link:app.py:" + "a" * 64}}
+        current = {"files": {"helper-link": "link:app.py:" + "b" * 64}}
+        with patch.object(Path, "is_symlink", lambda path: path == link), patch("ase.publishing.os.readlink", return_value="app.py"):
+            self.assertIsNone(self.publisher._secret_check(before, current))
+
+    def test_new_or_retargeted_links_remain_rejected(self):
+        link = self.repo / "helper-link"
+        link.write_text("value = 2\n", encoding="utf-8")
+        current = {"files": {"helper-link": "link:app.py:" + "b" * 64}}
+        for prior in (None, "link:other.py:" + "b" * 64, "ordinary-file-hash"):
+            before = {"files": {} if prior is None else {"helper-link": prior}}
+            with self.subTest(prior=prior), patch.object(Path, "is_symlink", lambda path: path == link), patch("ase.publishing.os.readlink", return_value="app.py"):
+                self.assertIn("redirected or shared", self.publisher._secret_check(before, current))
+
+    def test_link_changed_after_snapshot_remains_rejected(self):
+        link = self.repo / "helper-link"
+        link.write_text("value = 2\n", encoding="utf-8")
+        before = {"files": {"helper-link": "link:app.py:" + "a" * 64}}
+        current = {"files": {"helper-link": "link:app.py:" + "b" * 64}}
+        with patch.object(Path, "is_symlink", lambda path: path == link), patch("ase.publishing.os.readlink", return_value="other.py"):
+            self.assertIn("redirected or shared", self.publisher._secret_check(before, current))
+
     def test_this_test_module_has_no_embedded_candidate_payload(self):
         self.assertIsNone(self.inspect(Path(__file__).read_text(encoding="utf-8")))
 

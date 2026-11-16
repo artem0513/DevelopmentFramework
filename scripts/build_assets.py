@@ -47,6 +47,8 @@ def generated_assets(root=ROOT):
             instructions = ('Read ' + relative + '/' + skill + '/SKILL.md in the selected workspace. '
                             'Preserve the original approved scope and existing permissions. '
                             'Use the local ase CLI and original evidence; report unavailable capabilities honestly. '
+                            'Inspect authorized context and relevant safe read-only evidence before proposing an owner question; '
+                            'distinguish retrievable facts from owner-only decisions and give a concise supported hypothesis/recommendation. '
                             'For useful independent ready work with permitted native subagents, read ' + relative +
                             '/task-orchestrator/references/parallel-work.md. One lead integrates adaptive waves while preserving '
                             'root leases, ownership and budgets; serial fallback remains available. '

@@ -79,6 +79,6 @@
     "backend": "codex"
   },
   "reporting": {
-    "timezone": "Europe/Bucharest"
+    "timezone": "local"
   }
 }

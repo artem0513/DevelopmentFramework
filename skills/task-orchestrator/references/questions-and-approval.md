@@ -6,10 +6,12 @@ Use this reference only for a material unresolved decision or a changed authoriz
 
 A clear assignment authorizes its in-scope execution immediately. Record a concise internal proposal and original authorization; do not require another approval of the same work. Choose ordinary internal details and technical taste using project rules and suitable colleague examples. A question is necessary for a genuine unresolved business/access/authority blocker or serious architectural change beyond the approved scope: relevant [answer investigation](../../task-discovery/references/answer-investigation.md) cannot establish the answer, or only the owner can decide; it materially changes outcome, compatibility, cost, risk or authority; and no safe in-scope choice is supported. Existing behavior does not establish a future business decision.
 
-Send a roughly 4–6-line owner message with these parts, in order:
+For retrievable facts, a question needs actual inspected evidence or a concrete access/scope limitation, plus a stopping reason: no useful remaining authorized check can resolve the material gap. Missing text in the assignment, an untried tool, a planned command or one denied optional method is insufficient. Check supplied/fresh context first, then the relevant code/history, logs, data or environment as appropriate. Do not delay a genuinely owner-only decision with irrelevant research; do not invent a plausible answer merely to avoid asking.
 
-1. The remaining material uncertainty.
-2. The relevant evidence inspected and what it establishes; label unavailable evidence.
+Send a roughly 2–4-line owner message with these parts, in order:
+
+1. The relevant evidence actually inspected and what it establishes; label unavailable evidence.
+2. The remaining material uncertainty and why further authorized checks cannot settle it.
 3. The hypothesis about the owner's intent, explicitly unconfirmed.
 4. The recommended solution and why it fits; keep it distinct from the intent hypothesis.
 5. One concrete decision requested, including a material alternative's consequence when useful.

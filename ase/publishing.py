@@ -356,7 +356,16 @@ class Publisher:
             if path.is_file() and (path.name.lower() in {".env", "id_rsa", "id_ed25519"}
                                   or path.suffix.lower() in {".pfx", ".p12", ".pem", ".key"}):
                 return "Potential credential file: " + name
-            if path.is_symlink() or (path.is_file() and path.stat().st_nlink > 1):
+            if path.is_symlink():
+                # The fingerprint also binds dereferenced bytes. A reviewed
+                # target change does not change an existing Git link blob.
+                before = baseline["files"].get(name, "")
+                target = "link:" + os.readlink(path)
+                if (version.startswith("link:") and before.startswith("link:")
+                        and before.rsplit(":", 1)[0] == version.rsplit(":", 1)[0] == target):
+                    continue
+                return "Changed source is a redirected or shared file: " + name
+            if path.is_file() and path.stat().st_nlink > 1:
                 return "Changed source is a redirected or shared file: " + name
             if path.is_file() and path.stat().st_size < 2_000_000:
                 content = path.read_text(encoding="utf-8", errors="replace")

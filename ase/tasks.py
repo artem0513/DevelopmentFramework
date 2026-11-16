@@ -164,7 +164,7 @@ def validate_contract_v2(value):
     if policy["backend"] not in {"codex", "claude", "copilot"}:
         raise ValueError("Unknown backend")
     c["execution_policy"] = policy
-    c.setdefault("reporting", {"timezone": "Europe/Bucharest"})
+    c.setdefault("reporting", {"timezone": "local"})
     text(encode(c), "contract", limit=200000)
     return c
 

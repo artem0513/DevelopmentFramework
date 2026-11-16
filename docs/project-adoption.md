@@ -31,7 +31,7 @@ Shared tooling defaults to `AutonomousSE/tooling` under the platform state locat
 
 Prepare tooling alone with `python scripts/install.py --runtime-only --target codex --preview`. This creates no discoverable global skills/roles or project router. Legacy explicit Codex global activation remains `--global`; neither project installation nor runtime preparation implies it. A custom global skill destination requires that explicit mode.
 
-Configure project registration/timezone, actual checks, source inventory, domain rules and resource boundaries after adoption. Templates are descriptive worksheets. A native role file proves neither CLI availability nor independent model execution. Codex live evidence must be recorded separately. Claude and Copilot receive disposable packaging/protocol checks and a risk assessment in this delivery; no live installation, subscription or model functionality is asserted.
+Configure project registration (new projects default to current-PC local reporting time), actual checks, source inventory, domain rules and resource boundaries after adoption. Templates are descriptive worksheets. A native role file proves neither CLI availability nor independent model execution. Codex live evidence must be recorded separately. Claude and Copilot receive disposable packaging/protocol checks and a risk assessment in this delivery; no live installation, subscription or model functionality is asserted.
 
 ## Historical MCP registration
 

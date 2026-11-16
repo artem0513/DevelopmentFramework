@@ -27,6 +27,25 @@ def snapshot(root):
 
 
 class PortableInstallTests(unittest.TestCase):
+    def test_all_three_entrypoints_require_investigation_before_owner_questions(self):
+        """Installed entrypoint coverage; native behavior is checked separately."""
+        pointers = ('AGENTS.md', 'CLAUDE.md', '.github/copilot-instructions.md')
+        for name in pointers:
+            path = self.project / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Keep existing owner instructions.\n', encoding='utf-8')
+        installer.apply_install(self.plan(['codex', 'claude', 'copilot']))
+        for name in pointers:
+            with self.subTest(entrypoint=name):
+                body = (self.project / name).read_text(encoding='utf-8')
+                self.assertTrue(body.startswith('Keep existing owner instructions.'))
+                managed = body.split(installer.BEGIN, 1)[1].split(installer.END, 1)[0]
+                self.assertIn('Before asking', managed)
+                self.assertIn('supplied context', managed)
+                self.assertIn('read-only', managed)
+                self.assertIn('owner-only decisions', managed)
+                self.assertIn('hypothesis/recommendation', managed)
+
     def test_local_credential_reference_is_copied_for_all_three_backends(self):
         installer.apply_install(self.plan(['codex', 'claude', 'copilot']))
         for directory in ('.agents/skills', '.claude/skills', '.github/skills'):

@@ -158,7 +158,7 @@ class ProjectRegistry:
         if kind is not None and (not isinstance(kind, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", kind)):
             raise ValueError("Project kind must be a concise identifier")
         if timezone is not None and (not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+./-]{1,128}", timezone)):
-            raise ValueError("Project timezone must be an IANA timezone identifier")
+            raise ValueError("Project timezone must be local or an IANA timezone identifier")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self._lookup(str(root))
@@ -171,7 +171,7 @@ class ProjectRegistry:
                 if valid_local_home and self.db.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
                     raise ValueError("Existing project-local identity requires explicit project attach after relocation")
                 config = local_config(root)
-                default_timezone = config["timezone"] if config else "Europe/Bucharest"
+                default_timezone = config["timezone"] if config else "local"
                 selected_timezone = timezone or default_timezone
                 resolve_timezone(selected_timezone)
                 project_id, workspace_id = str(uuid.uuid4()), str(uuid.uuid4())

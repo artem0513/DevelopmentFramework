@@ -26,13 +26,13 @@ def _settings(value):
         raise ValueError('Project-local log_retention_days must be an integer from 1 to 365')
     timezone = value['timezone']
     if not isinstance(timezone, str) or not timezone or len(timezone) > 100:
-        raise ValueError('Project-local timezone must be an IANA name')
+        raise ValueError('Project-local timezone must be local or an IANA name')
     from .timezones import resolve_timezone
     resolve_timezone(timezone)
     return dict(value)
 
 
-def config_bytes(targets, timezone='UTC', log_retention_days=30):
+def config_bytes(targets, timezone='local', log_retention_days=30):
     value = _settings({'schema_version': 1, 'mode': 'project-local', 'targets': targets,
                        'timezone': timezone, 'log_retention_days': log_retention_days})
     return ('# DevelopmentFramework project settings; no secrets.\n'

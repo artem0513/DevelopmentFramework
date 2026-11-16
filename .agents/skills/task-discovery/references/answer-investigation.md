@@ -4,6 +4,14 @@ Apply [evidence decisions](../../task-orchestrator/references/evidence-decisions
 
 Use for an unresolved fact or conflicting requirement that could materially affect the task. This is a question-driven investigation, not an inventory of the whole environment. Obvious contradictions in the request or a decision only the owner can make can go directly to the owner; do not delay them with irrelevant searches.
 
+## Before the first owner question
+
+Missing prompt text does not establish missing knowledge or denied access. First classify the gap: an observable fact about an existing target, an unmade owner decision, or an authorization boundary. Retrieve the supplied/current context before asking factual questions. For an observable gap, execute a relevant authorized read-only check when available, or state the concrete reason it cannot be performed. The exact tool depends on the task; neither a server command nor Git/log/database searches are a universal checklist.
+
+Before escalating a factual gap, keep a short internal evidence note: the uncertainty, sources/checks actually used and their relevant results, what remains unknown, and why no useful authorized next check can settle it. Existing task/checkpoint notes suffice; ordinary questions do not need a new task or database ceremony. Do not label a source inspected merely because its locator or tool exists. A single denied method is not proof that every relevant access path is unavailable.
+
+Ask for the decision or access that actually unblocks the requested outcome. Do not ask the owner to manually supply an easily retrievable fact when the real blocker is a failed required connection. If fresh evidence answers the question, proceed without a question. If a safe in-scope default is supported, choose it. An existing implementation can support a recommendation but cannot settle an unmade future business decision. Do not contact colleagues automatically.
+
 ## Choose evidence for the question
 
 Check the assignment for obvious gaps first. State the uncertainty, the hypothesis about intended behavior and what observation would distinguish plausible alternatives. Restore fresh relevant project/meeting knowledge before repeating research. Start with the smallest authorized check likely to change the decision; record actual observations separately from the intent hypothesis, recommended solution and proposed next checks. Re-evaluate the remaining gaps after each material finding or owner answer.
@@ -38,4 +46,4 @@ Stopping investigation does not automatically mean asking a question. Choose a s
 
 Keep the unresolved question, inspected source locators/current version/time window, observations, intent hypothesis, recommendation and reason, remaining unknowns, next useful lead or stopping reason, and effort actually used. Mark unavailable/uninspected sources and explicit limits. Update existing project knowledge/checkpoint and dated journal without storing raw logs, rows, conversations or secrets. Refresh affected conclusions when their sources or an owner answer change; a previously exhausted search is not permanent proof of absence.
 
-Use a roughly 4–6-line owner message: remaining uncertainty; checked evidence; intent hypothesis labeled unconfirmed; recommended solution and why; one concrete decision. Keep the hypothesis distinct from the recommendation. For team input, route the concrete question through the owner under the questions-and-approval workflow.
+Use a roughly 2–4-line owner message: remaining uncertainty; checked evidence; intent hypothesis labeled unconfirmed; recommended solution and why; one concrete decision. Keep the hypothesis distinct from the recommendation. For team input, route the concrete question through the owner under the questions-and-approval workflow.

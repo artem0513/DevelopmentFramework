@@ -43,7 +43,7 @@ MODULES = (
         'edit_application local_edit_authority local_edit_inventory local_edit_recovery candidate_capture candidate_capture_recovery audit_candidate_authority',
         ('storage','tasks')),
     _module('testing', 'Execute approved checks, capture logs and actual test counts.',
-        'testing/__init__.py testing/execution.py', 'bun_counts command_log_paths secret_execution',
+        'testing/__init__.py testing/execution.py', 'bun_counts command_log_paths secret_execution ci_runner',
         ('storage','tasks','discovery','execution')),
     _module('review', 'Run independent acceptance and review sessions against current evidence.',
         'review/__init__.py review/service.py', 'stage_history revision_history audit_prerequisite',

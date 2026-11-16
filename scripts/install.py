@@ -316,6 +316,8 @@ def _routing(skill_root, project_local=False):
             'Choose software only for actual code or configuration implementation; documents, financial analysis, '
             'research and infrastructure use their own acceptance profiles. Preserve project rules and user authorization. '
             'Restore local context, propose the outcome concisely, and reuse existing scope approval. '
+            'Before asking about a missing fact, inspect supplied context and relevant authorized sources or environment with safe read-only checks. '
+            'Distinguish retrievable facts from owner-only decisions; ask only for a material remaining gap, with checked evidence and a concise hypothesis/recommendation. '
             'Independent acceptance and review plus the evidence gate are required for verified completion.'
             + (' Use this project\'s .devframework/bin/ase.ps1 (PowerShell) or .devframework/bin/ase (shell) '
                'for framework commands; .devframework/config.toml selects project-local configuration and '
@@ -392,7 +394,7 @@ def _local_launcher_bytes():
 
 def _local_config_bytes(path, targets, timezone):
     if not path.exists():
-        return config_bytes(targets, timezone='UTC' if timezone is None else timezone)
+        return config_bytes(targets, timezone='local' if timezone is None else timezone)
     data = path.read_bytes()
     existing = data.decode('utf-8')
     try:
@@ -783,7 +785,7 @@ def main(argv=None):
     mode.add_argument('--apply-manifest', type=Path, help='Apply a previously reviewed install/cleanup JSON manifest')
     parser.add_argument('--target', action='append', choices=TARGETS, help='Backend target; repeat for multiple backends')
     parser.add_argument('--project-local', action='store_true', help='Keep runtime/config/private state in the selected project')
-    parser.add_argument('--timezone', help='IANA timezone for project-local configuration (new projects default to UTC)')
+    parser.add_argument('--timezone', help='Reporting timezone: local (default for new projects) or an IANA name')
     state = Path(os.environ.get('ASE_HOME', Path(os.environ.get('LOCALAPPDATA', Path.home() / '.local/share')) / 'AutonomousSE'))
     parser.add_argument('--home', type=Path, help='Shared tooling destination; local mode only accepts project/.devframework')
     parser.add_argument('--skills', type=Path, help='Legacy global destination; requires --global')

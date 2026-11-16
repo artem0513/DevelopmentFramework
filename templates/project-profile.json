@@ -4,7 +4,7 @@
   "repositories": [],
   "sources": [],
   "workspace_kind": null,
-  "timezone": "Europe/Bucharest",
+  "timezone": "local",
   "backend_targets": [],
   "profiles": [],
   "conventions": {

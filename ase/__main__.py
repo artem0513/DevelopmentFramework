@@ -181,7 +181,7 @@ def parser():
     registration = project.add_parser("register")
     registration.add_argument("--root")
     registration.add_argument("--kind", required=True)
-    registration.add_argument("--timezone", help="Reporting timezone; defaults to project-local config")
+    registration.add_argument("--timezone", help="Reporting timezone: local (default) or an IANA name; project-local config may override")
     project.add_parser("list")
     attach = project.add_parser("attach")
     attach.add_argument("project_id")
@@ -352,8 +352,6 @@ def _project_command(args):
     try:
         if args.action == "register":
             config = local_config(selection)
-            if args.timezone is None and config is None:
-                raise ValueError("--timezone is required without project-local configuration")
             root = config["root"] if config else args.root or args.repo
             return asdict(with_registry.register(root, kind=args.kind, timezone=args.timezone))
         if args.action == "attach":

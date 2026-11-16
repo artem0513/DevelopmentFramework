@@ -50,7 +50,7 @@ class ProjectLocalInstallTests(unittest.TestCase):
         installer.apply_install(manifest)
         self.assertEqual(tomllib.loads((self.home / 'config.toml').read_text()), {
             'schema_version': 1, 'mode': 'project-local', 'targets': ['codex', 'claude', 'copilot'],
-            'timezone': 'UTC', 'log_retention_days': 30})
+            'timezone': 'local', 'log_retention_days': 30})
         self.assertTrue((self.home / 'autonomous-se/runtime/ase/__main__.py').is_file())
         self.assertIn('/local/', (self.home / '.gitignore').read_text().splitlines())
         for pointer in ('AGENTS.md', 'CLAUDE.md', '.github/copilot-instructions.md'):
