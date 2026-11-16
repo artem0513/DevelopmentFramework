@@ -17,9 +17,35 @@ class CanonicalTestRunnerTests(unittest.TestCase):
         self.base = Path(temporary.name)
         (self.base / "tests").mkdir()
 
-    def run_tests(self, *args, executable=None):
+    def run_tests(self, *args, executable=None, env=None):
         return subprocess.run([str(executable or sys.executable), "-B", str(RUNNER), *args],
-            cwd=self.base, capture_output=True, text=True, timeout=15)
+            cwd=self.base, env=env, capture_output=True, text=True, timeout=15)
+
+    def test_aliased_temp_is_physical_only_in_the_test_child(self):
+        physical = self.base / "physical-temp"
+        physical.mkdir()
+        alias = self.base / "temporary-alias"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(physical), str(alias))
+        else:
+            alias.symlink_to(physical, target_is_directory=True)
+        from ase.runner import checked_path
+        with self.assertRaisesRegex(ValueError, "Reparse points"):
+            checked_path(alias, directory=True)
+        (self.base / "tests" / "test_temp_path.py").write_text(
+            "import os, pathlib, tempfile, unittest\n"
+            "class TempPathTests(unittest.TestCase):\n"
+            " def test_temp_has_no_alias(self):\n"
+            "  path = pathlib.Path(tempfile.gettempdir())\n"
+            "  self.assertEqual(path, path.resolve())\n"
+            "  for key in ('TMPDIR','TEMP','TMP'): self.assertEqual(os.environ[key], str(path))\n",
+            encoding="utf-8")
+        environment = {**os.environ, **{key: str(alias) for key in ("TMPDIR", "TEMP", "TMP")}}
+        result = self.run_tests(env=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(environment["TEMP"], str(alias))
+        self.assertIn("Ran 1 test", result.stderr)
 
     def test_default_discovery_relaunches_an_aliased_interpreter(self):
         executable = Path(sys.executable).resolve()

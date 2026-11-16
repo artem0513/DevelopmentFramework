@@ -47,11 +47,16 @@ class TimezoneTests(unittest.TestCase):
 class LocalTimeTests(unittest.TestCase):
     """Native local rules and real journal/CLI integration in isolated processes."""
 
-    def local_process(self, source, zone='EST5EDT'):
+    def local_process(self, source, zone=None):
         import os
         import subprocess
         import sys
         import textwrap
+        # POSIX leaves omitted DST rules to host posixrules; the Windows CRT
+        # supports the shorter form and applies US rules. Pin the same intended
+        # transition dates explicitly where the full POSIX syntax is supported.
+        if zone is None:
+            zone = 'EST5EDT' if os.name == 'nt' else 'EST5EDT,M3.2.0/2,M11.1.0/2'
         root = Path(__file__).resolve().parents[1]
         result = subprocess.run([sys.executable, '-B', '-c', textwrap.dedent(source)],
             cwd=root, env={**os.environ, 'TZ': zone, 'PYTHONPATH': str(root), 'PYTHONDONTWRITEBYTECODE': '1'},
