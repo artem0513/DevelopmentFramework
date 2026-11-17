@@ -353,9 +353,6 @@ class _Lock:
             self.vault.directory.mkdir(parents=True, exist_ok=True)
             _safe_path(self.vault.lock_path)
             self.stream = self.vault.lock_path.open('a+b')
-            self.stream.seek(0, 2)
-            if self.stream.tell() == 0:
-                self.stream.write(b'0'); self.stream.flush()
             deadline = time.monotonic() + self.timeout
             while True:
                 if self.cancel_requested is not None and self.cancel_requested():
@@ -366,6 +363,11 @@ class _Lock:
                     self.stream.seek(0); msvcrt.locking(self.stream.fileno(), msvcrt.LK_NBLCK, 1); break
                 except OSError:
                     time.sleep(min(.05, max(0, deadline - time.monotonic())))
+            # Windows permits locking past EOF. Initialize only while owning
+            # byte zero, so another holder cannot reject an unguarded write.
+            self.stream.seek(0, 2)
+            if self.stream.tell() == 0:
+                self.stream.write(b'0'); self.stream.flush()
             return self
         except CredentialError:
             if self.stream: self.stream.close()

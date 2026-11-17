@@ -91,6 +91,41 @@ class VaultTests(unittest.TestCase):
         self.assertEqual([p.wait(timeout=30) for p in processes], [0] * len(paths))
         self.assertEqual({p['id'] for p in self.vault().list()}, {p['id'] for p in entries})
 
+    @unittest.skipUnless(os.name == 'nt', 'requires actual Windows byte-range locking')
+    def test_empty_lock_file_waits_before_initialization_and_preserves_cancellation(self):
+        import subprocess
+        from ase.credentials import CredentialError
+        vault = self.vault()
+        vault.directory.mkdir(parents=True)
+        script = ('import sys,msvcrt; f=open(sys.argv[1],"a+b"); f.seek(0); '
+                  'msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1); print("ready",flush=True); '
+                  'sys.stdin.read(1); f.seek(0); msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1); f.close()')
+        proc = subprocess.Popen([os.sys.executable, '-B', '-c', script, str(vault.lock_path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), 'ready')
+            self.assertEqual(vault.lock_path.stat().st_size, 0)
+            with self.assertRaises(CredentialError) as error:
+                with vault._locked(timeout=.1):
+                    self.fail('The other process still owns byte zero')
+            self.assertEqual(error.exception.code, 'timeout')
+            with self.assertRaises(CredentialError) as error:
+                with vault._locked(timeout=1, cancel_requested=lambda: True):
+                    self.fail('Cancelled acquisition cannot initialize the file')
+            self.assertEqual(error.exception.code, 'cancelled')
+            self.assertEqual(vault.lock_path.stat().st_size, 0)
+        finally:
+            try:
+                proc.communicate(input='release' if proc.poll() is None else None, timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=10)
+                raise
+        self.assertEqual(proc.returncode, 0)
+        with vault._locked(timeout=1):
+            pass
+        self.assertEqual(vault.lock_path.read_bytes(), b'0')
+
     def test_invalid_origins_are_rejected(self):
         from ase.credentials import normalize_target
         for target in ['https://example.com:', 'https://example.com?', 'https://example.com#',
