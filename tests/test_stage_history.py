@@ -35,14 +35,18 @@ class StageHistoryTests(unittest.TestCase):
         (self.root / "guide.txt").write_text("after")
         self.controller.check("history")
 
-    def capture(self):
+    def capture(self, *, whole=False, alter_verifier=None):
         self.assertTrue(hasattr(self.controller, "_capture_stage"), "stage proof capture is required")
         fixture = self.base / "fixture.py"; fixture.write_text(transport.FIXTURE)
         trusted = self.base / "trusted"; trusted.mkdir()
         runner = Runner({"executable": __import__("sys").executable, "executable_args": [str(fixture), "success", "codex"],
                          "trusted_cwd": str(trusted), "protocol_only": True}, self.store.root / "tasks" / "history" / "sessions")
         for role in ("implementation", "ac", "review"):
-            request = self.controller._request("history", role, transport.SCHEMA, {"stage": {"id": "draft"}, "stage_id": "draft"})
+            handoff = ({"stage": {"id": "draft"}, "stage_id": "draft"}
+                       if role == "implementation" or not whole else {"stage_id": None})
+            request = self.controller._request("history", role, transport.SCHEMA, handoff)
+            if role != "implementation" and alter_verifier:
+                alter_verifier(request)
             receipt = runner.run(CodexAdapter(), request, timeout=5)["receipt"]
             self.assertEqual(receipt["status"], "COMPLETE")
             self.controller._save("implementation" if role == "implementation" else "verification",
@@ -69,6 +73,113 @@ class StageHistoryTests(unittest.TestCase):
         self.assertIn("_ase_context/source_changes.json", {item["path"] for item in stage["observations"]})
         self.assertNotIn("guide.txt", {item["path"] for item in stage["observations"]})
         self.assertLess(len(json.dumps(history)), 262144)
+
+    def test_whole_task_receipts_keep_verified_single_stage_history(self):
+        self.capture(whole=True)
+        history, missing = self.history_packet()
+        self.assertEqual(missing, [])
+        self.assertEqual([row["stage_id"] for row in history["stages"]], ["draft"])
+        self.assertFalse(history["stages"][0]["semantic_approval"])
+
+    def test_whole_task_receipts_keep_history_after_approved_revision(self):
+        self.capture(whole=True)
+        tasks = TaskService(self.store)
+        task = tasks.snapshot("history")
+        spec = json.loads(json.dumps(task["contract"]))
+        spec["request"] += "; owner clarified the next review"
+        task = tasks.revise("history", spec, expected_revision=task["revision"])
+        task = tasks.propose("history", {"summary": "Refresh the original review", "stage_ids": ["draft"]},
+                             expected_revision=task["revision"])
+        tasks.approve("history", proposal_hash=task["proposal_hash"], user_message_ref="test:owner-update",
+                      approved_stage_ids=["draft"])
+        history, missing = self.history_packet()
+        self.assertEqual(missing, [])
+        self.assertEqual(len(history["stages"]), 1)
+        self.assertFalse(history["stages"][0]["current_identity"])
+        self.assertFalse(history["stages"][0]["semantic_approval"])
+
+    def test_whole_task_receipts_use_authenticated_multistage_original(self):
+        tasks = TaskService(self.store)
+        task = tasks.snapshot("history")
+        spec = json.loads(json.dumps(task["contract"]))
+        spec["stages"].append({"id": "later", "acceptance_ids": ["AC1"], "depends_on": ["draft"]})
+        task = tasks.revise("history", spec, expected_revision=task["revision"])
+        task = tasks.propose("history", {"summary": "Review both stages", "stage_ids": ["draft", "later"]},
+                             expected_revision=task["revision"])
+        tasks.approve("history", proposal_hash=task["proposal_hash"], user_message_ref="test:owner-update",
+                      approved_stage_ids=["draft", "later"])
+        self.controller.check("history")
+        self.capture(whole=True)
+        history, missing = self.controller._stage_history(tasks.snapshot("history"))
+        self.assertEqual(missing, [])
+        self.assertEqual([row["stage_id"] for row in history["stages"]], ["draft"])
+        self.assertFalse(history["stages"][0]["semantic_approval"])
+
+    def test_whole_task_fallback_does_not_accept_another_explicit_stage(self):
+        self.capture(whole=True, alter_verifier=lambda request: request["handoff"].update(stage_id="other"))
+        history, missing = self.history_packet()
+        self.assertEqual(history["stages"], [])
+        self.assertTrue(any("stage boundary mismatch" in row for row in missing))
+
+    def test_whole_task_history_requires_the_sealed_original_contract(self):
+        def alter(request):
+            source = next(row for row in request["source_packet"]["files"]
+                          if row["path"] == "_ase_context/contract.json")
+            contract = json.loads(source["content"])
+            contract["stages"][0]["id"] = "other"
+            source["content"] = json.dumps(contract)
+            source["sha256"] = hashlib.sha256(source["content"].encode()).hexdigest()
+        self.capture(whole=True, alter_verifier=alter)
+        history, missing = self.history_packet()
+        self.assertEqual(history["stages"], [])
+        self.assertTrue(any("stage boundary mismatch" in row for row in missing))
+
+    def test_whole_task_history_rejects_a_foreign_project(self):
+        self.capture(whole=True, alter_verifier=lambda request: request["project"].update(project_id="foreign"))
+        history, missing = self.history_packet()
+        self.assertEqual(history["stages"], [])
+        self.assertTrue(any("stage boundary mismatch" in row for row in missing))
+
+    def test_whole_task_history_rejects_a_foreign_workspace_root(self):
+        foreign = self.base / "foreign"
+        foreign.mkdir()
+        self.capture(whole=True, alter_verifier=lambda request: request["project"].update(root=str(foreign)))
+        history, missing = self.history_packet()
+        self.assertEqual(history["stages"], [])
+        self.assertTrue(any("stage boundary mismatch" in row for row in missing))
+
+    def test_implementation_requires_exact_stage_in_capture_and_history(self):
+        for identity in (None, "missing", "other"):
+            with self.subTest(identity=identity):
+                fixture = StageHistoryTests("test_capture_retains_real_receipts_and_compact_verified_observations")
+                fixture.setUp()
+                try:
+                    fixture.capture(whole=True)
+                    original = read_record(fixture.store.db, "stage", "history:draft")["payload"]
+                    request = fixture.controller._request("history", "implementation", transport.SCHEMA,
+                                                          {"stage": {"id": "draft"}})
+                    if identity == "missing":
+                        request["handoff"].pop("stage")
+                    else:
+                        request["handoff"]["stage"]["id"] = identity
+                    runner = Runner({"executable": __import__("sys").executable,
+                                     "executable_args": [str(fixture.base / "fixture.py"), "success", "codex"],
+                                     "trusted_cwd": str(fixture.base / "trusted"), "protocol_only": True},
+                                    fixture.store.root / "tasks" / "history" / "sessions")
+                    receipt = runner.run(CodexAdapter(), request, timeout=5)["receipt"]
+                    fixture.controller._save("stage_implementation", "history:draft", receipt)
+                    fixture.controller._save("stage", "history:draft", None)
+                    with self.assertRaisesRegex(ValueError, "another stage/project identity"):
+                        fixture.controller._capture_stage("history", "draft", original["gate"])
+                    # Also exercise the history reader against a misassociated
+                    # sealed receipt, rather than relying on the capture guard.
+                    original["proof"]["roles"]["implementation"] = receipt
+                    fixture.controller._save("stage", "history:draft", original)
+                    history, missing = fixture.controller._stage_history(TaskService(fixture.store).snapshot("history"))
+                    self.assertEqual(history["stages"], [])
+                    self.assertTrue(any("stage boundary mismatch" in row for row in missing))
+                finally:
+                    fixture.doCleanups()
 
     def test_tamper_and_stale_history_become_explicit_missing_coverage(self):
         self.capture()

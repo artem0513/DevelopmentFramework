@@ -819,7 +819,20 @@ class WorkflowController:
                     handoff = request.get("handoff", {})
                     captured_stage = handoff.get("stage", {}).get("id") if role == "implementation" else handoff.get("stage_id")
                     if captured_stage != stage["id"]:
-                        raise ValueError("historical stage boundary mismatch")
+                        # The stage gate also accepts a whole-task AC/review.
+                        # Recover its original boundary from the sealed source,
+                        # never from the current (possibly revised) contract.
+                        if role == "implementation" or captured_stage is not None:
+                            raise ValueError("historical stage boundary mismatch")
+                        supplied = {item["path"]: item for item in request["source_packet"]["files"]}
+                        original_contract = json.loads(supplied["_ase_context/contract.json"]["content"])
+                        original_stages = [item for item in original_contract["stages"] if item["id"] == stage["id"]]
+                        expected_stage = original_stage if supersession else stage
+                        if (hash_value(original_contract) != saved["contract_hash"]
+                                or original_stages != [expected_stage]
+                                or request["project"].get("project_id") != self.store.project_id
+                                or logical_path(request["project"]["root"]) != logical_path(self.store.repo)):
+                            raise ValueError("historical whole-task stage boundary mismatch")
                     if supersession or plan_supersession:
                         supplied = {item["path"]: item for item in request["source_packet"]["files"]}
                         contract = json.loads(supplied["_ase_context/contract.json"]["content"])
