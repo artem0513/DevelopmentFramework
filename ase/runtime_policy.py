@@ -10,7 +10,8 @@ from .protocol import canonical, decode_json, sha256
 
 
 BUNDLE_PATH = Path(__file__).with_name('data') / 'runtime_policy.json'
-COMMON = ('skills/task-orchestrator/references/evidence-decisions.md',)
+COMMON = ('skills/task-orchestrator/references/evidence-decisions.md',
+          'skills/task-orchestrator/references/lead-critical-passes.md')
 ROLE_FILES = {
     'implementation': ('skills/task-orchestrator/SKILL.md', *COMMON),
     'ac': ('skills/independent-ac-verifier/SKILL.md', *COMMON,

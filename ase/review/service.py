@@ -35,6 +35,14 @@ class VerificationService:
             instruction = ("Independently assess the configured criteria against the original request, actual packet source, source_changes baseline manifest, captured before-files and command logs. Return exactly the configured criterion IDs and preserve expected wording. Evaluate original-request constraints under the relevant criteria; a missing material constraint is UNVERIFIED/BLOCKED, never an extra ignored criterion. PASS needs meaningful evidence. Broader limitations do not invalidate concrete evidenced behavior."
                            if role == "ac" else "Independently review actual source for actionable defects P0-P3. P0/P1/P2 block. Do not downgrade to obtain approval. State coverage limits in summary.")
             handoff = {'instruction': instruction, 'stage_id': stage_id}
+            if label == 'ac' and stage_id is None:
+                from ..lead_review import LeadReview, acceptance_schema
+                if LeadReview(context.store).configured(task_id):
+                    schema = acceptance_schema(schema)
+                    handoff['instruction'] += (' Explicitly challenge the original lead classification, its complete requirement-anchored critiques and evidence/resolutions. '
+                        'Return the extra lead_review disposition. A structurally eligible but semantically complex exemption is DISAGREE; '
+                        'three generic PASS summaries are INSUFFICIENT. A justified current trivial exemption may have sufficient exemption evidence without three passes. '
+                        'Absent material proof is UNVERIFIED. Do not add uncontracted criterion IDs.')
             if label == 'adequacy':
                 handoff.update(purpose='test_adequacy', test_plan_sha256=test_plan['test_plan_sha256'],
                     instruction='Independently assess test adequacy against original requirements, scenario plan, actual test sources/assertions and executed logs. Challenge omitted material risks and consumer boundaries. Positive counts alone do not prove adequacy. Return only the configured adequacy schema; missing required proof is UNVERIFIED/BLOCKED.')

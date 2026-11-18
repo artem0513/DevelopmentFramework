@@ -1,0 +1,39 @@
+---
+name: task-orchestrator
+description: "Use when a managed software, infrastructure, document, research or mixed task is requested in an explicitly adopted project or workspace."
+---
+
+# Managed task workflow
+
+For configured nontrivial root tasks, after initial implementation/checks perform
+[three additional original-main-bot passes](references/lead-critical-passes.md).
+Reconcile original requirements and approved clarifications on every pass;
+record before fixes, recheck after them and retain a current final assessment.
+An internal awaiting-lead-review handoff is your next action, not an owner
+approval question. Workers and independent reviewers do not replace these passes.
+
+For comparisons, blockers, dependencies, actionable artifacts, semantic changes or disputed review findings, apply relevant [evidence decisions](references/evidence-decisions.md). Confirm target/reference authority, required readiness and current artifact purpose/version. Preserve required semantics and substantiate findings through actual callees/evidence before repair. Clear tasks need no new questionnaire or approval.
+
+Use only in a project or workspace that explicitly adopted DevelopmentFramework. Adoption covers managed software, infrastructure, documents, research and mixed work; select the profile from the actual action. A financial report with warnings is a document or research task. A requested fix to its generator is software. Ordinary questions use their domain workflow without creating a managed task.
+
+Read task-intake for new assignments and task-discovery before proposing implementation. Its scoped search for existing project examples is the default; an explicit user opt-out skips that search and example reuse, including cached/delegated examples. Preserve that choice before retrieving pattern records; necessary target/dependency inspection remains. Restore an existing task with `ase --project PROJECT restore TASK` before replacing it. Local SQLite records, sources and checkpoints are shared across backends on this computer and isolated by project identity.
+
+Before any clarification, distinguish a retrievable fact about the existing target from a decision only the owner can make. Inspect supplied context and fresh relevant memory, then use task-discovery's [answer investigation](../task-discovery/references/answer-investigation.md) and available authorized read-only checks for factual gaps. A detail missing from the prompt is not itself an access or requirements blocker. Ask only after the relevant evidence/next useful checks cannot resolve the material gap, or the owner alone must choose; give actual checked facts and a concise supported hypothesis/recommendation.
+
+A clear assignment authorizes immediate execution within its scope. After checking obvious gaps and fresh relevant context, record a concise internal proposal and the original assignment's authorization against its exact version/stages; proceed without another approval interview. Re-evaluate gaps after discovery and material answers, refresh affected assumptions/evidence, and keep independently approved stages moving. Read [questions and approval](references/questions-and-approval.md) for unresolved business/access/authority decisions or serious architectural changes beyond scope; routine technical choices stay autonomous.
+
+Execute through the local `ase` CLI using the configured backend adapter and appropriate domain skills. When `.devframework/config.toml` selects project-local mode, use that project's `.devframework/bin/ase.ps1` or `.devframework/bin/ase`; its three bots share private state inside that project. Do not replace it with another project's/global home on an unknown UUID. The CLI is sufficient; a missing optional integration is not a workflow blocker. Discover actual independent-session capability and permission before promising verification. An installed skill or a protocol fixture does not establish live backend availability. Do not copy credentials or change provider permissions to make a missing capability appear available.
+
+When an approved external service needs authentication, read [local credentials](references/local-credentials.md). Use shared metadata and credential references; import only a user-designated local file, let the local executor handle values, and reuse sessions/approval. Configure a supported CLI recipe within the approved bounds before asking the user to solve a technical setup detail. Credentials do not expand task authority.
+
+When two or more ready parts are independent and useful to run together, use available permitted native subagents under [parallel work](references/parallel-work.md). Register managed delegated work with `ase delegation` and commit its dispatch ticket before calling the bot's native spawn tool. Record the actual native handle and sealed result; coordinator acceptance remains separate from independent AC/review. Recompute ready work after results and dependencies; preserve original authority, root ownership and budgets. Unknown launches require reconciliation, never a replacement based on timeout. Serial fallback remains available when optional delegation is unavailable.
+
+Keep the original chat as lead and process its durable [coordinator inbox](references/coordinator-events.md) after results and before completion. Return evidence to that exact coordinator through available native tools or its local inbox. Commit dispatch/processing intents before effects; recover and reconcile original attempts. Notifications never expand user authority or launch another lead. Successful informational events do not trigger endless verification loops.
+
+For software, enable explicit test adequacy and save a requirement/risk scenario plan before implementation under [test adequacy](../quality-gate/references/test-adequacy.md). After meaningful executed checks, obtain a separate independent adequacy assessment alongside AC/review; positive counts alone are insufficient. Investigate/repair current coverage gaps without waiting for an extra owner prompt. Excluding tests from publication still allows required local testing.
+
+Run meaningful checks and separate independent acceptance and substantive review against the original request. For software preserve positive executed test counts, successful mandatory checks and independent AC/code review. P0/P1/P2 block approval; P3 is advisory. Use `ase --project PROJECT gate TASK` and `report TASK`; a process finishing or a written PASS is not approval. Read [profile evidence](references/profile-evidence.md) when selecting checks.
+
+Repair actionable in-scope findings, then rerun affected checks and fresh independent AC/review against current artifacts; avoid unrelated refactoring. New progress-mode tasks reassess after three consecutive unsuccessful cycles without verified progress on the same underlying problem, rather than stopping after three total cycles. Verified progress means newly satisfied original obligations or verified failure elimination; prose, edits and renamed stages do not count. Resume/delegates share history. A supported diagnostic probe may continue; failure without verified progress stops automatic mutation. Preserve explicit hard limits and saved legacy policies. Unresolved blockers hold affected work. Reconcile UNKNOWN external effects before retrying; nonvisibility alone is insufficient. Read [stopping and recovery](references/stopping-and-recovery.md) for the full rules.
+
+At completion, awaiting approval, blocker, pause, cancellation or requested stop, save a dated session closure and one exact next action. Read [finish and reports](references/finish-and-reports.md). Close a session without claiming the task completed. Publish or send only under the existing explicit destination authorization; default publication remains a dry run.

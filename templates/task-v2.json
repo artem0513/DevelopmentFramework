@@ -1,6 +1,7 @@
 {
   "id": "replace-task-id",
   "schema_version": 2,
+  "lead_review": {"version": 1, "required": true, "additional_passes": 3},
   "profile": "document",
   "request": "Replace with the requested outcome and source-backed constraints; publication remains held until its destination is confirmed.",
   "scope": {

@@ -58,6 +58,10 @@ def generated_assets(root=ROOT):
                             'Keep the original chat as lead and consume its durable ase events inbox; native return tools are optional. '
                             'For software, preserve explicit test_adequacy policy and a scenario plan, and require a separate '
                             'current adequacy assessment alongside original AC/review. Positive counts alone do not prove coverage. '
+                            'For configured nontrivial roots, the ORIGINAL main chat performs three additional whole-solution '
+                            'critical passes against original requirements and approved clarifications. Record each assessment '
+                            'before fixes, recheck after them and retain a current final pass. Workers do not count as the main. '
+                            'An awaiting_lead_review handoff is an internal continuation, not another owner approval request. '
                             'This descriptor grants no access, approval or independent execution by itself.')
             if target == 'codex':
                 path = root / 'agents' / (role + '.toml')

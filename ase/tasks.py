@@ -46,7 +46,7 @@ def _unique(items, name):
 def validate_contract_v2(value):
     allowed = {"id", "schema_version", "profile", "request", "scope", "acceptance", "evidence", "commands",
                "stages", "assumptions", "unknowns", "sources", "capabilities", "execution_policy", "reporting",
-               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy"}
+               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy", "lead_review"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("Unknown task field; approval must be recorded separately")
     c = copy.deepcopy(value)
@@ -54,6 +54,9 @@ def validate_contract_v2(value):
         raise ValueError("Task requires schema_version 2 and a supported profile")
     text(c.get("request"), "request")
     c["scope"] = _scope(c.get("scope"))
+    if 'lead_review' in c:
+        from .lead_review import validate_policy
+        validate_policy(c['lead_review'])
     c.setdefault("risk", "MEDIUM")
     if c["risk"] not in {"LOW", "MEDIUM", "HIGH"}:
         raise ValueError("Invalid risk")
@@ -213,6 +216,8 @@ class TaskService:
                 raise ValueError("Child scope exceeds approved parent stage")
             if parent['contract'].get('test_adequacy') and has_software(c):
                 c['test_adequacy'] = copy.deepcopy(parent['contract']['test_adequacy'])
+            if parent['contract'].get('lead_review'):
+                c['lead_review'] = copy.deepcopy(parent['contract']['lead_review'])
             validate_child_obligations(c, parent["contract"], parent_stage, task_id)
         payload = {"task_id": task_id, "state": "DRAFT", "contract": c, "contract_hash": hash_value(c),
                    "proposal_hash": None, "approved_stage_ids": [], "created": now()}
@@ -246,12 +251,17 @@ class TaskService:
             incoming["execution_policy"] = policy
             if current['contract'].get('test_adequacy'):
                 incoming.setdefault('test_adequacy', copy.deepcopy(current['contract']['test_adequacy']))
+            if current['contract'].get('lead_review'):
+                incoming.setdefault('lead_review', copy.deepcopy(current['contract']['lead_review']))
         c = validate_contract_v2(incoming)
         supplied_id = c.pop("id", task_id)
         if supplied_id != task_id:
             raise ValueError("Revision cannot change task identity")
         with transaction(self.store.db) as db:
             task = self.snapshot(task_id)
+            if task['contract'].get('lead_review') or c.get('lead_review'):
+                from .lead_review import archive_approved_intent
+                archive_approved_intent(self.store, task)
             if task["state"] in {"COMPLETED", "CANCELLED"}:
                 raise ValueError("Terminal task needs a new task")
             legacy_budget = task.get("legacy_budget")
@@ -367,8 +377,13 @@ class TaskService:
         if not isinstance(proposal, dict) or set(proposal) - {"summary", "stage_ids", "business", "technical", "steps", "verification", "limitations", "assumptions"}:
             raise ValueError("Invalid proposal fields")
         text(proposal.get("summary"), "proposal summary")
+        from .lead_review import validate_intent_text
+        validate_intent_text(proposal, "proposal", limit=200000)
         with transaction(self.store.db) as db:
             task = self.snapshot(task_id)
+            if task['contract'].get('lead_review'):
+                from .lead_review import archive_approved_intent
+                archive_approved_intent(self.store, task)
             validate_mixed_mapping(task["contract"])
             if task["legacy_v1"]:
                 raise ValueError("A legacy task needs a reviewed v2 contract before new approval")
@@ -412,6 +427,9 @@ class TaskService:
             payload = {k: v for k, v in task.items() if k not in {"revision", "legacy_v1"}}
             payload.update(state="READY", approved_stage_ids=approval["approved_stage_ids"])
             self._save(payload, task["revision"])
+            if task['contract'].get('lead_review'):
+                from .lead_review import archive_approved_intent
+                archive_approved_intent(self.store, self.snapshot(task_id))
         return self.snapshot(task_id)
 
     @staticmethod

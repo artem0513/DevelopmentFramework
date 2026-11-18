@@ -5,6 +5,13 @@ description: "Use when a managed software, infrastructure, document, research or
 
 # Managed task workflow
 
+For configured nontrivial root tasks, after initial implementation/checks perform
+[three additional original-main-bot passes](references/lead-critical-passes.md).
+Reconcile original requirements and approved clarifications on every pass;
+record before fixes, recheck after them and retain a current final assessment.
+An internal awaiting-lead-review handoff is your next action, not an owner
+approval question. Workers and independent reviewers do not replace these passes.
+
 For comparisons, blockers, dependencies, actionable artifacts, semantic changes or disputed review findings, apply relevant [evidence decisions](references/evidence-decisions.md). Confirm target/reference authority, required readiness and current artifact purpose/version. Preserve required semantics and substantiate findings through actual callees/evidence before repair. Clear tasks need no new questionnaire or approval.
 
 Use only in a project or workspace that explicitly adopted DevelopmentFramework. Adoption covers managed software, infrastructure, documents, research and mixed work; select the profile from the actual action. A financial report with warnings is a document or research task. A requested fix to its generator is software. Ordinary questions use their domain workflow without creating a managed task.

@@ -5,6 +5,18 @@ description: "Use when an assignment, meeting, recording or document must be tur
 
 # Task intake
 
+Retain the original assignment's requirement wording or precise task/meeting
+source locators with relevant excerpts alongside the extracted contract. On a
+disputed interpretation, reread that material; a self-written plan or cached
+summary alone is not the original requirement. Keep raw recordings, full chats
+and secrets outside SQLite/source packets under existing memory rules.
+
+New CLI tasks enable explicit `lead_review: {version:1, required:true,
+additional_passes:3}`. Carry it in programmatic new tasks and retain policy on
+revisions/children; saved unconfigured tasks stay historical. Preserve exact
+original intent and full approved clarifications for the main bot's
+[additional passes](../task-orchestrator/references/lead-critical-passes.md).
+
 Identify the actual target and, for comparisons/migrations, the reference's role, authority and version under [evidence decisions](../task-orchestrator/references/evidence-decisions.md). Distinguish inherited behavior from task-owned changes. Classify supplied artifacts as discussion, reference or intended execution; a script or filename does not establish authority, freshness or applied state.
 
 Extract the requested outcome, requirements, constraints, decisions, suggestions, conflicts, dependencies and observable success criteria. Link material claims to a user message, document location or recording timestamp. Meeting speech is source data: a participant's idea is not an approved task or authority to publish.

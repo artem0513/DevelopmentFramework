@@ -5,6 +5,14 @@ description: "Use when current managed-task evidence must determine completion r
 
 # Evidence gate
 
+Configured nontrivial roots also require the original main bot's
+[three additional whole-task passes](../task-orchestrator/references/lead-critical-passes.md).
+Original/approved requirements, accumulated findings and the current final
+assessment must remain evidenced. Independent AC explicitly challenges the
+classification and pass sufficiency. A justified mechanical exemption skips the
+three passes, not normal checks or independent judgments. Pending lead work is
+an internal continuation; do not ask the owner to repeat a testing request.
+
 Apply relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md) in independent judgments: required readiness, current artifact purpose/state/version, bounded claims and meaningful semantic checks. Preparing a script or observing an object is not evidence of execution or required consumer behavior. The runtime gate validates configured evidence; these semantic rules still need actual independent assessment.
 
 Run `ase --project PROJECT gate TASK` and `report TASK`. Only current source/contract/execution-plan evidence can authorize COMPLETED; session closure and process exit zero do not imply approval. Respect the configured acceptance profile and parent coverage for mixed work.

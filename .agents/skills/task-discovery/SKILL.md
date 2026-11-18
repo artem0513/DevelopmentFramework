@@ -5,6 +5,11 @@ description: "Use when task-relevant environment, sources, local knowledge fresh
 
 # Task discovery
 
+For configured root work, assess complexity from actual requirements, changes
+and risks under [original-lead passes](../task-orchestrator/references/lead-critical-passes.md).
+Default uncertainty to nontrivial. An explicit current mechanical exemption
+needs source/check evidence and independent challenge; low effort is insufficient.
+
 For comparisons, dependencies or potential blockers, read relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md). Establish target/reference authority; distinguish metadata, usable access, required data and consumer behavior. Bound negative claims to inspected scope and name the required outcome/concrete failed check for each blocker. Use the brief only when it helps keep material facts current.
 
 Before implementation, check the assignment for obvious gaps, restore fresh relevant project/meeting context and read applicable local instructions. Start with named resources. Expand only for a material dependency, task-relevant uncertainty or scoped colleague/project-example search; record the relationship and remaining uninspected dependencies. Reading a location does not adopt it or authorize product changes, installations or external effects.

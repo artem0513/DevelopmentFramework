@@ -10,6 +10,23 @@ from ..state import read_record, encode
 from ..execution.ports import PacketContext
 
 
+def _factor_omission_note(packet):
+    """Share one identical optional-body note without changing any policy."""
+    entry = next((f for f in packet['files'] if f['path'] == '_ase_context/omitted_sources.json'), None)
+    if entry is None:
+        return
+    rows = json.loads(entry['content'])
+    notes = {row.get('limitation') for row in rows}
+    if not rows or len(notes) != 1 or None in notes:
+        return
+    for row in rows:
+        del row['limitation']
+    entry['content'] = encode(rows)
+    entry['sha256'] = hashlib.sha256(entry['content'].encode()).hexdigest()
+    packet['coverage']['omitted_source_limitation'] = notes.pop()
+    packet['coverage']['scope'] += ' omitted_source_limitation applies exactly to EVERY omitted_sources row.'
+
+
 class PacketService:
     def __init__(self, context: PacketContext, *, target):
         self.context = context
@@ -204,9 +221,63 @@ class PacketService:
                     continue
                 files.append({"path": "_ase_context/logs/" + result["id"] + ".txt", "content": content,
                               "sha256": hashlib.sha256(content.encode()).hexdigest()})
+        historical_paths = set()
+        from ..lead_review import LeadReview
+        lead_service = LeadReview(context.store)
+        if stage_id is None and lead_service.configured(task_id):
+            try:
+                lead = lead_service.assessment(task_id, current_files=files)
+                historical_files = lead.pop('input_files')
+                missing.extend(lead.pop('input_coverage_missing'))
+                contract_file = next(item for item in files if item['path'] == '_ase_context/contract.json')
+                scope = task['contract']['scope']
+                scope_ref = {'$ref': contract_file['path'], 'sha256': contract_file['sha256'],
+                    'pointer': '/scope', 'value_sha256': hashlib.sha256(encode(scope).encode()).hexdigest()}
+                reference_note = ('Whole-contract $ref resolves the complete same-packet JSON body; '
+                    'a pointer /scope resolves only its scope. Remove exclude_resources from its resources in original order '
+                    'when present, then verify file SHA256 and canonical value_sha256, '
+                    'restore referenced values before original approval/intent hashes. Differing fields, stored '
+                    'intent and prepare are unchanged; no historical contract is replaced by a different current one.')
+                for intent in lead['requirements']['approved_intents']:
+                    if encode(intent['contract']) == contract_file['content']:
+                        # The complete identical body is already in this same
+                        # bounded packet. Preserve old differing contracts and
+                        # every immutable intent/approval hash, not a summary.
+                        intent['contract'] = {'$ref': contract_file['path'], 'sha256': contract_file['sha256']}
+                        lead['contract_reference'] = reference_note
+                    else:
+                        # A differing old contract stays distinct. Only exact,
+                        # repeated large scope values share the current body.
+                        for owner in [intent['contract'], *intent['contract']['stages']]:
+                            value = owner.get('scope')
+                            if not isinstance(value, dict):
+                                continue
+                            excluded = [path for path in scope['resources'] if path not in value.get('resources', [])]
+                            restored = {**scope, 'resources': [path for path in scope['resources'] if path not in excluded]}
+                            reference = {**scope_ref, 'value_sha256': hashlib.sha256(encode(value).encode()).hexdigest()}
+                            if excluded:
+                                reference['exclude_resources'] = excluded
+                            if encode(value) == encode(restored) and len(encode(reference)) < len(encode(value)):
+                                owner['scope'] = reference
+                                lead['contract_reference'] = reference_note
+                content = encode(lead)
+                files.append({'path': '_ase_context/lead_review.json', 'content': content,
+                    'sha256': hashlib.sha256(content.encode()).hexdigest()})
+                files.extend(historical_files)
+                historical_paths.update(item['path'] for item in historical_files)
+            except (ValueError, OSError, KeyError, TypeError) as error:
+                missing.append('Original-lead assessment evidence unavailable: ' + str(error))
         packet = {"requirements": [task["contract"]["request"], *[ac["id"] + ": " + ac["expected"] for ac in task["contract"]["acceptance"]]],
                 "files": files, "coverage": {"scope": "Current stage source plus task contract and actual check logs; known irrelevant/optional bodies are explicitly disclosed in omitted_sources; undeclared dependencies are not proven complete",
                                                "included": [f["path"] for f in files], "missing": missing,
                                                "omitted": [item["path"] for item in omitted_sources]}}
-        from ..protocol import validate_packet
+        from ..protocol import canonical, validate_packet
+        if len(canonical(packet)) > 1048576:
+            _factor_omission_note(packet)
+        if historical_paths and len(canonical(packet)) > 1048576:
+            # Retain complete durable input artifacts, but never pretend that
+            # missing bodies reached this bounded independent model request.
+            files[:] = [item for item in files if item['path'] not in historical_paths]
+            missing.append('Historical lead-input packet budget exceeded; exact stored inputs need a bounded review representation')
+            packet['coverage']['included'] = [item['path'] for item in files]
         return validate_packet(packet)

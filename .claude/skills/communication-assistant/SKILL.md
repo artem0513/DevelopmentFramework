@@ -1,0 +1,20 @@
+---
+name: communication-assistant
+description: "Use when a managed task needs a concise proposal, final status, meeting summary, PR explanation or stakeholder draft based on current evidence."
+---
+
+# Concise task communication
+
+Use relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md) for the current target/reference, artifact purpose/version and scoped blocker evidence. State the current object set and unresolved placeholders when material; mark older drafts/claims historical after new answers. Keep the first message concise; the internal evidence brief is not a questionnaire for the owner.
+
+For a clear assignment, prepare a concise internal proposal and record the original authorization, then execute within scope without another approval interview. A short progress update can state the intended action and verification. Keep outcome, approach/reason, technical means/reuse, main steps and material assumptions in the separately inspectable contract.
+
+For status read `ase --project PROJECT report TASK`, the current checkpoint and source coverage. Distinguish implemented, executed, independently verified, unavailable, blocked and actually published results. Cite existing artifacts and actual URLs. Empty source inventory is unconfigured, not completed analysis.
+
+Before drafting an owner question, use task-discovery's answer investigation for retrievable facts. Lead with what was actually checked and what remains unknown; briefly give the supported intent hypothesis and recommended action/reason, then one material decision. Keep the first question message about 2–4 lines when that preserves the necessary facts. Never claim a probe ran when it was only planned, or infer global absence from one denied/unread source. Owner-only decisions need no research theater.
+
+For dated activity use `ase worklog` and `ase meeting-report` with explicit date bounds. New projects use the executing computer's local time by default; do not ask the owner to choose a region for routine reports. Respect an explicit existing project choice or the owner's requested `--timezone local` override. Draft results, decisions, blockers and next actions; label current versus historical/as-of blockers. Read [finish and reports](../task-orchestrator/references/finish-and-reports.md) before session closure or requested stop. Summaries do not alter task approval or evidence.
+
+For a real unresolved business/access/authority blocker or serious architectural change, follow [questions and approval](../task-orchestrator/references/questions-and-approval.md). After relevant investigation, use roughly 2–4 lines: actually inspected evidence; remaining uncertainty/stopping reason; unconfirmed intent hypothesis; recommended solution and why; one concrete decision. Keep the intent hypothesis distinct from the recommendation. Choose routine technical details autonomously. After an answer refresh affected assumptions and keep independently approved work moving. For team input, draft the concrete question for owner review and send only after its content and destination are approved. Standing channel permission does not bypass that review; an already approved concrete question needs no second approval.
+
+Drafting is authorized by a drafting request or as internal preparation within the approved task. Other sending to email/chat or publishing needs explicit authorization for the destination. Never infer billable hours from agent activity.

@@ -40,6 +40,8 @@ def evaluate_gate(contract, current, receipts, judgments):
                          "verification_context_sha256": current.get("verification_context_sha256", "missing")}
     if current.get("workspace_id"):
         expected_bindings["workspace_id"] = current["workspace_id"]
+    if current.get('lead_review_required'):
+        expected_bindings['lead_review_sha256'] = current.get('lead_review_sha256')
     roles, execution_ids, session_ids = {}, set(), set()
     for role in ("ac", "review"):
         matches = [r for r in receipts if r.get("role") == role]
@@ -58,6 +60,11 @@ def evaluate_gate(contract, current, receipts, judgments):
             allowed_contexts = current.get("verification_context_sha256s", (expected_bindings["verification_context_sha256"],))
             if captured_context in allowed_contexts:
                 role_bindings["verification_context_sha256"] = captured_context
+            if (current.get('stage_id') is not None and contract.get('lead_review') and not contract.get('parent_task_id')
+                    and isinstance(captured, dict) and 'lead_review_sha256' in captured):
+                # Whole-root lead disposition is not an intermediate stage's
+                # business proof. Preserve the sealed extra binding as provenance.
+                role_bindings['lead_review_sha256'] = captured['lead_review_sha256']
             verified = verify_receipt(receipt, expected_bindings=role_bindings)
             if verified["evidence_kind"] != "independent_cli":
                 blocked.append("Protocol fixtures are not independent semantic approval: " + role)
@@ -115,6 +122,9 @@ def evaluate_gate(contract, current, receipts, judgments):
             rejected.append(finding["severity"] + ": " + str(finding.get("message", "Blocking review finding")))
     if current.get("protected_changed"):
         rejected.append("Unauthorized protected file changes: " + ", ".join(current["protected_changed"]))
+    if current.get('lead_review_required'):
+        from .lead_review import disposition_errors
+        blocked.extend(disposition_errors(roles.get('ac', {})))
     if contract.get("risk") == "HIGH" and not current.get("high_risk_approved"):
         blocked.append("HIGH risk requires current explicit approval")
     for unknown in contract.get("unknowns", []):
@@ -134,7 +144,7 @@ def stage_checks(contract, checks, stage_id=None):
     return stage_evidence_specs(contract, checks, stage_id)
 
 
-def verification_context_hash(store, contract, task_id, stage_id=None):
+def verification_context_hash(store, contract, task_id, stage_id=None, *, _include_lead=True):
     """Bind exact judgment coverage and the relevant current action proof.
 
     This is separate from source identity: reobserving an external resource can
@@ -407,6 +417,10 @@ class GateService:
             current.update(stage_id=stage_id, checks=stage_checks(task["contract"], plan["checks"], stage_id))
         current["verification_context_sha256s"] = verification_context_hashes(self.store, task["contract"], task_id, stage_id)
         current["verification_context_sha256"] = current["verification_context_sha256s"][0]
+        from .lead_review import LeadReview
+        lead_service = LeadReview(self.store)
+        current['lead_review_required'] = stage_id is None and lead_service.configured(task_id)
+        current['lead_review_sha256'] = lead_service.binding(task_id, stage_id)
         implementation = read_record(self.store.db, "implementation", task_id)["payload"]
         current["implementation_execution_id"] = (implementation or {}).get("execution_id")
         from .testing.adequacy import TestAdequacy
@@ -434,7 +448,11 @@ class GateService:
         current["high_risk_approved"] = bool(high and high.get("fingerprint") == source["fingerprint"] and high.get("contract_hash") == task["contract_hash"])
         result = evaluate_gate(task["contract"], current, receipts, [])
         result['test_adequacy_sha256']=current['test_adequacy_sha256']
+        result['lead_review_sha256'] = current['lead_review_sha256']
         extra = []
+        lead = lead_service.gate(task_id, stage_id=stage_id)
+        result['lead_review'] = lead
+        extra.extend('Lead review: ' + reason for reason in lead['blocked_reasons'])
         from .testing.adequacy import TestAdequacy
         adequacy = TestAdequacy(self.store).gate(task_id, current=current, stage_id=stage_id)
         result['test_adequacy'] = adequacy
@@ -564,7 +582,7 @@ class GateService:
         if stage_id is not None:
             result["stage_id"] = stage_id
         with transaction(self.store.db) as db:
-            if adequacy.get('configured'):
+            if adequacy.get('configured') or current['lead_review_required']:
                 latest = tasks.snapshot(task_id)
                 current_check = read_record(db, 'checks', task_id)['payload']
                 if (latest['contract_hash'] != current['contract_hash']
@@ -573,6 +591,7 @@ class GateService:
                         or (hash_value(current_check) if current_check else 'missing') != current['check_hash']
                         or source_snapshot(self.store, latest['contract'], task_id=task_id)['fingerprint'] != current['fingerprint']
                         or quality_service.binding(task_id,stage_id) != current['test_adequacy_sha256']
+                        or lead_service.binding(task_id,stage_id) != current['lead_review_sha256']
                         or hash_value({role:read_record(db,'verification',task_id+':'+role)['payload'] for role in ('ac','review')}) != verification_inputs
                         or verification_context_hashes(self.store, latest['contract'], task_id, stage_id) != current['verification_context_sha256s']):
                     reason = 'Source or current evidence changed during gate'

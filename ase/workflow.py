@@ -499,7 +499,10 @@ class WorkflowController:
                 context = receipt.get("bindings", {}).get("verification_context_sha256")
                 if context not in contexts:
                     continue
-                verified = verify_receipt(receipt, expected_bindings={**bindings, "verification_context_sha256": context})
+                role_bindings = {**bindings, "verification_context_sha256": context}
+                if contract.get('lead_review') and not contract.get('parent_task_id') and 'lead_review_sha256' in receipt.get('bindings', {}):
+                    role_bindings['lead_review_sha256'] = receipt['bindings']['lead_review_sha256']
+                verified = verify_receipt(receipt, expected_bindings=role_bindings)
                 execution_id, session_id = verified["execution_id"], verified["result"].get("session_id")
                 if (verified["evidence_kind"] != "independent_cli" or verified["result"].get("status") != "COMPLETE"
                         or execution_id in execution_ids or execution_id == implementation.get("execution_id")
@@ -809,6 +812,8 @@ class WorkflowController:
                     if "verification_context_sha256" in receipt["bindings"]:
                         # Archived context is provenance, not current authority.
                         historical_bindings["verification_context_sha256"] = receipt["bindings"]["verification_context_sha256"]
+                    if 'lead_review_sha256' in receipt['bindings']:
+                        historical_bindings['lead_review_sha256'] = receipt['bindings']['lead_review_sha256']
                     verified = verify_receipt(receipt, expected_bindings=historical_bindings if role != "implementation" else None,
                         require_current_policy=False)
                     if any(receipt["bindings"].get(key) != bindings[key] for key in ("contract_sha256", "proposal_sha256", "workspace_id", "plan_sha256")):
@@ -898,6 +903,11 @@ class WorkflowController:
             "check_sha256": hash_value(check) if check else "missing", "workspace_id": self.store.workspace_id}
         if role in {"ac", "review"}:
             bindings["verification_context_sha256"] = verification_context_hash(self.store, task["contract"], task_id, stage_id)
+            if stage_id is None and handoff.get('purpose') != 'test_adequacy':
+                from .lead_review import LeadReview
+                lead_binding = LeadReview(self.store).binding(task_id)
+                if lead_binding is not None:
+                    bindings['lead_review_sha256'] = lead_binding
         return {"role": role, "project": {"root": str(self.store.repo), "project_id": self.store.project_id}, "schema": schema,
                 "bindings": bindings, "source_packet": self._packet(task_id, stage_id=stage_id), "handoff": handoff}
 
@@ -980,7 +990,7 @@ class WorkflowController:
             reason = "blocked"
             try:
                 verdict = self._run(task_id, resume=resume)
-                reason = "completed" if verdict["status"] == "APPROVED" else "paused" if read_record(self.store.db, "stop", task_id)["payload"] else "awaiting_approval" if verdict.get("awaiting_approval") else "blocked"
+                reason = "completed" if verdict["status"] == "APPROVED" else "paused" if read_record(self.store.db, "stop", task_id)["payload"] else "awaiting_lead_review" if verdict.get('awaiting_lead_review') else "awaiting_approval" if verdict.get("awaiting_approval") else "blocked"
             except KeyboardInterrupt:
                 reason = "interrupted"
                 verdict = {"status": "BLOCKED", "blocked_reasons": ["Execution interrupted; inspect uncertain effects before resume"]}
@@ -1004,13 +1014,13 @@ class WorkflowController:
         summary = "All approved task obligations verified" if reason == "completed" else "; ".join(verdict.get("reasons", verdict.get("blocked_reasons", ["Work paused"])))[:3500]
         checkpoint_revision = self.store.db.execute("SELECT COALESCE(MAX(revision),0) FROM checkpoints WHERE task_id=?", (task_id,)).fetchone()[0]
         resolved = []
-        if reason == "completed" and any(b["task_id"] == task_id and b["id"] == "execution-blocker" for b in journal.active_blockers()):
+        if reason in {'completed', 'awaiting_lead_review'} and any(b["task_id"] == task_id and b["id"] == "execution-blocker" for b in journal.active_blockers()):
             resolved = [{"kind": "blocker_resolved", "blocker_id": "execution-blocker", "summary": "Current task verification resolved the framework execution blocker"}]
         closure = journal.finish_session(task_id, session_id, {"finish_reason": reason, "summary": summary,
-            "next_action": "No remaining task work" if reason == "completed" else "Inspect reported blockers, reconcile effects, then approve revised scope or resume",
+            "next_action": "No remaining task work" if reason == "completed" else verdict['next_action'] if reason == 'awaiting_lead_review' else "Inspect reported blockers, reconcile effects, then approve revised scope or resume",
             "context": {"summary": task["contract"]["request"], "limitations": ["Dated task context is retained alongside other tasks; verify current sources before reuse"]},
             "remaining": remaining, "workflow_outcome": verdict["status"], "events": resolved,
-            "blockers": [] if reason == "completed" else [{"id": "execution-blocker", "reason": summary, "next_probe": "Inspect current gate and stage state before resume"}]},
+            "blockers": [] if reason in {'completed', 'awaiting_lead_review'} else [{"id": "execution-blocker", "reason": summary, "next_probe": "Inspect current gate and stage state before resume"}]},
             closure_key=session_id + ":finish", expected_revision=checkpoint_revision, expected_context_revision=journal.context()["revision"])
         self._save("active_workflow", root_id, None)
         return {**verdict, "session_id": session_id, "closure": closure}
@@ -1254,9 +1264,20 @@ class WorkflowController:
             reasons += ["Remaining stage obligations: " + ", ".join(incomplete)]
             return {**original, "status": "BLOCKED", "awaiting_approval": not stage_blockers,
                     "stage_blockers": stage_blockers, "stage_results": stage_results, "reasons": reasons, "blocked_reasons": reasons}
+        return self._final_review(task_id)
+
+    def _final_review(self, task_id):
         full_gate = GateService(self.store).gate(task_id)
         if full_gate["status"] == "APPROVED":
             return full_gate
+        lead = full_gate.get('lead_review', {})
+        if lead.get('configured') and (lead.get('base_current') or lead.get('needs_owner_binding')):
+            if lead['status'] != 'READY':
+                return {**full_gate, 'awaiting_lead_review': True, 'awaiting_approval': False,
+                    'next_action': lead['next_action']}
+            # Only final independent judgments became stale when native lead
+            # evidence changed; current successful checks need no repetition.
+            return self.verify(task_id)
         self.check(task_id)
         return self.verify(task_id)
 

@@ -80,6 +80,18 @@ def parser():
     p.add_argument("--home", help="Explicit state home (outside source or validated project-local state)")
     p.add_argument("--project", help="Registered project UUID or workspace alias")
     commands = p.add_subparsers(dest="command", required=True)
+    lead = commands.add_parser('lead-review', help='Additional whole-task critiques by the original main bot')
+    lead_commands = lead.add_subparsers(dest='action', required=True)
+    for name in ('classify', 'prepare', 'record', 'status', 'recover'):
+        command = lead_commands.add_parser(name)
+        command.add_argument('task_id')
+        if name in {'classify', 'prepare', 'record'}:
+            command.add_argument('--thread-id', required=True)
+            command.add_argument('--expected-revision', required=True, type=int)
+        if name in {'classify', 'record'}:
+            command.add_argument('--file', required=True)
+        if name == 'record':
+            command.add_argument('--attempt', required=True)
     events = commands.add_parser('events', help='Durable original-coordinator result inbox; native host owns delivery')
     event_commands = events.add_subparsers(dest='action', required=True)
     for name in ('bind', 'bind-local', 'list', 'recover', 'dispatch', 'observe', 'claim', 'ack'):
@@ -392,6 +404,9 @@ def _task_command(store, action, args):
 def _new_contract(path):
     from .profiles import has_software
     contract = load(path)
+    if isinstance(contract, dict) and contract.get('schema_version') == 2:
+        from .lead_review import POLICY
+        contract.setdefault('lead_review', dict(POLICY))
     if isinstance(contract, dict) and contract.get('schema_version') == 2 and has_software(contract):
         contract.setdefault('test_adequacy', {'version': 1, 'required': True})
     return contract
@@ -482,6 +497,19 @@ def main(argv=None):
                 store = Store(args.repo, args.home)
             if cmd == "task":
                 result = _task_command(store, args.action, args)
+            elif cmd == 'lead-review':
+                from .lead_review import LeadReview
+                service = LeadReview(store)
+                if args.action == 'status':
+                    result = {'record': service.snapshot(args.task_id), 'policy': service.gate(args.task_id)}
+                elif args.action == 'recover':
+                    result = service.recover(args.task_id)
+                elif args.action == 'prepare':
+                    result = service.prepare(args.task_id, thread_id=args.thread_id, expected_revision=args.expected_revision)
+                elif args.action == 'classify':
+                    result = service.classify(args.task_id, load(args.file), thread_id=args.thread_id, expected_revision=args.expected_revision)
+                else:
+                    result = service.record(args.task_id, args.attempt, load(args.file), thread_id=args.thread_id, expected_revision=args.expected_revision)
             elif cmd == 'delegation':
                 result = _delegation_command(store, args)
             elif cmd == 'events':

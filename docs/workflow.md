@@ -1,5 +1,16 @@
 # Managed task workflow
 
+New CLI root tasks require three additional critiques by the original main bot
+after initial implementation/checking. Read the operational
+[lead-pass reference](../skills/task-orchestrator/references/lead-critical-passes.md).
+Every pass reconciles the original request and authenticated full approved
+contract/proposal history. Default complexity is nontrivial; a current mechanical
+LOW-risk exemption is independently challenged. Final completion, not each child
+or intermediate stage, waits for this layer. Native bots execute the critiques;
+ase stores CAS intent/results and recovers captured output without a new prompt.
+Final independent AC/review binds the lead digest separately from reusable
+stage/action context. Legacy saved tasks are not silently rewritten.
+
 Explicit adoption of a selected project/workspace activates this workflow. It supports software, infrastructure, documents, research and mixed work. A template, shared runtime or optional integration does not activate other projects. Ordinary questions use their domain workflow without a managed contract. Choose profiles by actual action: financial report warnings do not turn analysis into software debugging.
 
 Use the installed `ase` / `ase.ps1` launcher, or `python -m ase` in the source checkout. Global `--project PROJECT_ID` (or compatibility `--repo ROOT`) and `--home` precede the subcommand. State selection is explicit `--home`, selected project-local config, `ASE_HOME`, then the platform AutonomousSE directory. In [project-local mode](project-local.md) use `.devframework/bin/ase.ps1` or `.devframework/bin/ase`: settings/runtime are project-owned and memory/journal/receipts live in ignored `.devframework/local`. Local project UUIDs and explicit workspace aliases isolate the memory; Git is not required.

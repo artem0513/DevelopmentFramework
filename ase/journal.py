@@ -18,6 +18,7 @@ from .timezones import resolve_timezone
 
 
 FINISH_STATES = {"completed": "COMPLETED", "awaiting_approval": "AWAITING_APPROVAL",
+                 "awaiting_lead_review": "REVIEWING",
                  "blocked": "BLOCKED", "paused": "PAUSED", "cancelled": "CANCELLED", "interrupted": "PAUSED"}
 EVENT_KINDS = {"work_started", "work_completed", "stage_result", "check", "decision", "blocker_opened",
                "blocker_resolved", "pause", "session_finished", "correction", "committed", "published", "deployed", "merged"}

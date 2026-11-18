@@ -5,6 +5,14 @@ description: "Use when a managed task needs a separate acceptance judgment again
 
 # Independent acceptance
 
+When whole-root lead policy is configured, explicitly judge the original main
+bot's classification and requirement-anchored critique evidence in the provided
+`lead_review` disposition. Challenge unjustified mechanical exemptions, missing
+business scenarios, unsupported PASS/measurement claims, stale final input and
+unresolved findings. Three generic summaries are insufficient. A justified
+current exemption may have sufficient exemption evidence without three passes.
+Keep original criterion IDs/expected wording; these are additional policy checks.
+
 Apply relevant [evidence decisions](../task-orchestrator/references/evidence-decisions.md): actual target/reference authority, required dependency postconditions and current artifact purpose/version. For migration/optimization assess meaningful equivalence and relevant boundaries/preexisting ambiguity. Metadata or prepared drafts are not consumer/execution evidence. Missing relevant code is a coverage gap to investigate or disclose; it does not establish absent behavior.
 
 Act in a separate session from implementation. Read the original request and sources, approved proposal/stages, acceptance obligations, current artifacts and actual executed evidence. Inspect the delivered result directly; an implementation summary is only a locator.
