@@ -265,6 +265,7 @@ def parser():
     task = commands.add_parser("task").add_subparsers(dest="action", required=True)
     creation = task.add_parser("create")
     creation.add_argument("--file", required=True)
+    creation.add_argument("--bugfix", action="store_true", help="Require causal evidence, fix necessity and consumer regression proof")
     for name in ("propose", "revise", "plan"):
         command = task.add_parser(name)
         command.add_argument("task_id")
@@ -324,7 +325,10 @@ def parser():
 def _task_command(store, action, args):
     tasks = TaskService(store)
     if action == "create":
-        return tasks.create(_new_contract(args.file))
+        contract=_new_contract(args.file)
+        if args.bugfix:
+            contract['bugfix_evidence']={'version':1,'required':True}
+        return tasks.create(contract)
     task = tasks.snapshot(args.task_id)
     if action == "status":
         return {**task, "readiness": tasks.readiness(args.task_id)}

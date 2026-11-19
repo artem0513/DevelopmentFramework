@@ -37,7 +37,7 @@ MODULES = (
         'discovery discovery_policy_freshness discovery_refresh_retention directory_sources inspection scoped_readiness progress_sources audit_source_evidence',
         ('storage','tasks'), ('task-discovery',)),
     _module('test-design', 'Bot-owned test design from requirements, project patterns and domain skills; no automatic generator.',
-        'testing/adequacy.py', 'production_reasoning_scenarios reasoning_rule_evaluation adequacy_policy test_adequacy', ('tasks','discovery','backends'), ('task-orchestrator','quality-gate')),
+        'testing/adequacy.py testing/bugfix.py', 'production_reasoning_scenarios reasoning_rule_evaluation adequacy_policy test_adequacy execution_evidence bugfix_evidence native_bugfix_evidence', ('tasks','discovery','backends'), ('task-orchestrator','quality-gate')),
     _module('implementation', 'Persist/apply scoped edits with before-image and crash reconciliation.',
         'edit_application.py local_edit_intent.py candidate_capture.py',
         'edit_application local_edit_authority local_edit_inventory local_edit_recovery candidate_capture candidate_capture_recovery audit_candidate_authority',

@@ -4,6 +4,11 @@ Status: implementation design, 2026-11-15. Python 3.11+, standard library, local
 
 ## Structure
 
+Software bugfix evidence belongs to test design (`ase/testing/bugfix.py`), using
+the existing hashed adequacy plan and independent Runner receipts. Task policy
+selects it explicitly; verification orchestrates separate judgments. See
+[bugfix evidence](bugfix-evidence.md). There is no new database or execution loop.
+
 Organize by responsibility first. Within a responsibility, commands change state, queries return projections, services apply policy, repositories own SQL, and a unit of work owns the atomic boundary. These are roles, not mandatory base classes or one class for every noun. Existing small cohesive services remain in place; compatibility entry points remain importable.
 
 ```mermaid
@@ -82,3 +87,8 @@ python -B -m ase.modules evidence --test
 The catalogue is in `ase/modules.py`. It assigns every runtime Python file and every maintained test file explicitly; a boundary test fails when a new file has no owner. Shared integration tests can cover several responsibilities. The declared prerequisite graph documents the service roles; existing compatibility call-backs are still visible through `ase/execution/ports.py`, rather than pretending this is a complete static import graph.
 
 Test design combines instruction-driven test creation with executable plan/adequacy validation. Test execution remains separate. The coordinator inbox belongs to the coordination module; its results do not replace independent acceptance or start a model. Nothing in the catalogue grants model access, starts a worker, records an independent verdict or bypasses the original evidence gate.
+
+The test-design module also binds cited test cases to actual successful execution.
+Its native integration evidence can be checked with
+`scripts/check_native_bugfix_evidence.py`; this ordinary validator retains raw
+advisory outputs and leaves semantic judgment to independent review.

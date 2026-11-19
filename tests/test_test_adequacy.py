@@ -297,7 +297,7 @@ class AdequacyGateTests(AdequacyFixture):
         self.fixture=self.trusted/'provider.py'
         self.requests={}
 
-    def receipt(self,payload=None,*,stage='code',purpose='test_adequacy',schema=None,bindings=None,plan_hash=None,project_id=None):
+    def receipt(self,payload=None,*,stage='code',purpose='test_adequacy',schema=None,bindings=None,plan_hash=None,project_id=None,files=None):
         payload=copy.deepcopy(self.payload if payload is None else payload)
         body="payload = json.loads("+repr(json.dumps(payload))+")"
         self.fixture.write_text(FIXTURE.replace("payload = {'verdict':'PASS'}",body))
@@ -309,8 +309,8 @@ class AdequacyGateTests(AdequacyFixture):
             'bindings':selected,'schema':schema or self.api.ADEQUACY_SCHEMA,
             'handoff':{'purpose':purpose,'stage_id':stage,'test_plan_sha256':plan_hash or self.saved['payload']['test_plan_sha256']},
             'source_packet':{'requirements':['Only one concurrent claim'],
-                'files':[{'path':'tests/test_claim.py','content':self.test_source,'sha256':hashlib.sha256(self.test_source.encode()).hexdigest()}],
-                'coverage':{'scope':'Disposable concrete test source','included':['tests/test_claim.py'],'missing':[]}}}
+                'files':files if files is not None else [{'path':'tests/test_claim.py','content':self.test_source,'sha256':hashlib.sha256(self.test_source.encode()).hexdigest()}],
+                'coverage':{'scope':'Disposable concrete test source','included':[row['path'] for row in files] if files is not None else ['tests/test_claim.py'],'missing':[]}}}
         runner=Runner({'executable':sys.executable,'executable_args':[str(self.fixture),'success','codex'],
             'trusted_cwd':str(self.trusted),'protocol_only':True},self.store.root/'tasks/adequacy/sessions')
         receipt=runner.run(get_adapter('codex'),request,timeout=10)['receipt']

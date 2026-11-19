@@ -5,6 +5,8 @@ description: "Use when current managed-task evidence must determine completion r
 
 # Evidence gate
 
+For software bugfixes apply the [causal evidence procedure](../task-orchestrator/references/bugfix-evidence.md): confirm cause, justify the correction and independently judge real consumer regressions. Read its operating details only when applicable.
+
 Configured nontrivial roots also require the original main bot's
 [three additional whole-task passes](../task-orchestrator/references/lead-critical-passes.md).
 Original/approved requirements, accumulated findings and the current final

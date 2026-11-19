@@ -4,11 +4,13 @@ This service never runs tests, starts a model, or grants task authority. A host
 supplies fresh review-role Runner evidence; semantic quality remains a separate
 independent judgment rather than a test-count heuristic.
 """
+import ast
 import copy
 import hashlib
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 
+from ..native_paths import state_io
 from ..profiles import COMMAND_KINDS, evaluate_contract_profiles, stage_evidence_specs, stage_profile
 from ..protocol import decode_json, validate_payload
 from ..runner import checked_path, verify_receipt
@@ -59,7 +61,8 @@ def _ids(values, name, *, nonempty=True):
 
 
 def _rows(payload):
-    if not isinstance(payload,dict) or set(payload)!={'scenarios','not_applicable'}:
+    if (not isinstance(payload,dict) or not {'scenarios','not_applicable'}.issubset(payload)
+            or set(payload)-{'scenarios','not_applicable','bugfixes'}):
         raise ValueError('Test plan requires scenarios and not_applicable')
     if len(encode(payload))>200000:
         raise ValueError('Test plan exceeds bound')
@@ -89,6 +92,8 @@ def _rows(payload):
         if row['risk'] in risks:
             raise ValueError('Duplicate excluded risk')
         risks.add(row['risk'])
+    from .bugfix import validate_dossiers
+    validate_dossiers(payload)
     return scenarios
 
 
@@ -103,6 +108,8 @@ def _compatible_stages(contract,checks,scenario):
 
 def _validate_plan(contract,checks,payload):
     scenarios=_rows(payload)
+    from .bugfix import validate_dossiers
+    validate_dossiers(payload,contract,checks)
     known_ac={ac['id'] for ac in contract['acceptance']}
     known_checks={spec['id'] for spec in checks}
     mandatory={(stage['id'],ac['id']) for ac in contract['acceptance'] if ac.get('mandatory',True)
@@ -125,6 +132,166 @@ def _validate_plan(contract,checks,payload):
 def _outcome(status,reasons=(),*,configured=True,rejected=()):
     return {'configured':configured,'status':status,'blocked_reasons':list(dict.fromkeys(reasons)),
         'rejected_reasons':list(dict.fromkeys(rejected))}
+
+
+def _source_cases(content):
+    """Python definitions, not matching text in comments or another class."""
+    cases=set()
+    def visit(nodes,prefix=''):
+        for node in nodes:
+            if isinstance(node,ast.ClassDef):
+                visit(node.body,prefix+node.name+'.')
+            elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                cases.add(prefix+node.name)
+    try:
+        visit(ast.parse(content).body)
+    except (SyntaxError,ValueError):
+        pass
+    return cases
+
+
+def _script_argument(argv):
+    """Return Python's direct script argument, never an arbitrary argv mention."""
+    if not argv or not re.fullmatch(r'(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?',Path(argv[0]).name,re.I):
+        return None
+    index=1
+    while index<len(argv):
+        argument=argv[index]
+        if argument in ('-m','-c'):
+            return None
+        if argument=='--':
+            return argv[index+1] if index+1<len(argv) else None
+        if argument in ('-W','-X'):
+            index+=2
+        elif argument.startswith('-'):
+            index+=1
+        else:
+            return argument
+    return None
+
+
+def _unittest_module(path,repo,observation):
+    """Bind unittest's module name to the source and the actual invocation root."""
+    source=(repo/path).resolve()
+    cwd=Path(observation['cwd']).resolve()
+    argv=observation['argv']
+    script=_script_argument(argv)
+    if script is not None:
+        return '__main__' if (cwd/script).resolve()==source else None
+    top=cwd
+    if 'discover' in argv:
+        arguments=argv[argv.index('discover')+1:]
+        start='.'; explicit_top=None; positional=[]; index=0
+        while index<len(arguments):
+            argument=arguments[index]
+            if argument in ('-s','--start-directory','-t','--top-level-directory','-p','--pattern','-k'):
+                if index+1==len(arguments):
+                    return None
+                if argument in ('-s','--start-directory'):start=arguments[index+1]
+                elif argument in ('-t','--top-level-directory'):explicit_top=arguments[index+1]
+                index+=2
+            elif argument.startswith('--start-directory='):
+                start=argument.split('=',1)[1]; index+=1
+            elif argument.startswith('--top-level-directory='):
+                explicit_top=argument.split('=',1)[1]; index+=1
+            else:
+                if not argument.startswith('-'):positional.append(argument)
+                index+=1
+        if positional:start=positional[0]
+        if explicit_top is None and len(positional)>2:explicit_top=positional[2]
+        top=(cwd/(explicit_top if explicit_top is not None else start)).resolve()
+    try:
+        parts=list(source.relative_to(top).with_suffix('').parts)
+    except ValueError:
+        return None
+    if parts and parts[-1]=='__init__':parts.pop()
+    module='.'.join(parts) if parts and all(part.isidentifier() for part in parts) else None
+    return None if module=='__main__' else module
+
+
+def _unittest_cases(output):
+    """Known verbose unittest identities/outcomes, including failure subtests."""
+    pending=None
+    for line in output.splitlines():
+        if not line.strip():continue
+        failure=re.match(r'^\s*(?:FAIL|ERROR): (\w+) \(([\w.]+)\)',line)
+        match=re.match(r'^\s*(\w+) \(([\w.]+)\)(?: \([^\n]*\))?(?: \.\.\. (.*))?$',line)
+        if failure:
+            method,identity=failure.groups(); status='FAIL'
+        elif match:
+            method,identity,status=match.groups()
+            if status is None:
+                pending=(method,identity); continue
+        elif pending and (description:=re.match(r'^.* \.\.\. (.*)$',line)):
+            method,identity=pending; status=description[1]
+        else:
+            pending=None; continue
+        pending=None
+        # Python versions print either module.Class or module.Class.method.
+        qualified=identity if identity.endswith('.'+method) else identity+'.'+method
+        if status in ('FAIL','ERROR','unexpected success'):
+            outcome='FAIL'
+        elif status=='ok':
+            outcome='PASS'
+        else:
+            outcome='BLOCKED'
+        yield qualified,outcome
+
+
+def _case_execution(proof,spec,observations,content,repo):
+    """Mechanically bind a cited case to a current log, not semantic adequacy.
+
+    Only verbose unittest and pytest node outcomes are understood. Other runners
+    and aggregate-only output remain unproved until a reliable case adapter is
+    supplied; successful counts and source locators are never substitutes.
+    """
+    matches=[row for row in observations if row.get('id')==proof['check_id']]
+    if len(matches)!=1:
+        return 'BLOCKED'
+    observation=matches[0]
+    if (observation.get('configured_argv')!=spec['argv'] or not observation.get('started')
+            or not observation.get('ended') or not observation.get('cwd')):
+        return 'BLOCKED'
+    from ..core import validate_command_argv
+    try:
+        validate_command_argv(observation,spec['argv'])
+    except (ValueError,KeyError,TypeError):
+        return 'BLOCKED'
+    raw=state_io(Path(observation['log'])).read_bytes()
+    if hashlib.sha256(raw).hexdigest()!=observation.get('log_sha256'):
+        return 'BLOCKED'
+    output=raw.decode('utf-8','replace')
+    definitions=_source_cases(content)
+    parser=spec.get('parser')
+    outcomes=[]
+    path=proof['test_source']; test_id=proof['test_id']
+    # Parameter identities must be cited exactly; they are separate executions.
+    base,separator,parameters=test_id.partition('[')
+    parameters=separator+parameters
+    module=_unittest_module(path,repo,observation) if parser in (None,'unittest') else None
+    candidates=[]
+    for name in definitions:
+        locators={name,path+'::'+name.replace('.','::')}
+        if sum(other.rsplit('.',1)[-1]==name.rsplit('.',1)[-1] for other in definitions)==1:
+            locators.add(name.rsplit('.',1)[-1])
+        if module:locators.add(module+'.'+name)
+        if base in locators:candidates.append(name)
+    if len(candidates)!=1:
+        return 'BLOCKED'
+    name=candidates[0]
+    if module and not parameters:
+        outcomes.extend(status for identity,status in _unittest_cases(output) if identity==module+'.'+name)
+    if parser in (None,'pytest'):
+        for line in output.splitlines():
+            match=re.match(r'^([^\s]+::[^\s]+)\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)(?:\s|$)',line)
+            if not match:continue
+            node,status=match.groups(); source,_,case=node.partition('::')
+            if ((Path(observation['cwd'])/source).resolve()!=(repo/path).resolve()
+                    or case!='::'.join(name.split('.'))+parameters):
+                continue
+            outcomes.append('PASS' if status=='PASSED' else 'FAIL' if status in ('FAILED','ERROR','XPASS') else 'BLOCKED')
+    if 'FAIL' in outcomes:return 'FAIL'
+    return 'PASS' if outcomes and all(status=='PASS' for status in outcomes) else 'BLOCKED'
 
 
 class TestAdequacy:
@@ -174,13 +341,13 @@ class TestAdequacy:
             return row
         fields={'version','task_id','contract_hash','proposal_hash','execution_plan_hash',
             'scenarios','not_applicable','test_plan_sha256'}
-        if (not isinstance(value,dict) or set(value)!=fields or type(value['version']) is not int
+        if (not isinstance(value,dict) or set(value) not in (fields,fields|{'bugfixes'}) or type(value['version']) is not int
                 or value['version']!=1 or value['task_id']!=task_id or len(encode(value))>200000):
             raise ValueError('Invalid bounded test plan record')
         for field in ('contract_hash','proposal_hash','execution_plan_hash','test_plan_sha256'):
             if not isinstance(value[field],str) or not re.fullmatch('[0-9a-f]{64}',value[field]):
                 raise ValueError('Invalid test plan binding: '+field)
-        _rows({key:value[key] for key in ('scenarios','not_applicable')})
+        _rows({key:value[key] for key in ('scenarios','not_applicable','bugfixes') if key in value})
         if hash_value({key:item for key,item in value.items() if key!='test_plan_sha256'})!=value['test_plan_sha256']:
             raise ValueError('Test plan hash differs from captured plan')
         return row
@@ -260,7 +427,7 @@ class TestAdequacy:
         if any(current.get(key)!=expected[field] for key,field in
                 (('contract_hash','contract_hash'),('proposal_hash','proposal_hash'),('plan_hash','execution_plan_hash'))):
             return _outcome('BLOCKED',['Test adequacy current contract/proposal/execution plan differs'])
-        _validate_plan(contract,execution['checks'],{key:plan[key] for key in ('scenarios','not_applicable')})
+        _validate_plan(contract,execution['checks'],{key:plan[key] for key in ('scenarios','not_applicable','bugfixes') if key in plan})
         key=task_id+':adequacy'+(':'+stage_id if stage_id else '')
         receipt=read_record(self.store.db,'verification',key)['payload']
         captured_stage=stage_id
@@ -284,8 +451,10 @@ class TestAdequacy:
         if verified['evidence_kind']!='independent_cli':
             return _outcome('BLOCKED',['Protocol fixtures are not independent test adequacy judgment'])
         identity=verified.get('request_identity',{})
+        from .bugfix import assessment_schema, assess
+        schema=assessment_schema(ADEQUACY_SCHEMA,contract,captured_stage,plan=plan)
         wanted={'role':'review','purpose':'test_adequacy','stage_id':captured_stage,
-            'schema_sha256':hash_value(ADEQUACY_SCHEMA),'project_id':self.store.project_id,
+            'schema_sha256':hash_value(schema),'project_id':self.store.project_id,
             'test_plan_sha256':plan['test_plan_sha256']}
         if not set(wanted).issubset(identity) or any(identity.get(field)!=value for field,value in wanted.items()):
             return _outcome('BLOCKED',['Independent test adequacy request purpose/schema/project/stage/plan differs'])
@@ -293,7 +462,7 @@ class TestAdequacy:
             return _outcome('BLOCKED',['Independent test adequacy role differs'])
         self._independent(task_id,receipt,verified,current)
         result=verified['result']['payload']
-        validation=validate_payload(result,ADEQUACY_SCHEMA)
+        validation=validate_payload(result,schema)
         if validation['status']!='VALID':
             return _outcome('BLOCKED',['Invalid independent test adequacy result: '+str(validation['errors'])])
         bundle=read_record(self.store.db,'checks',task_id)['payload']
@@ -309,6 +478,8 @@ class TestAdequacy:
             return _outcome('BLOCKED',['Independent test adequacy scenario IDs are unknown or duplicated'])
         active=[row for row in plan['scenarios'] if stage_id is None or stage_id in _compatible_stages(contract,execution['checks'],row)]
         reasons=list(result['missing_coverage']); rejected=[]
+        def assessment(*args):
+            return self._assessment(*args,observations=bundle.get('results',[]))
         for scenario in active:
             matches=[row for row in rows if row['id']==scenario['id']]
             if not matches:
@@ -316,14 +487,15 @@ class TestAdequacy:
                     reasons.append('Required test adequacy scenario missing: '+scenario['id'])
                 continue
             if scenario['required']:
-                self._assessment(matches[0],scenario['id'],set(scenario['evidence_ids']),specs,profile,files,reasons,rejected)
+                assessment(matches[0],scenario['id'],set(scenario['evidence_ids']),specs,profile,files,reasons,rejected)
         for index,row in enumerate(result['additional_scenarios']):
             for field in ('risk','boundary','expected'):
                 text(row[field],field,limit=8000)
-            self._assessment(row,'additional risk '+str(index+1),{spec['id'] for spec in specs},specs,profile,files,reasons,rejected)
+            assessment(row,'additional risk '+str(index+1),{spec['id'] for spec in specs},specs,profile,files,reasons,rejected)
+        assess(contract,plan,result,stage_id,files,by_id,specs,profile,assessment,reasons,rejected,captured_stage=captured_stage)
         return _outcome('FAIL' if rejected else 'BLOCKED' if reasons else 'PASS',reasons,rejected=rejected)
 
-    def _assessment(self,row,label,allowed,specs,profile,files,reasons,rejected):
+    def _assessment(self,row,label,allowed,specs,profile,files,reasons,rejected,*,observations=()):
         text(row['reason'],'assessment reason',limit=8000)
         if row['status']=='FAIL':
             rejected.append('Test inadequacy '+label+': '+row['reason'])
@@ -342,14 +514,19 @@ class TestAdequacy:
                 text(proof[field],field,limit=8000)
             check_id=proof['check_id']
             spec=by_id.get(check_id,{})
-            if (check_id not in allowed or spec.get('kind') not in COMMAND_KINDS
-                    or profile['by_id'].get(check_id,{}).get('status')!='PASS'):
-                reasons.append('Scenario evidence is not a successful current executed check: '+label+'/'+check_id)
+            if check_id not in allowed or spec.get('kind') not in COMMAND_KINDS:
+                reasons.append('Scenario evidence is not a mapped current executed check: '+label+'/'+check_id)
+                continue
             path=proof['test_source']
             if ('\\' in path or PureWindowsPath(path).drive or PurePosixPath(path).is_absolute()
                     or '..' in PurePosixPath(path).parts or path.startswith('_ase_') or path not in files):
                 reasons.append('Observable test source missing from captured packet: '+label+'/'+path)
                 continue
-            leaf=re.split(r'::|[.#]',proof['test_id'])[-1]
-            if not leaf.strip() or leaf not in files[path]['content']:
-                reasons.append('Observable test locator missing from captured source: '+label+'/'+proof['test_id'])
+            outcome=_case_execution(proof,spec,observations,files[path]['content'],self.store.repo)
+            if outcome=='FAIL':
+                rejected.append('Cited test case failed in current executed check: '+label+'/'+proof['test_id'])
+                continue
+            if profile['by_id'].get(check_id,{}).get('status')!='PASS':
+                reasons.append('Scenario evidence is not a successful current executed check: '+label+'/'+check_id)
+            if outcome!='PASS':
+                reasons.append('Successful cited case execution unproved (verbose unittest/pytest evidence required): '+label+'/'+proof['test_id'])

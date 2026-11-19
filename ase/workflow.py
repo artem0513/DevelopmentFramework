@@ -131,10 +131,31 @@ class WorkflowController:
                 return task_id
             task_id = parent
 
-    def reserve_cycle(self, task_id, stage_id):
+    def _repair_readiness(self, task_id, stage_id, *, expected_plan_sha256=None):
+        """Pin causal readiness and its exact saved plan under one writer."""
+        from .testing.bugfix import repair_readiness, repair_targets
+        from .testing.adequacy import TestAdequacy
+        with transaction(self.store.db):
+            readiness = repair_readiness(self.store, task_id, stage_id)
+            if not readiness['ready']:
+                return readiness
+            targets = repair_targets(self.tasks.snapshot(task_id)['contract'], stage_id)
+            plan_sha256 = (TestAdequacy(self.store).snapshot(task_id)['payload']['test_plan_sha256']
+                if targets else None)
+            if expected_plan_sha256 is not None and plan_sha256 != expected_plan_sha256:
+                return {'ready': False, 'reason': 'Bugfix investigation changed before causal-repair launch',
+                    'needs_owner_input': False,
+                    'next_action': 'Continue authorized investigation and save current causal evidence before proposing another repair.'}
+            return {**readiness, **({'test_plan_sha256': plan_sha256} if plan_sha256 is not None else {})}
+
+    def reserve_cycle(self, task_id, stage_id, *, repair_plan_sha256=None):
         self.tasks.require_approval(task_id, stage_id)
         root_id = self._root_task(task_id)
         with transaction(self.store.db) as db:
+            if repair_plan_sha256 is not None:
+                readiness = self._repair_readiness(task_id, stage_id, expected_plan_sha256=repair_plan_sha256)
+                if not readiness['ready']:
+                    raise ValueError(readiness['reason'])
             if read_record(db, "stop", task_id)["payload"] or read_record(db, "stop", root_id)["payload"]:
                 raise ValueError("Task is paused by a stop request")
             root = self.tasks.snapshot(root_id)
@@ -1379,9 +1400,21 @@ class WorkflowController:
                           and progress.get("contract_hash") == task["contract_hash"]
                           and progress.get("proposal_hash") == task["proposal_hash"])
             if not continuing:
+                readiness = self._repair_readiness(task_id, stage_id)
+                if not readiness['ready']:
+                    return {'status':'BLOCKED','blocked_reasons':[readiness['reason']],
+                        'next_action':readiness['next_action'],'needs_owner_input':False}
+                repair_plan_sha256 = readiness.get('test_plan_sha256')
+                reservation_options = ({'repair_plan_sha256': repair_plan_sha256}
+                    if repair_plan_sha256 is not None else {})
                 try:
-                    reservation = self.reserve_cycle(task_id, stage_id)
+                    reservation = self.reserve_cycle(task_id, stage_id, **reservation_options)
                 except ValueError as ex:
+                    if repair_plan_sha256 is not None:
+                        readiness = self._repair_readiness(task_id, stage_id, expected_plan_sha256=repair_plan_sha256)
+                        if not readiness['ready']:
+                            return {'status': 'BLOCKED', 'blocked_reasons': [readiness['reason']],
+                                'next_action': readiness['next_action'], 'needs_owner_input': False}
                     return {"status": "BLOCKED", "blocked_reasons": [str(ex)], "task_id": task_id}
                 current = self.tasks.snapshot(task_id)
                 self.tasks.transition(task_id, "EXECUTING", expected_revision=current["revision"], reason="Executing approved stage " + stage_id)
@@ -1391,22 +1424,41 @@ class WorkflowController:
                 feedback = read_record(self.store.db, "gate", progress_key)["payload"]
                 candidate_authority = self._stage_authority(task, stage)
                 progress["candidate_authority"] = candidate_authority
+                if repair_plan_sha256 is not None:
+                    progress['repair_test_plan_sha256'] = repair_plan_sha256
                 self._save("cycle", progress_key, progress)
                 request = self._request(task_id, "implementation", EDIT_SCHEMA,
                     {"instruction": "Propose minimal approved-scope edits. Empty before_sha256 means a new file. Do not change requirements or proof state.",
-                     "stage": stage, "candidate_id": reservation["candidate_id"], "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"]})
+                     "stage": stage, "candidate_id": reservation["candidate_id"], "previous_feedback": feedback, "diagnostic": read_record(self.store.db, "diagnostic", task_id)["payload"],
+                     **({'test_plan_sha256': repair_plan_sha256} if repair_plan_sha256 is not None else {})})
                 from .candidate_capture import reference
                 capture, request = reference(task_id, stage_id, reservation['candidate_id'], uuid.uuid4().hex, request)
                 progress['implementation_capture'] = capture
                 self._save('cycle', progress_key, progress)
+                launch_options, launch_denial = {}, {}
+                if repair_plan_sha256 is not None:
+                    @contextmanager
+                    def launch_guard():
+                        # Serialize the pinned investigation check with actual
+                        # Popen only; probes and model waits hold no DB writer.
+                        with transaction(self.store.db):
+                            readiness = self._repair_readiness(task_id, stage_id, expected_plan_sha256=repair_plan_sha256)
+                            if not readiness['ready']:
+                                launch_denial.update(readiness)
+                                raise ValueError(readiness['reason'])
+                            yield
+                    launch_options['launch_guard'] = launch_guard
                 candidate = self._call(task_id, lambda timeout: runner.run(adapter, request,
-                    timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id), execution_id=capture['execution_id']),
-                    capture_reference=capture)
+                    timeout=timeout, cancel_requested=lambda: self._stop_requested(task_id), execution_id=capture['execution_id'],
+                    **launch_options), capture_reference=capture)
                 self._save("implementation", task_id, candidate["receipt"])
                 # Preserve unfinished independent stages before a later stage
                 # replaces the task-wide latest candidate. This is a proposal
                 # receipt, not a checkpoint asserting that edits were applied.
                 self._save("stage_implementation", task_id + ":" + stage_id, candidate["receipt"])
+                if launch_denial:
+                    return {'status': 'BLOCKED', 'blocked_reasons': [launch_denial['reason']],
+                        'next_action': launch_denial['next_action'], 'needs_owner_input': False}
                 if candidate["result"]["status"] != "COMPLETE":
                     return {"status": "BLOCKED", "blocked_reasons": [candidate["result"]["blocker"]]}
                 if not read_record(self.store.db, "baseline_implementation", task_id)["payload"]:

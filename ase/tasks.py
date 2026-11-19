@@ -46,7 +46,7 @@ def _unique(items, name):
 def validate_contract_v2(value):
     allowed = {"id", "schema_version", "profile", "request", "scope", "acceptance", "evidence", "commands",
                "stages", "assumptions", "unknowns", "sources", "capabilities", "execution_policy", "reporting",
-               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy", "lead_review"}
+               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy", "lead_review", "bugfix_evidence"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("Unknown task field; approval must be recorded separately")
     c = copy.deepcopy(value)
@@ -128,6 +128,10 @@ def validate_contract_v2(value):
                 or type(quality['version']) is not int or quality['version'] != 1
                 or quality['required'] is not True or not has_software(c)):
             raise ValueError('test_adequacy requires version 1, required true and software scope')
+    if 'bugfix_evidence' in c:
+        from .testing.bugfix import required
+        if not required(c) or c.get('test_adequacy')!={'version':1,'required':True}:
+            raise ValueError('bugfix_evidence requires software scope and required test adequacy')
     visiting, visited = set(), set()
     by_id = {s["id"]: s for s in stages}
 
@@ -216,9 +220,14 @@ class TaskService:
                 raise ValueError("Child scope exceeds approved parent stage")
             if parent['contract'].get('test_adequacy') and has_software(c):
                 c['test_adequacy'] = copy.deepcopy(parent['contract']['test_adequacy'])
+            if parent['contract'].get('bugfix_evidence') and has_software(c):
+                c['bugfix_evidence'] = copy.deepcopy(parent['contract']['bugfix_evidence'])
             if parent['contract'].get('lead_review'):
                 c['lead_review'] = copy.deepcopy(parent['contract']['lead_review'])
             validate_child_obligations(c, parent["contract"], parent_stage, task_id)
+            # Inherited policy can strengthen (and invalidate) a formerly valid
+            # child. Reject it before inserting an authorized READY task.
+            c = validate_contract_v2(c)
         payload = {"task_id": task_id, "state": "DRAFT", "contract": c, "contract_hash": hash_value(c),
                    "proposal_hash": None, "approved_stage_ids": [], "created": now()}
         if parent:
@@ -251,6 +260,8 @@ class TaskService:
             incoming["execution_policy"] = policy
             if current['contract'].get('test_adequacy'):
                 incoming.setdefault('test_adequacy', copy.deepcopy(current['contract']['test_adequacy']))
+            if current['contract'].get('bugfix_evidence'):
+                incoming.setdefault('bugfix_evidence', copy.deepcopy(current['contract']['bugfix_evidence']))
             if current['contract'].get('lead_review'):
                 incoming.setdefault('lead_review', copy.deepcopy(current['contract']['lead_review']))
         c = validate_contract_v2(incoming)

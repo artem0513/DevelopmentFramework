@@ -56,6 +56,8 @@ A documented platform capability is a hypothesis about this execution path until
 
 ## 6. Substantiate and respond to review
 
-Before asserting an actionable defect, trace a concrete trigger through the relevant caller, callee and contract; cite the inspected location or observation supporting the consequence. Tests and actual error paths can establish whether a guard/transition exists. An omitted callee means missing coverage, not proof of absent behavior: obtain relevant code if authorized, or report a material gap as UNVERIFIED/BLOCKED without inventing a defect.
+Trace the current trigger through caller, boundary, callee, contract and observations; cite the first divergence/consequence. Missing code is a coverage gap to investigate, never a defect. Unknowns stay UNVERIFIED/BLOCKED.
 
-Before repair, verify the finding against current code/evidence. Reproduce or otherwise establish the actual consequence. Repair confirmed in-scope defects, then rerun affected checks and fresh independent AC/review. Reject a disproven finding with evidence and retain the finding/response in history. Avoid speculative changes or downgrading a real P0/P1/P2 to obtain approval. Existing scope, recovery and separate-session requirements remain in force.
+For new software bugs use `--bugfix`. Distinguish symptom, cause and workaround. Justify the correction and new layers against the contract; preserve legitimate behavior. Use grounded consumer regressions with baseline/fault-injection evidence: helper-only green tests are insufficient. Continue useful authorized diagnostics before owner questions. See [bugfix procedure](bugfix-evidence.md) on demand.
+
+Repair confirmed in-scope findings, rerun affected checks and fresh separate AC/review. Reject disproven findings with counterproof retained in history. Never speculate or downgrade P0/P1/P2 for approval. Preserve scope/recovery limits.

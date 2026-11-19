@@ -215,7 +215,7 @@ class Runner:
         self.artifact_root = Path(artifact_root)
         if not self.artifact_root.is_absolute(): raise ValueError("Absolute artifact root required")
 
-    def run(self, adapter, request, *, timeout=300, cancel_requested=None, execution_id=None):
+    def run(self, adapter, request, *, timeout=300, cancel_requested=None, execution_id=None, launch_guard=None):
         if type(timeout) not in (int, float) or timeout <= 0:
             raise ValueError("Positive timeout required")
         deadline = time.monotonic() + timeout
@@ -282,7 +282,8 @@ class Runner:
             artifacts["stdin"] = _write(root / "stdin.bin", input_bytes or b"")
             cap = self.config.get("max_output_bytes", 1048576)
             process = capture_process(call["argv"], cwd, timeout=timeout, max_output_bytes=cap, input_bytes=input_bytes,
-                                      extra_output_paths=[root / 'final.json'], cancel_requested=cancel_requested, deadline=deadline)
+                                      extra_output_paths=[root / 'final.json'], cancel_requested=cancel_requested, deadline=deadline,
+                                      **({'launch_guard': launch_guard} if launch_guard is not None else {}))
             stdout, stderr = process.pop("stdout"), process.pop("stderr")
             artifacts.update(stdout=_write(root / "stdout.jsonl", stdout), stderr=_write(root / "stderr.log", stderr))
             final_data = None
