@@ -266,6 +266,7 @@ def parser():
     creation = task.add_parser("create")
     creation.add_argument("--file", required=True)
     creation.add_argument("--bugfix", action="store_true", help="Require causal evidence, fix necessity and consumer regression proof")
+    creation.add_argument('--compact-context', action='store_true', help='Enable bounded exact context body representations')
     for name in ("propose", "revise", "plan"):
         command = task.add_parser(name)
         command.add_argument("task_id")
@@ -328,6 +329,8 @@ def _task_command(store, action, args):
         contract=_new_contract(args.file)
         if args.bugfix:
             contract['bugfix_evidence']={'version':1,'required':True}
+        if getattr(args, 'compact_context', False):
+            contract['context_transport']={'version':1,'mode':'lossless'}
         return tasks.create(contract)
     task = tasks.snapshot(args.task_id)
     if action == "status":

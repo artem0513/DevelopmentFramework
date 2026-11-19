@@ -25,7 +25,7 @@ def _object(properties):
 _STRING={'type':'string','minLength':1,'maxLength':8000}
 _STRINGS={'type':'array','maxItems':100,'items':_STRING}
 _STATUS={'type':'string','enum':['PASS','FAIL','UNVERIFIED','BLOCKED']}
-_PROOF=_object({'check_id':_STRING,'test_source':_STRING,'test_id':_STRING,'assertion':_STRING})
+_PROOF=_object({'check_id':_STRING,'test_source':{**_STRING,'description':'Exact relative packet source file path, without :line suffix. Put line locators in assertion.'},'test_id':_STRING,'assertion':_STRING})
 _PROOFS={'type':'array','maxItems':100,'items':_PROOF}
 _ASSESSMENT={'status':_STATUS,'evidence':_PROOFS,'missing_coverage':_STRINGS,'reason':_STRING}
 ADEQUACY_SCHEMA=_object({
@@ -380,7 +380,8 @@ class TestAdequacy:
         if len(raw)>8388608 or hashlib.sha256(raw).hexdigest()!=receipt['request_sha256']:
             raise ValueError('Adequacy request changed after receipt validation')
         request=decode_json(raw)
-        return {row['path']:row for row in request['source_packet']['files']}
+        from ..evidence.compact import expand_packet
+        return {row['path']:row for row in expand_packet(request['source_packet'])['files']}
 
     def _independent(self,task_id,receipt,verified,current):
         execution=receipt['execution_id']

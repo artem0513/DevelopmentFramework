@@ -235,7 +235,7 @@ class NativeEvidenceValidatorTests(unittest.TestCase):
         """Unit seam: run the real suite with mocked evidence, never native acceptance."""
         advisory = {'items': deepcopy(self.result['payload']['items']), 'identities': [('case-run', 'case-session')]}
         consumer = {'identities': [('consumer-run', 'consumer-session')]}
-        output, runner = io.StringIO(), io.StringIO()
+        output = runner = io.StringIO()
         suite = checker.build_suite(self.folder, self.folder)
         case_class = type(next(iter(suite)))
         started = datetime.now(timezone.utc).isoformat()
@@ -245,10 +245,9 @@ class NativeEvidenceValidatorTests(unittest.TestCase):
              patch.object(checker, 'validate_cases', return_value=advisory), \
              patch.object(checker, 'validate_consumer', return_value=consumer), \
              patch('sys.stdout', output):
-            result = unittest.TextTestRunner(stream=runner, verbosity=2).run(suite)
+            status = checker.main(['--consumer', str(self.folder), '--cases', str(self.folder)])
         ended = datetime.now(timezone.utc).isoformat()
-        self.assertTrue(result.wasSuccessful(), runner.getvalue())
-        self.assertEqual(result.testsRun, 8)
+        self.assertEqual(status, 0)
         log = Path(self.temp.name) / 'unit-suite-verbose.log'
         log.write_bytes(runner.getvalue().encode('utf-8'))
         argv = [sys.executable, '-B', 'scripts/check_native_bugfix_evidence.py',
@@ -268,6 +267,16 @@ class NativeEvidenceValidatorTests(unittest.TestCase):
             with self.subTest(test_id=proof['test_id']):
                 self.assertEqual(_case_execution(proof, spec, [observation],
                     CHECKER.read_text(encoding='utf-8'), CHECKER.parents[1]), 'PASS', runner.getvalue())
+
+    def test_native_packet_files_reads_exact_logical_compacted_sources(self):
+        from ase.evidence.compact import compact_packet
+        body = 'source line\n' * 14000
+        rows = [{'path': path, 'content': body, 'sha256': sha256(body.encode())} for path in ('base.txt', 'client.py')]
+        packet = {'requirements': ['Exact native source'], 'files': rows,
+                  'coverage': {'scope': 'Fixture', 'included': ['base.txt', 'client.py'], 'missing': []}}
+        compact = compact_packet(packet)
+        self.assertEqual(compact['files'][1]['encoding'], 'copy_v1')
+        self.assertEqual(checker.packet_files({'source_packet': compact})['client.py'], rows[1])
 
     def test_native_suite_cache_is_local_to_each_suite(self):
         advisory = {'items': deepcopy(self.result['payload']['items']), 'identities': [('case-run', 'case-session')]}

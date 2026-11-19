@@ -13,11 +13,14 @@ class CodexAdapter:
         return caps
 
     def build_invocation(self, request, capabilities):
+        prompt = packet_prompt(request)
+        if len(prompt) > 1048576:
+            raise ValueError('CODEX_INPUT_TOO_LARGE: complete prompt exceeds native character limit')
         paths = capabilities["artifact_paths"]
         call = invocation(capabilities, ["exec", "--ignore-user-config", "--ephemeral", "--sandbox", "read-only",
             "--skip-git-repo-check", "--cd", capabilities["trusted_cwd"], "--output-schema", paths["schema"],
             "--output-last-message", paths["final"], "--json", "-"], os_sandbox="read-only")
-        call['stdin'] = packet_prompt(request)
+        call['stdin'] = prompt
         return call
 
     def parse_result(self, raw_events, final_payload):

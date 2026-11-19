@@ -27,18 +27,23 @@ MAX_DELTA_LINES = 8192
 def restore_line_delta(value, base, expected_sha256):
     """Restore one bounded, same-packet source; never follow another delta."""
     keys = {'encoding', 'base_packet_path', 'base_sha256', 'source_sha256', 'edits'}
+    normalized = isinstance(value, dict) and value.get('encoding') == 'line_delta_v2'
+    if normalized:
+        keys.add('base_newlines')
     if (not isinstance(base, dict) or not isinstance(base.get('path'), str)
             or not isinstance(base.get('content'), str) or not isinstance(base.get('sha256'), str)
-            or not isinstance(value, dict) or set(value) != keys or value['encoding'] != 'line_delta_v1'
+            or not isinstance(value, dict) or set(value) != keys or value['encoding'] not in {'line_delta_v1', 'line_delta_v2'}
+            or (normalized and value['base_newlines'] != 'crlf_to_lf')
             or len(canonical(value)) > MAX_SOURCE or value['base_packet_path'] != base['path']):
         raise ValueError('Invalid historical line delta')
     raw = base['content'].encode('utf-8')
     if (len(raw) > MAX_SOURCE or sha256(raw) != base['sha256'] or base['sha256'] != value['base_sha256']
             or _digest(value['source_sha256']) != _digest(expected_sha256)):
         raise ValueError('Historical delta source identity differs')
-    lines = base['content'].splitlines(keepends=True)
+    content = base['content'].replace('\r\n', '\n') if normalized else base['content']
+    lines = content.splitlines(keepends=True)
     edits = value['edits']
-    if len(lines) > MAX_DELTA_LINES or not isinstance(edits, list) or not 1 <= len(edits) <= MAX_REFS:
+    if len(lines) > MAX_DELTA_LINES or not isinstance(edits, list) or not (0 if normalized else 1) <= len(edits) <= MAX_REFS:
         raise ValueError('Historical delta exceeds bounded line edits')
     pieces, cursor = [], 0
     for edit in edits:
@@ -62,12 +67,20 @@ def _line_delta(raw, base):
     after = raw.decode('utf-8').splitlines(keepends=True)
     if len(before) > MAX_DELTA_LINES or len(after) > MAX_DELTA_LINES:
         return None
-    edits = [{'start': i, 'until': end, 'content': ''.join(after[j:stop])}
-             for kind, i, end, j, stop in difflib.SequenceMatcher(None, before, after).get_opcodes() if kind != 'equal']
-    value = {'encoding': 'line_delta_v1', 'base_packet_path': base['path'], 'base_sha256': base['sha256'],
-             'source_sha256': sha256(raw), 'edits': edits}
+    def candidate(lines, normalized):
+        edits = [{'start': i, 'until': end, 'content': ''.join(after[j:stop])}
+                 for kind, i, end, j, stop in difflib.SequenceMatcher(None, lines, after).get_opcodes() if kind != 'equal']
+        value = {'encoding': 'line_delta_v2' if normalized else 'line_delta_v1', 'base_packet_path': base['path'], 'base_sha256': base['sha256'],
+                 'source_sha256': sha256(raw), 'edits': edits}
+        if normalized: value['base_newlines'] = 'crlf_to_lf'
+        return value
+    value = candidate(before, False)
+    if '\r\n' in base['content']:
+        other = candidate(base['content'].replace('\r\n', '\n').splitlines(keepends=True), True)
+        if len(canonical(other)) < len(canonical(value)): value = other
+    edits = value['edits']
     encoded = canonical(value)
-    if not edits or len(edits) > MAX_REFS or len(encoded) > MAX_SOURCE or len(encoded) * 4 >= len(raw) * 3:
+    if (not edits and value['encoding'] == 'line_delta_v1') or len(edits) > MAX_REFS or len(encoded) > MAX_SOURCE or len(encoded) * 4 >= len(raw) * 3:
         return None
     if restore_line_delta(value, base, sha256(raw)) != raw:
         raise ValueError('Historical delta reconstruction differs')
@@ -410,8 +423,9 @@ class LeadInputs:
 
     @staticmethod
     def _archive_files(request):
+        from .evidence.compact import expand_packet
         files = {}
-        for row in request['source_packet']['files']:
+        for row in expand_packet(request['source_packet'])['files']:
             raw = row['content'].encode('utf-8')
             if sha256(raw) != row['sha256'] or row['path'] in files:
                 raise ValueError('Archived source packet has duplicate or changed bodies')
@@ -543,7 +557,7 @@ class LeadInputs:
                     content = canonical(delta).decode('utf-8'); representation_hash = sha256(content.encode())
                     path = '_ase_lead_history/' + digest + '.delta.json'
                     by_hash[digest] = {'sha256': digest, 'packet_path': path,
-                        'encoding': 'line_delta_v1', 'representation_sha256': representation_hash}
+                        'encoding': delta['encoding'], 'representation_sha256': representation_hash}
                     exported[digest] = {'path': path, 'content': content, 'sha256': representation_hash}
                 else:
                     path = '_ase_lead_history/' + digest + '.txt'

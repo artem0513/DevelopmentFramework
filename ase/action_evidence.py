@@ -9,6 +9,7 @@ from .core import redact, validate_command_argv
 from .native_paths import logical_path, state_io
 from .runner import verify_receipt
 from .state import encode, hash_value, identifier, read_record
+from .evidence.compact import expand_packet
 
 MAX_LOG = 32768
 MAX_READ = 16 * 1024 * 1024
@@ -246,7 +247,7 @@ def _proposal(store, task, plan, stage, snapshot):
             if hashlib.sha256(original_bytes).hexdigest() != receipt["artifacts"]["request"]["sha256"]:
                 raise ValueError("Original plan request changed after receipt verification")
             original_request = json.loads(original_bytes)
-            original_files = {item["path"]: item for item in original_request["source_packet"]["files"]}
+            original_files = {item["path"]: item for item in expand_packet(original_request["source_packet"])["files"]}
             original_plan = json.loads(original_files["_ase_context/execution_plan.json"]["content"])
             if original_plan.get("plan_hash") != saved["proof"]["checks"]["plan_hash"]:
                 raise ValueError("Original check-plan identity differs")
@@ -278,7 +279,7 @@ def _proposal(store, task, plan, stage, snapshot):
         raise ValueError("Proposal project/workspace differs")
     if "scope" in actual_stage and actual_stage["scope"] != stage["scope"]:
         raise ValueError("Proposal stage scope differs")
-    supplied = {item["path"]: item for item in request["source_packet"]["files"]}
+    supplied = {item["path"]: item for item in expand_packet(request["source_packet"])["files"]}
     contract = supplied.get("_ase_context/contract.json")
     if historical and contract is None:
         raise ValueError("Historical proposal contract source is unavailable")

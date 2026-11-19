@@ -79,7 +79,8 @@ def record(path, content):
 
 
 def packet_files(request):
-    rows = request['source_packet']['files']
+    from ase.evidence.compact import expand_packet
+    rows = expand_packet(request['source_packet'])['files']
     result = {row['path']: row for row in rows}
     require(len(result) == len(rows), 'Duplicate source packet paths')
     return result
@@ -360,7 +361,6 @@ class NativeEvidenceIntegrityChecks(unittest.TestCase):
         if kind not in self._cache:
             value = validate_consumer(self._consumer) if kind == 'consumer' else validate_cases(self._cases)
             self._cache[kind] = value
-            print(json.dumps({'evidence_integrity_only': True, kind: value}, ensure_ascii=False, separators=(',', ':')), flush=True)
         return self._cache[kind]
 
     def _advisory_case(self, name):
@@ -400,7 +400,16 @@ class NativeEvidenceIntegrityChecks(unittest.TestCase):
 
 def build_suite(consumer, cases):
     cache = {}
-    return unittest.TestSuite(NativeEvidenceIntegrityChecks(name, consumer=consumer, cases=cases, cache=cache)
+    class IntegritySuite(unittest.TestSuite):
+        def run(self, result, debug=False):
+            outcome = super().run(result, debug)
+            # Complete every unittest status line before emitting data on stdout.
+            # Real command capture merges streams; data must not split a case's
+            # identity from its success marker and invalidate case-level proof.
+            for kind, value in cache.items():
+                print(json.dumps({'evidence_integrity_only': True, kind: value}, ensure_ascii=False, separators=(',', ':')), flush=True)
+            return outcome
+    return IntegritySuite(NativeEvidenceIntegrityChecks(name, consumer=consumer, cases=cases, cache=cache)
         for name in unittest.defaultTestLoader.getTestCaseNames(NativeEvidenceIntegrityChecks))
 
 
@@ -410,7 +419,7 @@ def main(argv=None):
     parser.add_argument('--cases', type=Path, required=True, help='Existing one-repetition live advisory capture tree')
     args = parser.parse_args(argv)
     print('Evidence integrity/currentness checks only. Advisory correctness requires independent semantic adjudication.', flush=True)
-    return 0 if unittest.TextTestRunner(verbosity=2).run(build_suite(args.consumer, args.cases)).wasSuccessful() else 1
+    return 0 if unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(build_suite(args.consumer, args.cases)).wasSuccessful() else 1
 
 
 if __name__ == '__main__':

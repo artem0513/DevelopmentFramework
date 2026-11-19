@@ -46,7 +46,7 @@ def _unique(items, name):
 def validate_contract_v2(value):
     allowed = {"id", "schema_version", "profile", "request", "scope", "acceptance", "evidence", "commands",
                "stages", "assumptions", "unknowns", "sources", "capabilities", "execution_policy", "reporting",
-               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy", "lead_review", "bugfix_evidence"}
+               "risk", "protected_paths", "parent_task_id", "parent_stage_id", "test_adequacy", "lead_review", "bugfix_evidence", "context_transport"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("Unknown task field; approval must be recorded separately")
     c = copy.deepcopy(value)
@@ -54,6 +54,11 @@ def validate_contract_v2(value):
         raise ValueError("Task requires schema_version 2 and a supported profile")
     text(c.get("request"), "request")
     c["scope"] = _scope(c.get("scope"))
+    if 'context_transport' in c:
+        transport = c['context_transport']
+        if (not isinstance(transport, dict) or transport != {'version': 1, 'mode': 'lossless'}
+                or type(transport.get('version')) is not int):
+            raise ValueError('Unsupported context transport policy')
     if 'lead_review' in c:
         from .lead_review import validate_policy
         validate_policy(c['lead_review'])
@@ -264,6 +269,8 @@ class TaskService:
                 incoming.setdefault('bugfix_evidence', copy.deepcopy(current['contract']['bugfix_evidence']))
             if current['contract'].get('lead_review'):
                 incoming.setdefault('lead_review', copy.deepcopy(current['contract']['lead_review']))
+            if current['contract'].get('context_transport'):
+                incoming.setdefault('context_transport', copy.deepcopy(current['contract']['context_transport']))
         c = validate_contract_v2(incoming)
         supplied_id = c.pop("id", task_id)
         if supplied_id != task_id:

@@ -6,12 +6,19 @@ from ..gates import source_snapshot, source_resources, stage_checks
 from ..native_paths import logical_path, state_io
 from ..runner import verify_receipt
 from ..state import read_record, encode
+from .compact import compact_packet, expand_packet
 
 from ..execution.ports import PacketContext
 
 
 def _factor_omission_note(packet):
     """Share one identical optional-body note without changing any policy."""
+    if any('encoding' in row for row in packet['files']):
+        logical = expand_packet(packet)
+        _factor_omission_note(logical)
+        packet.clear()
+        packet.update(compact_packet(logical))
+        return
     entry = next((f for f in packet['files'] if f['path'] == '_ase_context/omitted_sources.json'), None)
     if entry is None:
         return
@@ -25,6 +32,23 @@ def _factor_omission_note(packet):
     entry['sha256'] = hashlib.sha256(entry['content'].encode()).hexdigest()
     packet['coverage']['omitted_source_limitation'] = notes.pop()
     packet['coverage']['scope'] += ' omitted_source_limitation applies exactly to EVERY omitted_sources row.'
+
+
+def _bound_packet(packet, historical_paths=(), *, lossless=False):
+    """Transform logical bodies before measuring; never retain stale list aliases."""
+    from ..protocol import canonical, validate_packet
+    if len(canonical(packet)) > 1048576:
+        _factor_omission_note(packet)
+    if lossless:
+        packet = compact_packet(packet)
+    if historical_paths and len(canonical(packet)) > 1048576:
+        packet = expand_packet(packet)
+        packet['files'] = [row for row in packet['files'] if row['path'] not in historical_paths]
+        packet['coverage']['missing'].append('Historical lead-input packet budget exceeded; exact stored inputs need a bounded review representation')
+        packet['coverage']['included'] = [row['path'] for row in packet['files']]
+        if lossless:
+            packet = compact_packet(packet)
+    return validate_packet(packet)
 
 
 class PacketService:
@@ -176,7 +200,7 @@ class PacketService:
                 verify_receipt(historical, require_current_policy=False)
                 original = json.loads(Path(historical["artifacts"]["request"]["path"]).read_bytes())
                 changed_paths = {entry["path"] for entry in changes["changes"]}
-                for before in original["source_packet"]["files"]:
+                for before in expand_packet(original["source_packet"])["files"]:
                     if before["path"] in changed_paths and body_omission(before["path"]) is None:
                         files.append({**before, "path": "_ase_before/" + before["path"]})
             except (ValueError, OSError, KeyError, TypeError) as ex:
@@ -190,7 +214,11 @@ class PacketService:
         from ..delegations import DelegationRegistry
         from ..testing.adequacy import TestAdequacy
         test_adequacy_plan = TestAdequacy(context.store).snapshot(task_id)
-        test_adequacy_assessment = TestAdequacy(context.store).assessment(task_id,stage_id)
+        test_adequacy_assessment = (
+            {'status': 'WITHHELD_FOR_INDEPENDENCE',
+             'reason': 'Prior assessment prose is not input to a fresh opted-in session. Inspect original requirements, scenario plan, actual source and executed logs; the gate separately requires current independent assessment receipts.'}
+            if task['contract'].get('context_transport') == {'version': 1, 'mode': 'lossless'}
+            else TestAdequacy(context.store).assessment(task_id,stage_id))
         try:
             delegation_evidence = DelegationRegistry(context.store).packet_evidence(task_id, stage_id=stage_id)
         except (ValueError, OSError, KeyError, TypeError) as ex:
@@ -271,13 +299,5 @@ class PacketService:
                 "files": files, "coverage": {"scope": "Current stage source plus task contract and actual check logs; known irrelevant/optional bodies are explicitly disclosed in omitted_sources; undeclared dependencies are not proven complete",
                                                "included": [f["path"] for f in files], "missing": missing,
                                                "omitted": [item["path"] for item in omitted_sources]}}
-        from ..protocol import canonical, validate_packet
-        if len(canonical(packet)) > 1048576:
-            _factor_omission_note(packet)
-        if historical_paths and len(canonical(packet)) > 1048576:
-            # Retain complete durable input artifacts, but never pretend that
-            # missing bodies reached this bounded independent model request.
-            files[:] = [item for item in files if item['path'] not in historical_paths]
-            missing.append('Historical lead-input packet budget exceeded; exact stored inputs need a bounded review representation')
-            packet['coverage']['included'] = [item['path'] for item in files]
-        return validate_packet(packet)
+        return _bound_packet(packet, historical_paths,
+            lossless=task['contract'].get('context_transport') == {'version': 1, 'mode': 'lossless'})

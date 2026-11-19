@@ -11,6 +11,7 @@ import threading
 import tempfile
 import uuid
 import weakref
+from .evidence.compact import expand_packet
 
 from .adapters import get_adapter
 from .gates import GateService, source_resources, source_snapshot, stage_checks, verification_context_hash, verification_context_hashes
@@ -850,7 +851,7 @@ class WorkflowController:
                         # never from the current (possibly revised) contract.
                         if role == "implementation" or captured_stage is not None:
                             raise ValueError("historical stage boundary mismatch")
-                        supplied = {item["path"]: item for item in request["source_packet"]["files"]}
+                        supplied = {item["path"]: item for item in expand_packet(request["source_packet"])["files"]}
                         original_contract = json.loads(supplied["_ase_context/contract.json"]["content"])
                         original_stages = [item for item in original_contract["stages"] if item["id"] == stage["id"]]
                         expected_stage = original_stage if supersession else stage
@@ -860,7 +861,7 @@ class WorkflowController:
                                 or logical_path(request["project"]["root"]) != logical_path(self.store.repo)):
                             raise ValueError("historical whole-task stage boundary mismatch")
                     if supersession or plan_supersession:
-                        supplied = {item["path"]: item for item in request["source_packet"]["files"]}
+                        supplied = {item["path"]: item for item in expand_packet(request["source_packet"])["files"]}
                         contract = json.loads(supplied["_ase_context/contract.json"]["content"])
                         plan = json.loads(supplied["_ase_context/execution_plan.json"]["content"])
                         if (hash_value(contract) != saved["contract_hash"] or plan["plan_hash"] != checks["plan_hash"]
@@ -874,7 +875,7 @@ class WorkflowController:
                         "bindings": receipt["bindings"], "started_at_utc": receipt.get("started_at_utc"), "ended_at_utc": receipt.get("ended_at_utc"),
                         "session_id": receipt.get("session_id"), "receipt_sha256": hash_value(receipt),
                         "policy_current": verified['policy_current'], "policy_status": verified['policy_status']}
-                    for item in request["source_packet"]["files"]:
+                    for item in expand_packet(request["source_packet"])["files"]:
                         if item["path"] not in {"_ase_context/source_changes.json", "_ase_context/actual_checks.json"} and not item["path"].startswith("_ase_context/logs/"):
                             continue
                         if len(item["content"].encode("utf-8")) > 65536:
@@ -929,8 +930,11 @@ class WorkflowController:
                 lead_binding = LeadReview(self.store).binding(task_id)
                 if lead_binding is not None:
                     bindings['lead_review_sha256'] = lead_binding
+        packet = self._packet(task_id, stage_id=stage_id)
+        if task['contract'].get('context_transport') and len(encode(packet).encode('utf-8')) > 700000:
+            handoff['context_transport'] = {'version': 1, 'layout': 'source_text_v1'}
         return {"role": role, "project": {"root": str(self.store.repo), "project_id": self.store.project_id}, "schema": schema,
-                "bindings": bindings, "source_packet": self._packet(task_id, stage_id=stage_id), "handoff": handoff}
+                "bindings": bindings, "source_packet": packet, "handoff": handoff}
 
     def _runner(self, task_id):
         if self.runner is not None:
