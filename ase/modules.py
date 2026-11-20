@@ -31,7 +31,7 @@ MODULES = (
         'store.py state.py projects.py project_local.py native_paths.py timezones.py',
         'state schema_v5 projects project_local project_local_state timezones'),
     _module('tasks', 'Versioned commands/queries, original scope, approval and obligations.',
-        'tasks.py', 'task_contract_v2 audit_authority scope_audit partial_progress mixed_profiles', ('storage',), ('task-intake',)),
+        'tasks.py', 'task_contract_v2 task_effects audit_authority scope_audit partial_progress mixed_profiles', ('storage',), ('task-intake',)),
     _module('discovery', 'Relevant sources, existing examples, capabilities and blocker investigation.',
         'discovery.py source_coverage.py inspection.py',
         'discovery discovery_policy_freshness discovery_refresh_retention directory_sources inspection scoped_readiness progress_sources audit_source_evidence',

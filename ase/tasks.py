@@ -392,7 +392,7 @@ class TaskService:
                 "semantic_validation": False}
 
     def propose(self, task_id, proposal, *, expected_revision):
-        if not isinstance(proposal, dict) or set(proposal) - {"summary", "stage_ids", "business", "technical", "steps", "verification", "limitations", "assumptions"}:
+        if not isinstance(proposal, dict) or set(proposal) - {"summary", "stage_ids", "business", "technical", "steps", "verification", "limitations", "assumptions", "effects"}:
             raise ValueError("Invalid proposal fields")
         text(proposal.get("summary"), "proposal summary")
         from .lead_review import validate_intent_text
@@ -409,8 +409,10 @@ class TaskService:
                 raise ValueError("Terminal task needs a new task")
             known = {s["id"] for s in task["contract"]["stages"]}
             stages = proposal.get("stage_ids", [])
-            if not isinstance(stages, list) or not stages or not set(stages).issubset(known):
+            if (not isinstance(stages, list) or not stages or not all(isinstance(s, str) for s in stages)
+                    or not set(stages).issubset(known)):
                 raise ValueError("Proposal requires known stage IDs")
+            self._validate_effects(task["contract"], proposal)
             payload = {k: v for k, v in task.items() if k not in {"revision", "legacy_v1"}}
             payload.update(state="AWAITING_APPROVAL", proposal=copy.deepcopy(proposal),
                            proposal_hash=hash_value({"contract_hash": task["contract_hash"], "proposal": proposal}), approved_stage_ids=[])
@@ -430,11 +432,16 @@ class TaskService:
                 raise ValueError("Terminal task needs a new task")
             if task["legacy_v1"] or not task["proposal_hash"] or proposal_hash != task["proposal_hash"]:
                 raise ValueError("Approval hash differs from current proposal hash")
-            if not isinstance(approved_stage_ids, list) or not approved_stage_ids or not set(approved_stage_ids).issubset(task["proposal"]["stage_ids"]):
+            if (not isinstance(approved_stage_ids, list) or not approved_stage_ids
+                    or not all(isinstance(s, str) for s in approved_stage_ids)
+                    or not set(approved_stage_ids).issubset(task["proposal"]["stage_ids"])):
                 raise ValueError("Approval stage scope differs from proposal")
             stages = {s["id"]: s for s in task["contract"]["stages"]}
+            if not set(approved_stage_ids).issubset(stages):
+                raise ValueError("Approval stage scope differs from contract")
             for stage_id in approved_stage_ids:
                 self._check_unknowns(task, stages[stage_id])
+                self._check_effects(task, stages[stage_id])
             approval = {"proposal_hash": proposal_hash, "contract_hash": task["contract_hash"],
                         "approved_stage_ids": sorted(set(approved_stage_ids)), "user_message_ref": user_message_ref, "approved_at_utc": now()}
             previous = read_record(db, "approval", task_id)
@@ -449,6 +456,101 @@ class TaskService:
                 from .lead_review import archive_approved_intent
                 archive_approved_intent(self.store, self.snapshot(task_id))
         return self.snapshot(task_id)
+
+    @staticmethod
+    def _unknown_stages(stages, unknown):
+        """Stages blocked by an unknown, including dependents (same rule as _check_unknowns)."""
+        affected = set(unknown.get("blocking_stage_ids", [])) | {
+            candidate["id"] for candidate in stages if unknown["id"] in candidate.get("unknown_ids", [])}
+        if not affected or not affected.issubset({candidate["id"] for candidate in stages}):
+            affected = {candidate["id"] for candidate in stages}
+        while True:
+            expanded = affected | {candidate["id"] for candidate in stages if set(candidate.get("depends_on", [])) & affected}
+            if expanded == affected:
+                return affected
+            affected = expanded
+
+    @classmethod
+    def _validate_effects(cls, contract, proposal):
+        """Require a bound justification for each new user/system effect declared in a proposal.
+
+        The declaration is optional so ordinary changes proceed as before. Each declared effect
+        names what changes, the requirement/decision that makes it necessary (or the unknown that
+        holds an unconfirmed assumption) and the scenario the existing path does not cover. The CLI
+        checks presence and binding; the coordinator still judges the meaning against the source.
+        """
+        if "effects" not in proposal:
+            return []
+        effects = proposal["effects"]
+        if not isinstance(effects, list) or len(effects) > 50:
+            raise ValueError("Proposal effects must be a bounded list")
+        if not effects:
+            return effects
+        required = {"id", "stage_ids", "change", "basis", "ref", "uncovered_scenario"}
+        stages = contract["stages"]
+
+        def filled(value):
+            return isinstance(value, str) and bool(value.strip())
+
+        acceptance_ids = {a["id"] for a in contract.get("acceptance", []) if isinstance(a, dict) and isinstance(a.get("id"), str)}
+        # Only a source with a usable locator can bind; a bare placeholder ID is prose with an identifier.
+        source_ids = {s["id"] for s in contract.get("sources", [])
+                      if isinstance(s, dict) and isinstance(s.get("id"), str) and filled(s.get("locator"))}
+        stage_acceptance = {s["id"]: set(s.get("acceptance_ids", [])) for s in stages}
+        unknowns = {u["id"]: u for u in contract.get("unknowns", []) if isinstance(u, dict) and isinstance(u.get("id"), str)}
+        seen = set()
+        for effect in effects:
+            if not isinstance(effect, dict) or set(effect) != required:
+                raise ValueError("Each proposal effect requires id, stage_ids, change, basis, ref and uncovered_scenario")
+            effect_id = identifier(effect["id"], "effect id")
+            if effect_id in seen:
+                raise ValueError("Proposal effect IDs must be unique")
+            seen.add(effect_id)
+            text(effect["change"], "effect change", limit=2000)
+            text(effect["uncovered_scenario"], "effect uncovered_scenario", limit=2000)
+            affected = effect["stage_ids"]
+            if (not isinstance(affected, list) or not affected or not all(isinstance(s, str) for s in affected)
+                    or len(affected) != len(set(affected)) or not set(affected).issubset(proposal.get("stage_ids", []))
+                    or not set(affected).issubset(stage_acceptance)):
+                raise ValueError("Effect " + effect_id + " requires stage IDs within the proposal")
+            ref = identifier(effect["ref"], "effect ref")
+            # A task-wide source binds every stage; an acceptance criterion binds only stages that own it.
+            requirement_refs = source_ids | ({ref} if ref in acceptance_ids and all(
+                ref in stage_acceptance.get(stage_id, set()) for stage_id in affected) else set())
+            if not isinstance(effect["basis"], str):
+                raise ValueError("Effect basis must be REQUIREMENT, DECISION or ASSUMPTION")
+            if effect["basis"] == "REQUIREMENT":
+                if ref not in requirement_refs:
+                    raise ValueError("Effect " + effect_id + " needs a known acceptance or source reference for its stages, not prose")
+            elif effect["basis"] == "DECISION":
+                # A decision binds only when the owner's recorded answer covers the unknown for these stages.
+                decided = (ref in unknowns and unknowns[ref].get("status", "UNRESOLVED") in {"RESOLVED", "CONFIRMED"}
+                           and filled(unknowns[ref].get("resolution"))
+                           and set(affected).issubset(cls._unknown_stages(stages, unknowns[ref])))
+                if ref not in requirement_refs and not decided:
+                    raise ValueError("Effect " + effect_id + " needs a known acceptance or source reference for its stages, or a resolved unknown, not prose")
+            elif effect["basis"] == "ASSUMPTION":
+                if ref not in unknowns or unknowns[ref].get("status", "UNRESOLVED") not in {"UNRESOLVED", "RESOLVED", "CONFIRMED"}:
+                    raise ValueError("Effect " + effect_id + " rests on an assumption and needs a tracked unknown")
+                if not set(affected).issubset(cls._unknown_stages(stages, unknowns[ref])):
+                    raise ValueError("Effect " + effect_id + " unknown does not block its stages")
+            else:
+                raise ValueError("Effect basis must be REQUIREMENT, DECISION or ASSUMPTION")
+        return effects
+
+    @classmethod
+    def _check_effects(cls, task, stage):
+        """Revalidate declared effects against the current contract before a stage may start."""
+        proposal = task.get("proposal")
+        if not isinstance(proposal, dict) or "effects" not in proposal:
+            return
+        for effect in cls._validate_effects(task["contract"], proposal):
+            if stage["id"] not in effect["stage_ids"] or effect["basis"] != "ASSUMPTION":
+                continue
+            unknown = next((u for u in task["contract"].get("unknowns", []) if u["id"] == effect["ref"]), {})
+            # Fail closed: only an explicitly resolved or confirmed unknown releases the stage.
+            if unknown.get("status", "UNRESOLVED") not in {"RESOLVED", "CONFIRMED"}:
+                raise ValueError("Unconfirmed effect assumption blocks stage: " + effect["id"])
 
     @staticmethod
     def _check_unknowns(task, stage):
@@ -492,6 +594,7 @@ class TaskService:
               or stage_id not in approval["approved_stage_ids"]):
             raise ValueError("Current stage requires explicit approval")
         self._check_unknowns(task, stages[stage_id])
+        self._check_effects(task, stages[stage_id])
         readiness = self.readiness(task_id, stage_id=stage_id)
         if readiness["untracked_gap_ids"]:
             raise ValueError("Required source gaps need explicit stage obligations: " + ", ".join(readiness["untracked_gap_ids"]))

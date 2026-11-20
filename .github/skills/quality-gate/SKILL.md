@@ -25,4 +25,6 @@ Configured software also requires current independent [test adequacy](references
 
 Inspect blocked reasons separately from the overall verdict: any unresolved blocker stops mutation even if the overall verdict is REJECTED. In-scope repairs require fresh affected checks and independent receipts within persisted limits. Missing capabilities are not PASS and cannot be repaired by editing status fields.
 
+Publication by any route is bound to the exact head: `ase publish` or git push, and also creating or updating a PR/branch through Azure DevOps or another service CLI, API or connector. First run `ase --project PROJECT publish TASK` as a dry run; it compares the current source fingerprint with the APPROVED gate. A new commit, including a later follow-up or review fix, needs its own current gate before the PR is updated. A review or gate for another SHA, or a solo review, does not cover it. Record the PR id and published SHA. Outside `ase publish` this is procedure, not mechanical enforcement; trusted CI and server-side branch rules enforce it.
+
 Gate exit codes are 0 APPROVED, 2 REJECTED, 3 BLOCKED. Publication remains a dry run until explicitly authorized for the exact destination. Local receipts and hooks are a reliability layer; trusted CI and server-side rules are needed for enforcement against a hostile same-user process.

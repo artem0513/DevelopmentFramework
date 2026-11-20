@@ -18,8 +18,10 @@ correct when the actual contract requires them; this is no blanket prohibition.
    production reproduction. Continue useful authorized probes under existing
    recovery rules; no endless research or premature owner questions.
 3. Explain why the correction belongs at this boundary. Before adding a new
-   merger/wrapper/cache/retry/override, inspect whether direct response use,
-   existing mapping or existing project facilities meet the contract. Preserve
+   merger/wrapper/cache/retry/override, background process, timer/polling, global UI
+   effect or shared-service change, inspect whether direct response use, existing
+   mapping or existing project facilities meet the contract, and record the
+   [scope-growth justification](evidence-decisions.md#7-separate-requirement-wording-from-interpretation-justify-scope-growth). Preserve
    other legitimate fields/behavior. Full-object responses differ from partial
    patches; omission, null and false/zero may differ. Do not invent an allowlist
    from one example.
