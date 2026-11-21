@@ -12,13 +12,16 @@ from .protocol import canonical, decode_json, sha256
 BUNDLE_PATH = Path(__file__).with_name('data') / 'runtime_policy.json'
 COMMON = ('skills/task-orchestrator/references/evidence-decisions.md',
           'skills/task-orchestrator/references/lead-critical-passes.md')
+# Proportionality rules must reach independent sessions, which cannot read repository links.
+DESIGN = ('skills/task-orchestrator/references/solution-design.md',
+          'skills/task-orchestrator/references/solution-calibration.md')
 ROLE_FILES = {
-    'implementation': ('skills/task-orchestrator/SKILL.md', *COMMON),
+    'implementation': ('skills/task-orchestrator/SKILL.md', *COMMON, *DESIGN),
     'ac': ('skills/independent-ac-verifier/SKILL.md', *COMMON,
         'skills/task-orchestrator/references/profile-evidence.md'),
     'review': ('skills/independent-code-reviewer/SKILL.md', *COMMON,
         'skills/task-orchestrator/references/profile-evidence.md',
-        'skills/quality-gate/references/test-adequacy.md'),
+        'skills/quality-gate/references/test-adequacy.md', *DESIGN),
     'diagnostic': ('skills/task-discovery/SKILL.md', *COMMON),
 }
 

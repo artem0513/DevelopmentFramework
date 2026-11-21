@@ -450,8 +450,8 @@ class GateService:
                 receipts.append(record)
         baseline = read_record(self.store.db, "baseline", task_id)["payload"]
         if has_software(task["contract"]) and baseline:
-            from .core import PROTECTED
-            patterns = [*PROTECTED, *task["contract"].get("protected_paths", [])]
+            from .core import PROTECTED, project_protected_paths
+            patterns = [*PROTECTED, *task["contract"].get("protected_paths", []), *project_protected_paths(self.store.repo)]
             changed = [p for p in set(baseline["files"]) | set(source["files"]) if baseline["files"].get(p) != source["files"].get(p)]
             authorization = read_record(self.store.db, "protected_approval", task_id)["payload"]
             allowed = authorization.get("paths", []) if authorization and authorization.get("fingerprint") == source["fingerprint"] and authorization.get("contract_hash") == task["contract_hash"] else []

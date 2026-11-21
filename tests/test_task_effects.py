@@ -54,6 +54,43 @@ class TaskEffectTests(unittest.TestCase):
         proposal.update(extra)
         return self.tasks.propose(task['task_id'], proposal, expected_revision=task['revision'])
 
+    def test_infrastructure_effect_needs_the_owner_not_a_derived_criterion(self):
+        task = self.created()
+        for basis, ref in (('REQUIREMENT', 'ALERT'), ('DECISION', 'ALERT')):
+            with self.subTest(basis=basis), self.assertRaisesRegex(ValueError, "owner's explicit source or decision"):
+                self.propose(task, [timer(kind='infrastructure', basis=basis, ref=ref)])
+        # An explicit owner source, or an assumption that holds the stage until the owner answers, is accepted.
+        self.propose(self.created_again(), [timer(kind='infrastructure', basis='REQUIREMENT', ref='JIRA-1009')])
+        held = self.propose(self.created_again(), [timer(kind='infrastructure')])
+        with self.assertRaisesRegex(ValueError, 'Unconfirmed effect assumption'):
+            self.tasks._check_effects(held, held['contract']['stages'][0])
+
+    def test_infrastructure_effect_from_an_owner_source_approves_and_starts(self):
+        task = self.propose(self.created_again(unknown_stage='other'), [timer(kind='infrastructure', basis='REQUIREMENT', ref='JIRA-1009')])
+        task = self.tasks.approve(task['task_id'], proposal_hash=task['proposal_hash'],
+                                  user_message_ref='test:owner', approved_stage_ids=['implement'])
+        self.tasks._check_effects(task, task['contract']['stages'][0])
+
+    def test_infrastructure_effect_with_a_resolved_owner_decision_is_accepted(self):
+        spec = contract()
+        spec['id'] = 'owner-decided'
+        spec['unknowns'][0].update(status='RESOLVED', resolution='Owner approved a 5-minute authorization check (chat 2026-11-21)')
+        task = self.tasks.create(spec)
+        self.propose(task, [timer(kind='infrastructure', basis='DECISION', ref='IDLE-DETECTION')])
+
+    def test_effect_kind_is_bounded_and_code_kind_keeps_existing_rules(self):
+        task = self.created()
+        for kind in ('cloud', [], None, 3):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, 'kind must be'):
+                self.propose(task, [timer(kind=kind)])
+        self.propose(self.created_again(), [timer(kind='code', basis='REQUIREMENT', ref='ALERT')])
+
+    def created_again(self, **kwargs):
+        # Fresh task per proposal attempt so revisions never collide between subtests.
+        spec = contract(**kwargs)
+        spec['id'] = 'dms-alerts-' + str(len(self.tasks.store.db.execute('SELECT 1 FROM tasks').fetchall()) + 1)
+        return self.tasks.create(spec)
+
     def test_proposal_without_effects_keeps_existing_behavior(self):
         task = self.propose(self.created(unknown_stage='other'))
         task = self.tasks.approve(task['task_id'], proposal_hash=task['proposal_hash'],

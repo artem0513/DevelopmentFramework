@@ -131,6 +131,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(next(item["content"] for item in packet["files"] if item["path"] == "guide.txt"), "Extracted native content")
         self.assertEqual(packet["coverage"]["missing"], [])
 
+    def test_v2_gate_rejects_changes_to_project_protected_shared_code(self):
+        repo = self.store.repo
+        (repo / "Jobs").mkdir()
+        (repo / "Jobs" / "JobRunner.cs").write_text("class JobRunner {}")
+        (repo / "guide.md").write_text("old content")
+        (repo / ".devframework").mkdir()
+        (repo / ".devframework" / "protected-paths.txt").write_text("# shared code\nJobs\\*\n")
+        for args in (("init", "-b", "feature/protect"), ("config", "user.email", "test@example.invalid"), ("config", "user.name", "Protect test"), ("add", "."), ("commit", "-m", "baseline")):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+        c = contract("protect")
+        c["profile"] = "software"
+        self.tasks.create(c)
+        self.controller._save("baseline", "protect", source_snapshot(self.store, c, task_id="protect"))
+        (repo / "guide.md").write_text("feature change")
+        reasons = GateService(self.store).gate("protect")["reasons"]
+        self.assertFalse(any("protected" in r.lower() for r in reasons), reasons)
+        (repo / "Jobs" / "JobRunner.cs").write_text("class JobRunner { /* atomic claim */ }")
+        reasons = GateService(self.store).gate("protect")["reasons"]
+        self.assertIn("Unauthorized protected file changes: Jobs/JobRunner.cs", reasons)
+
     def test_gate_never_completes_unexecuted_stages(self):
         verdict = GateService(self.store).gate("approval-task")
         self.assertIn("Stage incomplete: draft", verdict["reasons"])

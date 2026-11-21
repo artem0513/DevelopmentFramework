@@ -194,6 +194,49 @@ print(json.dumps({'type': 'thread.started', 'thread_id': 'fixture-only'}))
         self.cli("verify", self.task)
         self.assert_gate("REJECTED")
 
+    def project_protects(self, *patterns):
+        folder = self.repo / ".devframework"
+        folder.mkdir(exist_ok=True)
+        (folder / "protected-paths.txt").write_text("# shared, cross-cutting code\n" + "\n".join(patterns) + "\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-m", "project protected paths")
+
+    def gate_after_change(self, path, text):
+        self.start()
+        (self.repo / path).write_text(text, encoding="utf-8")
+        self.cli("check", self.task)
+        self.fixture_codex()
+        self.cli("verify", self.task)
+        return json.dumps(self.cli("gate", self.task, ok=(0, 2, 3)))
+
+    def test_project_protected_paths_reject_a_feature_change_to_shared_code(self):
+        self.project_protects("app.py")
+        result = json.loads(self.gate_after_change("app.py", "def add(a, b):\n    return a + b + 0\n"))
+        self.assertNotEqual(result["status"], "APPROVED", result)
+        self.assertIn("Unauthorized protected file changes: app.py", result["rejected_reasons"])
+
+    def test_unlisted_change_is_not_blocked_by_project_protection(self):
+        self.project_protects("other.py")
+        result = json.loads(self.gate_after_change("app.py", "def add(a, b):\n    return a + b + 0\n"))
+        self.assertEqual(result["status"], "APPROVED", result)
+
+    def test_project_protected_list_cannot_be_weakened_inside_the_task(self):
+        self.project_protects("app.py")
+        result = json.loads(self.gate_after_change(".devframework/protected-paths.txt", ""))
+        self.assertNotEqual(result["status"], "APPROVED", result)
+        self.assertIn("Unauthorized protected file changes: .devframework/protected-paths.txt", result["rejected_reasons"])
+
+    def test_project_protected_paths_parse_globs_and_refuse_escapes(self):
+        from ase.core import project_protected_paths
+        self.assertEqual(project_protected_paths(self.repo), [])
+        self.project_protects("src/Jobs/**", "  # comment", "src\\Data\\*DbContext.cs", "./src/Infra/")
+        self.assertEqual(project_protected_paths(self.repo), ["src/Jobs/**", "src/Data/*DbContext.cs", "src/Infra/*"])
+        (self.repo / ".devframework" / "protected-paths.txt").write_bytes("\ufeffsrc/Jobs/*\n".encode("utf-8"))
+        self.assertEqual(project_protected_paths(self.repo), ["src/Jobs/*"])
+        (self.repo / ".devframework" / "protected-paths.txt").write_text("../outside\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            project_protected_paths(self.repo)
+
     def test_task_and_context_persist_across_processes(self):
         self.start()
         first = self.cli("status", self.task)

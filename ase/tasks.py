@@ -485,6 +485,7 @@ class TaskService:
         if not effects:
             return effects
         required = {"id", "stage_ids", "change", "basis", "ref", "uncovered_scenario"}
+        kinds = {"code", "schema", "infrastructure"}
         stages = contract["stages"]
 
         def filled(value):
@@ -498,8 +499,10 @@ class TaskService:
         unknowns = {u["id"]: u for u in contract.get("unknowns", []) if isinstance(u, dict) and isinstance(u.get("id"), str)}
         seen = set()
         for effect in effects:
-            if not isinstance(effect, dict) or set(effect) != required:
+            if not isinstance(effect, dict) or not required <= set(effect) <= required | {"kind"}:
                 raise ValueError("Each proposal effect requires id, stage_ids, change, basis, ref and uncovered_scenario")
+            if "kind" in effect and (not isinstance(effect["kind"], str) or effect["kind"] not in kinds):
+                raise ValueError("Effect kind must be code, schema or infrastructure")
             effect_id = identifier(effect["id"], "effect id")
             if effect_id in seen:
                 raise ValueError("Proposal effect IDs must be unique")
@@ -520,6 +523,10 @@ class TaskService:
             if effect["basis"] == "REQUIREMENT":
                 if ref not in requirement_refs:
                     raise ValueError("Effect " + effect_id + " needs a known acceptance or source reference for its stages, not prose")
+                if effect.get("kind") == "infrastructure" and ref not in source_ids:
+                    # Added/removed infrastructure is the owner's call: an explicit owner source, a
+                    # resolved owner decision, or an assumption that holds the stage until answered.
+                    raise ValueError("Infrastructure effect " + effect_id + " needs the owner's explicit source or decision, not a derived acceptance criterion")
             elif effect["basis"] == "DECISION":
                 # A decision binds only when the owner's recorded answer covers the unknown for these stages.
                 decided = (ref in unknowns and unknowns[ref].get("status", "UNRESOLVED") in {"RESOLVED", "CONFIRMED"}
@@ -527,6 +534,8 @@ class TaskService:
                            and set(affected).issubset(cls._unknown_stages(stages, unknowns[ref])))
                 if ref not in requirement_refs and not decided:
                     raise ValueError("Effect " + effect_id + " needs a known acceptance or source reference for its stages, or a resolved unknown, not prose")
+                if effect.get("kind") == "infrastructure" and not decided and ref not in source_ids:
+                    raise ValueError("Infrastructure effect " + effect_id + " needs the owner's explicit source or decision, not a derived acceptance criterion")
             elif effect["basis"] == "ASSUMPTION":
                 if ref not in unknowns or unknowns[ref].get("status", "UNRESOLVED") not in {"UNRESOLVED", "RESOLVED", "CONFIRMED"}:
                     raise ValueError("Effect " + effect_id + " rests on an assumption and needs a tracked unknown")

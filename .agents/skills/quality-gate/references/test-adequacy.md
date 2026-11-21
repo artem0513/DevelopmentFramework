@@ -6,11 +6,11 @@ New software tasks created through the CLI enable `test_adequacy: {"version":1,"
 
 ## Before implementation
 
-Inspect current code, relevant existing tests, project examples and actual available test tools. Derive a concise scenario plan from original acceptance and relevant failure risks. Every mandatory software criterion/stage needs a required scenario. Save it through `ase adequacy plan TASK --file plan.json --expected-revision N`.
+Inspect current code, relevant existing tests, project examples and actual available test tools. Derive a concise scenario plan from original acceptance and triaged risks ([risk triage](../../task-orchestrator/references/solution-design.md#2-triage-every-risk-only-required-risks-become-code)). Only a category (a) risk - required by the ticket, an acceptance criterion or the reviewer, or needed so the change does not break existing auth, invariants or data - becomes a required scenario, code and tests; a risk existing behaviour already handles, or an unlikely/out-of-scope one, goes to `not_applicable` with its reason and to the PR's "Not handled" list. Every mandatory software criterion/stage needs a required scenario. Save it through `ase adequacy plan TASK --file plan.json --expected-revision N`.
 
 Each scenario has `id`, `acceptance_ids`, `risk`, `boundary`, `expected`, `evidence_ids`, `required`. The plan also contains `not_applicable` rows with `risk` and a source-supported `reason`. Choose meaningful scenarios rather than an exhaustive checklist. Keep ordinary technical choices autonomous.
 
-Examples of relevant boundaries:
+When a required risk applies, choose evidence that can catch it. Examples of relevant boundaries (they are not a checklist of risks to add):
 
 | Requirement/risk | Discriminating evidence |
 | --- | --- |

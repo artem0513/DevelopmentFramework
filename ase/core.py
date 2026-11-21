@@ -27,6 +27,34 @@ from .native_paths import logical_path, state_io
 STATUSES = {"PASS", "FAIL", "UNVERIFIED", "BLOCKED", "NOT_APPLICABLE"}
 PROTECTED = [".github/workflows/*", ".codex/*", ".agents/*", "AGENTS.md", ".gitmodules", ".githooks/*"]
 PROTECTED += [".devframework/config.toml", ".devframework/.gitignore", ".devframework/bin/*", ".devframework/autonomous-se/*"]
+# A project lists its shared, cross-cutting code (job runners, DI setup, DB context, middleware...)
+# here; feature tasks may not change it without recorded authorization. The list protects itself.
+PROJECT_PROTECTED_FILE = ".devframework/protected-paths.txt"
+PROTECTED += [PROJECT_PROTECTED_FILE]
+
+
+def project_protected_paths(repo):
+    """Glob patterns from the project's protected-paths list; comments and blank lines are ignored."""
+    path = Path(repo) / PROJECT_PROTECTED_FILE
+    try:
+        if path.is_symlink() or path.stat().st_size > 65536:
+            raise ValueError("Unsafe or oversized " + PROJECT_PROTECTED_FILE)
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return []
+    except UnicodeError:
+        raise ValueError(PROJECT_PROTECTED_FILE + " must be UTF-8 text") from None
+    patterns = []
+    for line in lines:
+        # Windows separators and "./" prefixes are accepted; "dir/" means everything below dir.
+        pattern = line.strip().replace("\\", "/")
+        if not pattern or pattern.startswith("#"):
+            continue
+        pattern = pattern[2:] if pattern.startswith("./") else pattern
+        patterns.append(pattern + "*" if pattern.endswith("/") else pattern)
+    if any(p.startswith("/") or ":" in p or ".." in p.split("/") for p in patterns):
+        raise ValueError(PROJECT_PROTECTED_FILE + " requires repository-relative glob patterns")
+    return patterns
 SECRET = re.compile(r"(?i)(?:sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9_]{16,}|Bearer\s+[a-z0-9._-]{12,}|(?:password|api[_-]?key|token|secret)\s*[=:]\s*[^\s,;]{8,})")
 
 
@@ -656,7 +684,7 @@ class Engine:
             c = self._contract(task_id)
             current = self._snapshot(self.repo)
             baseline = load(self.folder(task_id) / "baseline.json")
-            patterns = [*PROTECTED, *c.get("protected_paths", [])]
+            patterns = [*PROTECTED, *c.get("protected_paths", []), *project_protected_paths(self.repo)]
             for path in paths:
                 if (not isinstance(path, str) or not path or any(ch in path for ch in "*?[]\\:")
                         or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/"))):
@@ -713,7 +741,7 @@ class Engine:
         contract_hash = digest(canonical(c))
         rejected, blocked = [], []
         baseline = load(folder / "baseline.json")
-        patterns = [*PROTECTED, *c.get("protected_paths", [])]
+        patterns = [*PROTECTED, *c.get("protected_paths", []), *project_protected_paths(self.repo)]
         changed = [p for p in set(baseline["files"]) | set(current["files"]) if baseline["files"].get(p) != current["files"].get(p)]
         authorized = self._authorized_protected(task_id, current, contract_hash)
         protected = [p for p in changed if p not in authorized and any(fnmatch.fnmatchcase(p, pattern) for pattern in patterns)]

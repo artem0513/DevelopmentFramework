@@ -9,6 +9,8 @@ Use relevant [evidence decisions](../task-orchestrator/references/evidence-decis
 
 For a clear assignment, prepare a concise internal proposal and record the original authorization, then execute within scope without another approval interview. A short progress update can state the intended action and verification. Keep outcome, approach/reason, technical means/reuse, main steps and material assumptions in the separately inspectable contract.
 
+A PR description is short and plain: what the ticket asked, what changed, what was deliberately not handled, how it was verified; no showcase of mechanisms.
+
 For status read `ase --project PROJECT report TASK`, the current checkpoint and source coverage. Distinguish implemented, executed, independently verified, unavailable, blocked and actually published results. Cite existing artifacts and actual URLs. Empty source inventory is unconfigured, not completed analysis.
 
 Before drafting an owner question, use task-discovery's answer investigation for retrievable facts. Lead with what was actually checked and what remains unknown; briefly give the supported intent hypothesis and recommended action/reason, then one material decision. Keep the first question message about 2–4 lines when that preserves the necessary facts. Never claim a probe ran when it was only planned, or infer global absence from one denied/unread source. Owner-only decisions need no research theater.
