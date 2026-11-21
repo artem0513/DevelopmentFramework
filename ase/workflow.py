@@ -11,7 +11,8 @@ import threading
 import tempfile
 import uuid
 import weakref
-from .evidence.compact import expand_packet
+from .evidence.compact import MAX_EXPANDED, expand_packet
+from .protocol import MAX_DECLARED_PACKET_BYTES
 
 from .adapters import get_adapter
 from .gates import GateService, source_resources, source_snapshot, stage_checks, verification_context_hash, verification_context_hashes
@@ -878,7 +879,9 @@ class WorkflowController:
                     for item in expand_packet(request["source_packet"])["files"]:
                         if item["path"] not in {"_ase_context/source_changes.json", "_ase_context/actual_checks.json"} and not item["path"].startswith("_ase_context/logs/"):
                             continue
-                        if len(item["content"].encode("utf-8")) > 65536:
+                        # Logical bounds only: identical bodies (for example the current suite log)
+                        # compact to same-packet references, and packet admission enforces the wire bound.
+                        if len(item["content"].encode("utf-8")) > MAX_DECLARED_PACKET_BYTES:
                             raise ValueError("historical observation exceeds packet bound")
                         key = (item["path"], item["sha256"])
                         if key not in observations:
@@ -887,7 +890,7 @@ class WorkflowController:
                 entry["observations"] = list(observations.values())
                 entry['policy_current'] = all(entry['roles'][role]['policy_current'] for role in ('ac', 'review'))
                 entry["semantic_approval"] = entry["current_identity"] and saved["gate"].get("status") == "APPROVED" and entry['policy_current'] and all(entry["roles"][role]["evidence_kind"] == "independent_cli" for role in ("ac", "review"))
-                if len(encode({"stages": history["stages"] + [entry]}).encode("utf-8")) > 262144:
+                if len(encode({"stages": history["stages"] + [entry]}).encode("utf-8")) > MAX_EXPANDED:
                     raise ValueError("stage history exceeds bounded packet budget")
                 history["stages"].append(entry)
             except (ValueError, OSError, KeyError, TypeError) as error:
@@ -939,8 +942,10 @@ class WorkflowController:
     def _runner(self, task_id):
         if self.runner is not None:
             return self.runner
-        backend = self.tasks.snapshot(task_id)["contract"]["execution_policy"]["backend"]
-        config = read_record(self.store.db, "backend_config", backend)["payload"] or {}
+        contract = self.tasks.snapshot(task_id)["contract"]
+        backend = contract["execution_policy"]["backend"]
+        from .protocol import runner_limits
+        config = {**runner_limits(contract), **(read_record(self.store.db, "backend_config", backend)["payload"] or {})}
         executable = config.get("executable") or shutil.which({"codex": "codex", "claude": "claude", "copilot": "copilot"}[backend])
         if not executable:
             raise ValueError("CLI_NOT_INSTALLED: " + backend)

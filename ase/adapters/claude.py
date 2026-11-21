@@ -12,9 +12,13 @@ class ClaudeAdapter:
                          deadline=deadline, cancel_requested=cancel_requested)
 
     def build_invocation(self, request, capabilities):
-        return invocation(capabilities, ["--safe-mode", "--tools", "", "--strict-mcp-config", "--mcp-config",
+        # Print mode reads the prompt from stdin when no prompt argument is given, so packets
+        # beyond the Windows command-line limit reach the backend whole instead of failing.
+        call = invocation(capabilities, ["--safe-mode", "--tools", "", "--strict-mcp-config", "--mcp-config",
             '{"mcpServers":{}}', "--no-session-persistence", "--output-format", "json", "--json-schema",
-            canonical(request["schema"]).decode("utf-8"), "-p", packet_prompt(request)])
+            canonical(request["schema"]).decode("utf-8"), "-p"])
+        call["stdin"] = packet_prompt(request)
+        return call
 
     def parse_result(self, raw_events, final_payload):
         if len(raw_events) != 1 or raw_events[0].get("type") != "result":

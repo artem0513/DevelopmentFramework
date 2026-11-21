@@ -7,6 +7,7 @@ from ..native_paths import logical_path, state_io
 from ..runner import verify_receipt
 from ..state import read_record, encode
 from .compact import compact_packet, expand_packet
+from ..protocol import lossless_transport, packet_byte_limit
 
 from ..execution.ports import PacketContext
 
@@ -34,21 +35,21 @@ def _factor_omission_note(packet):
     packet['coverage']['scope'] += ' omitted_source_limitation applies exactly to EVERY omitted_sources row.'
 
 
-def _bound_packet(packet, historical_paths=(), *, lossless=False):
+def _bound_packet(packet, historical_paths=(), *, lossless=False, max_bytes=1048576):
     """Transform logical bodies before measuring; never retain stale list aliases."""
     from ..protocol import canonical, validate_packet
-    if len(canonical(packet)) > 1048576:
+    if len(canonical(packet)) > max_bytes:
         _factor_omission_note(packet)
     if lossless:
         packet = compact_packet(packet)
-    if historical_paths and len(canonical(packet)) > 1048576:
+    if historical_paths and len(canonical(packet)) > max_bytes:
         packet = expand_packet(packet)
         packet['files'] = [row for row in packet['files'] if row['path'] not in historical_paths]
         packet['coverage']['missing'].append('Historical lead-input packet budget exceeded; exact stored inputs need a bounded review representation')
         packet['coverage']['included'] = [row['path'] for row in packet['files']]
         if lossless:
             packet = compact_packet(packet)
-    return validate_packet(packet)
+    return validate_packet(packet, max_bytes=max_bytes)
 
 
 class PacketService:
@@ -217,7 +218,7 @@ class PacketService:
         test_adequacy_assessment = (
             {'status': 'WITHHELD_FOR_INDEPENDENCE',
              'reason': 'Prior assessment prose is not input to a fresh opted-in session. Inspect original requirements, scenario plan, actual source and executed logs; the gate separately requires current independent assessment receipts.'}
-            if task['contract'].get('context_transport') == {'version': 1, 'mode': 'lossless'}
+            if lossless_transport(task['contract'])
             else TestAdequacy(context.store).assessment(task_id,stage_id))
         try:
             delegation_evidence = DelegationRegistry(context.store).packet_evidence(task_id, stage_id=stage_id)
@@ -243,7 +244,11 @@ class PacketService:
                     physical = state_io(log)
                     if not physical.is_file():
                         raise ValueError("Log is unavailable")
-                    content = physical.read_bytes().decode("utf-8", errors="replace")
+                    raw = physical.read_bytes()
+                    # The record names the exact run; a replaced log is not that run's evidence.
+                    if result.get("log_sha256") is not None and hashlib.sha256(raw).hexdigest() != result["log_sha256"]:
+                        raise ValueError("Log differs from its recorded hash")
+                    content = raw.decode("utf-8", errors="replace")
                 except (OSError, ValueError):
                     missing.append("Actual check log unavailable: " + result["id"])
                     continue
@@ -300,4 +305,4 @@ class PacketService:
                                                "included": [f["path"] for f in files], "missing": missing,
                                                "omitted": [item["path"] for item in omitted_sources]}}
         return _bound_packet(packet, historical_paths,
-            lossless=task['contract'].get('context_transport') == {'version': 1, 'mode': 'lossless'})
+            lossless=lossless_transport(task['contract']), max_bytes=packet_byte_limit(task['contract']))

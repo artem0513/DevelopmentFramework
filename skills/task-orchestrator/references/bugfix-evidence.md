@@ -21,7 +21,7 @@ correct when the actual contract requires them; this is no blanket prohibition.
    merger/wrapper/cache/retry/override, background process, timer/polling, global UI
    effect or shared-service change, inspect whether direct response use, existing
    mapping or existing project facilities meet the contract, and record the
-   [scope-growth justification](evidence-decisions.md#7-separate-requirement-wording-from-interpretation-justify-scope-growth). Preserve
+   [scope-growth justification](scope-growth.md). Preserve
    other legitimate fields/behavior. Full-object responses differ from partial
    patches; omission, null and false/zero may differ. Do not invent an allowlist
    from one example.

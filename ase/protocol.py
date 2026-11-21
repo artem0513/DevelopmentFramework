@@ -107,7 +107,42 @@ def validate_payload(payload, schema):
     return {"status": "INVALID" if errors else "VALID", "errors": errors}
 
 
-def validate_packet(packet, *, max_bytes=1048576):
+DEFAULT_PACKET_BYTES = 1048576
+MAX_DECLARED_PACKET_BYTES = 2097152
+
+
+def validate_transport_policy(transport):
+    """Lossless transport may raise packet admission to an owner-approved bound, never beyond 2 MiB."""
+    if (not isinstance(transport, dict) or set(transport) - {'version', 'mode', 'max_packet_bytes'}
+            or type(transport.get('version')) is not int or transport.get('version') != 1
+            or transport.get('mode') != 'lossless'):
+        raise ValueError('Unsupported context transport policy')
+    if 'max_packet_bytes' in transport:
+        limit = transport['max_packet_bytes']
+        if type(limit) is not int or not DEFAULT_PACKET_BYTES <= limit <= MAX_DECLARED_PACKET_BYTES:
+            raise ValueError('Context transport max_packet_bytes must be an integer from 1 MiB to 2 MiB')
+    return transport
+
+
+def lossless_transport(contract):
+    transport = contract.get('context_transport')
+    return isinstance(transport, dict) and transport.get('version') == 1 and transport.get('mode') == 'lossless'
+
+
+def packet_byte_limit(contract):
+    transport = contract.get('context_transport')
+    return transport.get('max_packet_bytes', DEFAULT_PACKET_BYTES) if lossless_transport(contract) else DEFAULT_PACKET_BYTES
+
+
+def runner_limits(contract):
+    """Host Runner limits for a task: only an owner-approved lossless bound raises the defaults."""
+    limit = packet_byte_limit(contract)
+    if limit == DEFAULT_PACKET_BYTES:
+        return {}
+    return {'max_packet_bytes': limit, 'max_input_bytes': limit + DEFAULT_PACKET_BYTES}
+
+
+def validate_packet(packet, *, max_bytes=DEFAULT_PACKET_BYTES):
     if not isinstance(packet, dict) or len(canonical(packet)) > max_bytes:
         raise ValueError("Source packet missing or exceeds byte limit")
     requirements, files, coverage = packet.get("requirements"), packet.get("files"), packet.get("coverage")

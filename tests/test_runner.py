@@ -38,8 +38,13 @@ if args == (['exec','--help'] if backend == 'codex' else ['--help']):
   if case == 'cancel-help': pathlib.Path('probe.ready').touch()
   time.sleep(0.35 if case in {'cancel-help','slow-probes'} else 0.1 if case == 'shared-budget' else 0.02)
  print(flags[backend]); sys.exit()
-input_text = sys.stdin.read()
-assert bool(input_text) == (backend == 'codex'), 'inherited or missing input'
+if case == 'close-stdin':
+ sys.stdin.close(); os.close(0); time.sleep(0.5); input_text = 'REQUEST (unread)'
+else:
+ input_text = sys.stdin.read()
+stdin_backend = backend == 'codex' or (backend == 'claude' and case != 'legacy-argv')
+assert bool(input_text) == stdin_backend, 'inherited or missing input'
+if stdin_backend: assert 'REQUEST' in input_text, 'prompt not on stdin'
 canary = pathlib.Path('.backend-startup.py')
 if canary.exists(): exec(canary.read_text())
 if case == 'sleep':
@@ -75,7 +80,7 @@ if backend == 'codex':
  print(dump({'type':'item.completed','item':{'type':'agent_message','text':dump(message)}}))
  if case != 'truncated': print(json.dumps({'type':'turn.completed','usage':{}}))
 elif backend == 'claude':
- expected = ['--safe-mode','--tools','','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--no-session-persistence','--output-format','json','--json-schema',args[10],'-p',args[-1]]
+ expected = ['--safe-mode','--tools','','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--no-session-persistence','--output-format','json','--json-schema',args[10],'-p', *(args[-1:] if case == 'legacy-argv' else [])]
  assert args == expected, repr(args)
  result = {'type':'result','subtype':'success','is_error':False,'session_id':sid,'result':'PASS','permission_denials':[]}
  if case != 'missing': result['structured_output'] = payload
@@ -292,6 +297,16 @@ class RunnerCaptureRegressionTests(TransportFixture):
         from ase.adapters.claude import ClaudeAdapter
         from ase.adapters.copilot import CopilotAdapter
         return [('codex', CodexAdapter()), ('claude', ClaudeAdapter()), ('copilot', CopilotAdapter())]
+
+    def test_child_that_closes_stdin_early_is_never_credited(self):
+        for backend, adapter in (('codex', CodexAdapter()), ('claude', self.adapters()[1][1])):
+            with self.subTest(backend=backend):
+                request = self.request()
+                body = 'y' * 600000
+                request['source_packet']['files'][0].update(content=body, sha256=hashlib.sha256(body.encode()).hexdigest())
+                outcome = Runner(self.config(backend, 'close-stdin'), self.base / ('artifacts-' + backend)).run(adapter, request, timeout=20)
+                self.assertEqual(outcome['result']['status'], 'BLOCKED', outcome['result'])
+                self.assertIn('not fully delivered', outcome['receipt']['error'] or '')
 
     def test_malformed_codex_shapes_keep_raw_and_blocked_receipts(self):
         for case in ('malformed-item-null', 'malformed-item-list', 'malformed-item-type',

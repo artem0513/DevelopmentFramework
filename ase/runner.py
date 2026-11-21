@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 
-from .protocol import canonical, decode_json, normalized, sha256, validate_packet, validate_payload
+from .protocol import canonical, decode_json, normalized, sha256, validate_packet, validate_payload, DEFAULT_PACKET_BYTES, MAX_DECLARED_PACKET_BYTES
 
 
 def checked_path(value, *, directory):
@@ -94,6 +94,7 @@ def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, e
     started = datetime.now(timezone.utc).isoformat()
     began = time.monotonic()
     process, job, writer = None, None, None
+    delivered = []  # set only after the complete prompt was written and flushed
     code, error, timed_out, limited, cancelled = None, None, False, False, False
     if deadline is not None: timeout = min(timeout, deadline - began)
     cancelled = cancel_requested is not None and cancel_requested()
@@ -113,6 +114,7 @@ def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, e
                     try:
                         process.stdin.write(input_bytes)
                         process.stdin.flush()
+                        delivered.append(True)
                     except (OSError, ValueError):
                         pass
                     finally:
@@ -150,6 +152,9 @@ def capture_process(argv, cwd, *, timeout, max_output_bytes, input_bytes=None, e
                 process.wait(timeout=10)
                 code = process.returncode
                 if writer: writer.join(timeout=2)
+                if input_bytes is not None and not delivered and error is None:
+                    # A child that closed stdin early never saw the sealed prompt; never credit its output.
+                    error = "Prompt input was not fully delivered"
             size = os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size
             limited = limited or size > max_output_bytes
         stdout.seek(0)
@@ -229,6 +234,11 @@ class Runner:
         from .runtime_policy import bind_policy
         request = bind_policy(request)
         request_data = canonical(request)
+        # Limits come only from the host-built config; the workflow derives a larger packet bound
+        # from the owner-approved contract and never from request content.
+        packet_limit = self.config.get("max_packet_bytes", DEFAULT_PACKET_BYTES)
+        if type(packet_limit) is not int or not 0 < packet_limit <= MAX_DECLARED_PACKET_BYTES:
+            raise ValueError("Invalid runner packet limit")
         input_limit = self.config.get("max_input_bytes", 2097152)
         if len(request_data) > input_limit: raise ValueError("Request exceeds byte limit")
         request = decode_json(request_data)  # immutable snapshot, no caller-owned nested references
@@ -239,7 +249,7 @@ class Runner:
         required_bindings = {"fingerprint", "contract_sha256", "proposal_sha256", "plan_sha256", "check_sha256"}
         if not isinstance(bindings, dict) or not required_bindings <= bindings.keys() or not all(isinstance(v, str) and v for v in bindings.values()):
             raise ValueError("Current source/contract/proposal/plan/check bindings required")
-        validate_packet(request.get("source_packet"), max_bytes=self.config.get("max_packet_bytes", 1048576))
+        validate_packet(request.get("source_packet"), max_bytes=packet_limit)
         if validate_payload(None, request.get("schema"))["status"] == "BLOCKED": raise ValueError("Unsupported result schema")
         cwd = checked_path(self.config["trusted_cwd"], directory=True)
         project = request.get("project")
@@ -366,10 +376,16 @@ def _verify_capture(receipt, *, expected_bindings, require_current_policy, requi
     policy = validate_policy(request, require_current=require_current_policy)
     prompt = packet_prompt(request)
     if 'stdin' in data:
+        argv = receipt.get('argv', [])
+        argument_delivery = not data['stdin'] and argv[-2:] == ['-p', prompt]
         if receipt['backend'] == 'codex':
             delivered = data['stdin'] == prompt.encode('utf-8')
+        elif receipt['backend'] == 'claude':
+            # Current Claude captures read the prompt from stdin after a bare -p; older receipts
+            # delivered it as the -p argument and keep verifying under that original view.
+            delivered = (data['stdin'] == prompt.encode('utf-8') and argv[-1:] == ['-p']) or argument_delivery
         else:
-            delivered = not data['stdin'] and receipt.get('argv', [])[-2:] == ['-p', prompt]
+            delivered = argument_delivery
         if not delivered:
             raise ValueError('Captured policy/request differs from the delivered prompt')
     elif receipt.get('pid') is not None or receipt.get('argv') or not receipt.get('error'):

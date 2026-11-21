@@ -212,6 +212,66 @@ class WorkflowTests(unittest.TestCase):
         captured = next(f for f in packet["files"] if f["path"] == "_ase_context/logs/unit.txt")
         self.assertEqual(captured["sha256"], hashlib.sha256(raw).hexdigest())
 
+    def bound_task(self, task_id, transport, *, parts=()):
+        spec = contract(task_id)
+        if transport is not None:
+            spec["context_transport"] = transport
+        for name in parts:  # extra required artifacts, each under the per-file source bound
+            for owner in (spec["scope"], spec["stages"][0]["scope"], spec["stages"][1]["scope"]):
+                owner["resources"].append(name)
+            spec["evidence"].append({"id": name.split(".")[0], "kind": "artifact", "path": name, "required": True})
+            spec["acceptance"][0]["evidence_ids"].append(name.split(".")[0])
+        task = self.tasks.create(spec)
+        task = self.tasks.propose(task_id, {"summary": "Bound packet", "stage_ids": ["draft"]}, expected_revision=task["revision"])
+        self.tasks.approve(task_id, proposal_hash=task["proposal_hash"], user_message_ref="chat:approved", approved_stage_ids=["draft"])
+
+    def test_runner_limits_follow_the_task_contract_and_backend_config_wins(self):
+        self.bound_task("bound-task", {"version": 1, "mode": "lossless", "max_packet_bytes": 2097152})
+        with transaction(self.store.db) as db:
+            record = read_record(db, "backend_config", "codex")
+            write_record(db, "backend_config", "codex", {"executable": sys.executable}, expected_revision=record["revision"])
+        bound = self.controller._runner("bound-task").config
+        self.assertEqual((bound["max_packet_bytes"], bound["max_input_bytes"]), (2097152, 3145728))
+        default = self.controller._runner("approval-task").config
+        self.assertNotIn("max_packet_bytes", default)
+        self.assertNotIn("max_input_bytes", default)
+        with transaction(self.store.db) as db:
+            record = read_record(db, "backend_config", "codex")
+            write_record(db, "backend_config", "codex", {"executable": sys.executable, "max_packet_bytes": 1048576},
+                         expected_revision=record["revision"])
+        self.assertEqual(self.controller._runner("bound-task").config["max_packet_bytes"], 1048576)
+
+    def test_packet_admission_uses_the_contract_bound_through_the_real_packet_service(self):
+        parts = ("guide.md", "part1.md", "part2.md")
+        seed = b"guide"
+        for name in parts:  # incompressible unique text, about 420 KB per file
+            chunks = []
+            while sum(map(len, chunks)) < 420000:
+                seed = hashlib.sha256(seed).digest()
+                chunks.append(seed.hex() + "\n")
+            (self.store.repo / name).write_text("".join(chunks), encoding="utf-8")
+        self.bound_task("bound-task", {"version": 1, "mode": "lossless", "max_packet_bytes": 2097152}, parts=parts[1:])
+        self.bound_task("plain-lossless", {"version": 1, "mode": "lossless"}, parts=parts[1:])
+        packet = self.controller._packet("bound-task")
+        self.assertEqual(packet["coverage"]["missing"], [])
+        self.assertGreater(len(json.dumps(packet).encode()), 1048576)
+        for name in parts:
+            self.assertIn(name, packet["coverage"]["included"])
+        for task_id in ("plain-lossless",):
+            with self.subTest(task_id=task_id), self.assertRaisesRegex(ValueError, "byte limit"):
+                self.controller._packet(task_id)
+
+    def test_packet_reports_a_replaced_check_log_instead_of_its_new_text(self):
+        folder = self.store.root / "tasks" / "approval-task" / "checks"
+        folder.mkdir(parents=True)
+        log = folder / "actual.log"
+        raw = b"Ran 1 test in 0.001s\r\n\r\nFAILED (failures=1)\r\n"
+        log.write_bytes(b"Ran 1 test in 0.001s\r\n\r\nOK\r\n")
+        self.controller._save("checks", "approval-task", {"results": [{"id": "unit", "log": str(log), "log_sha256": hashlib.sha256(raw).hexdigest()}]})
+        packet = self.controller._packet("approval-task")
+        self.assertNotIn("_ase_context/logs/unit.txt", packet["coverage"]["included"])
+        self.assertIn("Actual check log unavailable: unit", packet["coverage"]["missing"])
+
     def test_full_child_gate_revalidates_changed_parent(self):
         c = contract("child")
         c.update(parent_task_id="approval-task", parent_stage_id="draft")

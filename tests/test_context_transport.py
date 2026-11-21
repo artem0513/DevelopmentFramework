@@ -65,6 +65,78 @@ class ContextTransportTests(unittest.TestCase):
         old['context_transport'] = {'version': True, 'mode': 'lossless'}
         with self.assertRaises(ValueError): validate_contract_v2(old)
 
+    def test_repeated_large_scalars_are_charged_before_expansion(self):
+        from ase.evidence.compact import _expand_memo
+        big = int('9' * 4000)
+        data = {'root': [{'$ase_ref': 0}] * 3000, 'definitions': [big], 'suffix': ''}
+        with self.assertRaisesRegex(ValueError, 'exceeds bound'):
+            _expand_memo(data, 1000000, lambda path: None)
+        literal = {'root': {'$ase_literal': {'k' * 600000: 1, 'j' * 600000: 2}}, 'definitions': [], 'suffix': ''}
+        with self.assertRaisesRegex(ValueError, 'exceeds bound'):
+            _expand_memo(literal, 1000000, lambda path: None)
+        small = {'root': {'a': [1, 2, {'$ase_ref': 0}]}, 'definitions': ['x' * 70], 'suffix': '\n'}
+        self.assertEqual(_expand_memo(small, 1000, lambda path: None), canonical({'a': [1, 2, 'x' * 70]}).decode() + '\n')
+
+    def test_owner_packet_bound_is_validated_and_capped(self):
+        from ase.tasks import validate_contract_v2
+        from ase.protocol import packet_byte_limit
+        from test_task_contract_v2 import contract
+        base = validate_contract_v2(contract())
+        self.assertEqual(packet_byte_limit(base), 1048576)
+        base['context_transport'] = {'version': 1, 'mode': 'lossless', 'max_packet_bytes': 2097152}
+        self.assertEqual(packet_byte_limit(validate_contract_v2(base)), 2097152)
+        for bad in (2097153, 1048575, True, 1.5e6, '2097152', None):
+            base['context_transport'] = {'version': 1, 'mode': 'lossless', 'max_packet_bytes': bad}
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_contract_v2(base)
+        base['context_transport'] = {'version': 1, 'mode': 'lossless', 'extra': 1}
+        with self.assertRaises(ValueError): validate_contract_v2(base)
+
+    def test_packet_admission_uses_the_declared_bound_and_still_fails_closed(self):
+        from ase.evidence.packets import _bound_packet
+        body = packet([file('a.txt', 'a' * 700000), file('b.txt', 'b' * 700000)])
+        with self.assertRaisesRegex(ValueError, 'byte limit'):
+            _bound_packet(copy.deepcopy(body), lossless=True)
+        admitted = _bound_packet(copy.deepcopy(body), lossless=True, max_bytes=2097152)
+        self.assertEqual(expand_packet(admitted)['files'], body['files'])
+        with self.assertRaisesRegex(ValueError, 'byte limit'):
+            _bound_packet(packet([file('c.txt', 'c' * 2200000)]), lossless=True, max_bytes=2097152)
+
+    def test_runner_limits_come_only_from_the_host_contract_bound(self):
+        from test_runner import TransportFixture
+        from test_task_contract_v2 import contract
+        from ase.adapters.claude import ClaudeAdapter
+        from ase.protocol import runner_limits
+        from ase.runner import Runner
+        from ase.tasks import validate_contract_v2
+        fixture = TransportFixture('run')
+        fixture.setUp()
+        self.addCleanup(fixture.temp.cleanup)
+        def request(handoff=None):
+            value = fixture.request()
+            content = 'x' * 1100000
+            value['source_packet']['files'][0].update(content=content, sha256=hashlib.sha256(content.encode()).hexdigest())
+            if handoff is not None:
+                value['handoff'] = handoff
+            return value
+        plain = validate_contract_v2(contract())
+        self.assertEqual(runner_limits(plain), {})
+        default = Runner(fixture.config('claude'), fixture.base / 'artifacts')
+        with self.assertRaisesRegex(ValueError, 'byte limit'):
+            default.run(ClaudeAdapter(), request(), timeout=10)
+        with self.assertRaisesRegex(ValueError, 'byte limit'):  # request content cannot raise the bound
+            default.run(ClaudeAdapter(), request({'packet_limit': {'version': 1, 'max_packet_bytes': 2097152}}), timeout=10)
+        with self.assertRaisesRegex(ValueError, 'byte limit'):  # an explicit input cap stays authoritative
+            Runner(fixture.config('claude', max_input_bytes=262144), fixture.base / 'a2').run(ClaudeAdapter(), fixture.request() | {
+                'source_packet': {**fixture.request()['source_packet'], 'requirements': ['r' * 300000]}}, timeout=10)
+        with self.assertRaisesRegex(ValueError, 'Invalid runner packet limit'):
+            Runner(fixture.config('claude', max_packet_bytes=4194304), fixture.base / 'a3').run(ClaudeAdapter(), request(), timeout=10)
+        plain['context_transport'] = {'version': 1, 'mode': 'lossless', 'max_packet_bytes': 2097152}
+        limits = runner_limits(validate_contract_v2(plain))
+        self.assertEqual(limits, {'max_packet_bytes': 2097152, 'max_input_bytes': 3145728})
+        outcome = Runner(fixture.config('claude', **limits), fixture.base / 'a4').run(ClaudeAdapter(), request(), timeout=20)
+        self.assertEqual(outcome['result']['status'], 'COMPLETE', outcome['result'])
+
     def test_cli_can_explicitly_enable_exact_transport(self):
         from ase.__main__ import parser
         args = parser().parse_args(['task', 'create', '--file', 'task.json', '--compact-context'])

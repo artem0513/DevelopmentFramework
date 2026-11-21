@@ -74,6 +74,34 @@ class StageHistoryTests(unittest.TestCase):
         self.assertNotIn("guide.txt", {item["path"] for item in stage["observations"]})
         self.assertLess(len(json.dumps(history)), 262144)
 
+    @staticmethod
+    def with_large_log(size):
+        def alter(request):
+            content = "test_case (suite.Tests.test_case) ... ok\n" * (size // 40)
+            row = {"path": "_ase_context/logs/suite.txt", "content": content,
+                   "sha256": hashlib.sha256(content.encode()).hexdigest()}
+            request["source_packet"]["files"].append(row)
+            request["source_packet"]["coverage"]["included"].append(row["path"])
+        return alter
+
+    def test_observation_above_the_old_64_kib_bound_keeps_the_stage(self):
+        self.capture(alter_verifier=self.with_large_log(300000))
+        history, missing = self.history_packet()
+        self.assertEqual(missing, [])
+        logs = [item for item in history["stages"][0]["observations"] if item["path"] == "_ase_context/logs/suite.txt"]
+        self.assertEqual(len(logs), 1)
+        self.assertGreater(len(logs[0]["content"].encode()), 65536)
+        self.assertEqual(sorted(logs[0]["roles"]), ["ac", "review"])
+
+    def test_observation_above_the_protocol_bound_is_explicit_missing_history(self):
+        from unittest import mock
+        import ase.workflow as workflow
+        self.capture(alter_verifier=self.with_large_log(150000))
+        with mock.patch.object(workflow, "MAX_DECLARED_PACKET_BYTES", 100000):
+            history, missing = self.controller._stage_history(TaskService(self.store).snapshot("history"))
+        self.assertEqual(history["stages"], [])
+        self.assertTrue(any("historical observation exceeds packet bound" in item for item in missing))
+
     def test_whole_task_receipts_keep_verified_single_stage_history(self):
         self.capture(whole=True)
         history, missing = self.history_packet()

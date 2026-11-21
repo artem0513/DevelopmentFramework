@@ -55,10 +55,8 @@ def validate_contract_v2(value):
     text(c.get("request"), "request")
     c["scope"] = _scope(c.get("scope"))
     if 'context_transport' in c:
-        transport = c['context_transport']
-        if (not isinstance(transport, dict) or transport != {'version': 1, 'mode': 'lossless'}
-                or type(transport.get('version')) is not int):
-            raise ValueError('Unsupported context transport policy')
+        from .protocol import validate_transport_policy
+        validate_transport_policy(c['context_transport'])
     if 'lead_review' in c:
         from .lead_review import validate_policy
         validate_policy(c['lead_review'])

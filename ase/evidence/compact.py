@@ -83,8 +83,12 @@ def _expand_memo(data, budget, source_body):
         nonlocal nodes, text_bytes
         nodes += 1
         if depth > 100 or nodes > MAX_NODES: raise ValueError('JSON expansion exceeds bound')
+        # Charge every node's canonical contribution (scalars and punctuation included) before
+        # materializing it, so a repeated large scalar cannot outgrow the budget unnoticed.
+        text_bytes += 2
         if isinstance(item, str): text_bytes += len(item.encode())
-        if isinstance(item, dict): text_bytes += sum(len(k.encode()) for k in item)
+        elif isinstance(item, dict): text_bytes += sum(len(k.encode()) + 4 for k in item)
+        elif not isinstance(item, list): text_bytes += len(canonical(item))
         if text_bytes > budget: raise ValueError('Expanded JSON text exceeds bound')
         if isinstance(item, dict):
             if set(item) == {'$ase_source'}:
@@ -110,6 +114,8 @@ def _expand_memo(data, budget, source_body):
             if set(item) == {'$ase_literal'}:
                 literal = item['$ase_literal']
                 if not isinstance(literal, dict): raise ValueError('Invalid JSON literal escape')
+                text_bytes += sum(len(k.encode()) + 4 for k in literal)
+                if text_bytes > budget: raise ValueError('Expanded JSON text exceeds bound')
                 return {k: decode(v, depth + 1) for k, v in literal.items()}
             return {k: decode(v, depth + 1) for k, v in item.items()}
         if isinstance(item, list): return [decode(v, depth + 1) for v in item]
