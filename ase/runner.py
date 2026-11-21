@@ -287,8 +287,10 @@ class Runner:
             prompt = call.get("stdin")
             input_bytes = prompt.encode("utf-8") if prompt is not None else None
             if input_bytes is not None and len(input_bytes) > input_limit: raise ValueError("Prompt exceeds byte limit")
-            if input_bytes is None and os.name == 'nt' and len(subprocess.list2cmdline(call["argv"])) > 28000:
-                raise ValueError("PROMPT_ARGUMENT_TOO_LARGE: backend stdin protocol unverified")
+            if os.name == 'nt' and len(subprocess.list2cmdline(call["argv"])) > 28000:
+                # Stdin delivery keeps the prompt off argv, but schema and flags still count.
+                raise ValueError("PROMPT_ARGUMENT_TOO_LARGE: backend stdin protocol unverified" if input_bytes is None
+                                 else "ARGUMENT_TOO_LARGE: command line exceeds the Windows limit")
             artifacts["stdin"] = _write(root / "stdin.bin", input_bytes or b"")
             cap = self.config.get("max_output_bytes", 1048576)
             process = capture_process(call["argv"], cwd, timeout=timeout, max_output_bytes=cap, input_bytes=input_bytes,

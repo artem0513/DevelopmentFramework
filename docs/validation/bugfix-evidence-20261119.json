@@ -1,5 +1,6 @@
 {
   "checked_at_utc": "2026-11-19T20:29:40.479346+00:00",
+  "historical_note": "Dated 2026-11-19 record of the native Codex chain. Its limitation about Claude live execution is superseded: on 2026-11-21 the final whole-root adequacy, AC and review of task bugfix-evidence-20261119 ran live on the Claude backend (commit c750162).",
   "scope": "Disposable local API-v2 fixture through real ase and Codex; no remote corporate service/VM/database was accessed.",
   "runtime_policy_sha256": "0b6227a32d7ccacd4e86abda8e673b50d95072e1d4d6f2bb40086bcad1c16018",
   "native_chain": {

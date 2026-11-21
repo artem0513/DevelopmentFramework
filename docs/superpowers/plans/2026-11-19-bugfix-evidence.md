@@ -55,12 +55,14 @@ instructions and generated provider/runtime copies; add reusable scenario tests.
 
 ### Task 3: Review, verification and delivery
 
-- [ ] Execute the complete unittest suite and actual independent Codex adequacy,
+- [x] Execute the complete unittest suite and actual independent Codex adequacy (ran on Claude; see note below),
       AC and substantive review on the current scoped sources and evidence.
-- [ ] Perform three additional main-chat critiques anchored to the original request.
-- [ ] Fix confirmed findings with regression tests; refresh affected independent checks.
-- [ ] Record dated results and limitations, commit and push to the current preview
+- [x] Perform three additional main-chat critiques anchored to the original request.
+- [x] Fix confirmed findings with regression tests; refresh affected independent checks.
+- [x] Record dated results and limitations, commit and push to the current preview
       branch; do not merge its unfinished prior work into main implicitly.
+
+Task 3 completed 2026-11-21 (c750162): the final whole-root independent adequacy, AC and review of task bugfix-evidence-20261119 ran on Claude, not Codex, because the complete packet exceeded the Codex prompt cap (see docs/context-transport.md). A later follow-up commit only adds a typed Windows command-line blocker for stdin delivery and these notes; it had its own independent review and full suite, and the whole-task acceptance applies to c750162.
 
 Ruling: implement inline under the user's standing autonomous technical-choice
 authorization; no additional design interview. Keep the paused large-context

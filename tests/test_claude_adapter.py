@@ -1,5 +1,7 @@
 """Claude protocol coverage only; no installed/authenticated backend required."""
 import json
+import os
+import unittest
 from pathlib import Path
 
 from test_runner import TransportFixture
@@ -46,6 +48,20 @@ class ClaudeAdapterTests(TransportFixture):
         self.assertEqual(stdin, packet_prompt(captured).encode("utf-8"))
         self.assertEqual(outcome["receipt"]["argv"][-1], "-p")
         self.assertTrue(verify_receipt(outcome["receipt"])["valid"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows command-line limit")
+    def test_oversized_remaining_command_line_is_a_typed_blocker_before_spawn(self):
+        class PaddedClaude(ClaudeAdapter):
+            def build_invocation(self, request, capabilities):
+                call = super().build_invocation(request, capabilities)
+                call["argv"] = [*call["argv"][:-1], "--append-system-prompt", "y" * 29000, "-p"]
+                return call
+        artifacts = self.base / "artifacts"
+        with self.assertRaisesRegex(ValueError, "^ARGUMENT_TOO_LARGE"):
+            Runner(self.config("claude"), artifacts).run(PaddedClaude(), self.request(), timeout=10)
+        # stdin.bin is written immediately after the guard, so its absence shows the raise came first.
+        self.assertEqual(list(artifacts.rglob("stdin.bin")), [])
+        self.assertEqual(list(artifacts.rglob("stdout.jsonl")), [])
 
     def as_legacy_argument_capture(self, outcome):
         """Rewrite a real capture into the pre-stdin shape: prompt as the -p value, empty stdin."""
