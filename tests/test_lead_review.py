@@ -158,6 +158,71 @@ class LeadReviewTests(unittest.TestCase):
                 ticket = self.prepare()
         self.assertEqual(ticket['handoff']['base']['fingerprint'], checks['fingerprint'])
 
+    def verifying_controller(self):
+        """Controller whose real verify() runs AC/review sessions through a role-aware provider fixture."""
+        ac = {'criteria': [{'id': 'RULE', 'expected': self.contract['acceptance'][0]['expected'], 'status': 'PASS',
+            'evidence': ['ready'], 'method': 'protocol boundary double', 'limitations': [], 'missing_coverage': []}]}
+        review = {'findings': [], 'summary': 'Protocol boundary double'}
+        fixture = self.base / 'role_fixture.py'
+        fixture.write_text(transport.FIXTURE.replace("payload = {'verdict':'PASS'}",
+            "payload = {'verdict':'PASS'}\nif '\"role\":\"ac\"' in input_text: payload = " + repr(ac) +
+            "\nelif '\"role\":\"review\"' in input_text: payload = " + repr(review)))
+        trusted = self.base / 'trusted'; trusted.mkdir(exist_ok=True)
+        runner = Runner({'executable': sys.executable, 'executable_args': [str(fixture), 'success', 'codex'],
+            'trusted_cwd': str(trusted), 'protocol_only': True}, self.store.root / 'tasks/lead/sessions')
+        return WorkflowController(self.store, runner=runner)
+
+    @staticmethod
+    def independent_boundary():
+        # Preserve real captured-byte, policy and EXACT binding validation everywhere; only the
+        # semantic provenance label is a double, never a claim of independent AC/review.
+        from contextlib import ExitStack
+        import ase.runner
+        real = ase.runner.verify_receipt
+
+        def boundary(receipt, **kwargs):
+            return {**real(receipt, **kwargs), 'evidence_kind': 'independent_cli'}
+        stack = ExitStack()
+        for module in ('ase.runner', 'ase.gates', 'ase.workflow', 'ase.lead_review'):
+            stack.enter_context(patch(module + '.verify_receipt', side_effect=boundary))
+        return stack
+
+    def test_end_to_end_policy_refresh_with_real_verify_unlocks_the_lead_pass(self):
+        from ase.state import hash_value
+        controller = self.verifying_controller()
+        self.implementation()
+        receipt = read_record(self.store.db, 'implementation', 'lead')['payload']
+        task = self.tasks.snapshot('lead')
+        stage = task['contract']['stages'][0]
+        with self.independent_boundary():
+            # 1. Complete the stage through the real checks, real verify() and real capture.
+            controller.check('lead', 'finish')
+            verdict = controller.verify('lead', 'finish')
+            self.assertEqual(verdict['status'], 'APPROVED', verdict)
+            controller._capture_stage('lead', 'finish', verdict)
+            original = read_record(self.store.db, 'stage', 'lead:finish')['payload']
+            with patch('ase.runtime_policy._identity', return_value='e' * 64):
+                # 2. An engine/skills upgrade: the implementation and stage proof are historical.
+                controller.check('lead')
+                with self.assertRaisesRegex(ValueError, 'stale'):
+                    self.prepare()
+                self.assertTrue(controller._stage_policy_refresh_needed(task, original))
+                # 3. Real refresh: fresh real checks and real independent-labelled AC/review.
+                refreshed = controller._refresh_stage_policy(task, stage, original)
+                self.assertEqual(refreshed['status'], 'APPROVED', refreshed)
+                proof = read_record(self.store.db, 'stage', 'lead:finish')['payload']['proof']
+                history, missing = controller._stage_history(self.tasks.snapshot('lead'))
+                self.assertEqual(missing, [])
+                entry = history['stages'][0]
+                self.assertTrue(entry['semantic_approval'] and entry['policy_current'] and entry['current_identity'])
+                self.assertEqual(entry['roles']['implementation']['receipt_sha256'], hash_value(receipt))
+                self.assertFalse(controller._stage_policy_refresh_needed(task, read_record(self.store.db, 'stage', 'lead:finish')['payload']))
+                # 4. The original lead pass now accepts the historical-policy implementation.
+                ticket = self.prepare()
+        self.assertEqual(proof['roles']['implementation'], receipt)
+        self.assertEqual(ticket['handoff']['number'], 1)
+        self.assertEqual(ticket['handoff']['base']['fingerprint'], proof['checks']['fingerprint'])
+
     def test_rechecked_receipt_cannot_borrow_another_stage_implementation(self):
         from unittest.mock import patch
         self.implementation(); checks = self.controller.check('lead'); task = self.tasks.snapshot('lead')
