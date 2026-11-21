@@ -91,6 +91,54 @@ class VaultTests(unittest.TestCase):
         self.assertEqual([p.wait(timeout=30) for p in processes], [0] * len(paths))
         self.assertEqual({p['id'] for p in self.vault().list()}, {p['id'] for p in entries})
 
+    @unittest.skipUnless(os.name == 'nt', 'requires Windows replace-while-open semantics')
+    def test_save_waits_out_a_transient_open_handle_on_the_vault(self):
+        import threading
+        self.write_input([self.entry])
+        vault = self.vault()
+        vault.import_file(self.input)
+        holder = open(vault.path, 'rb')  # like a scanner/indexer: os.replace fails while it is open
+        self.addCleanup(holder.close)
+        timer = threading.Timer(0.3, holder.close)
+        self.addCleanup(timer.join)
+        timer.start()
+        self.write_input([dict(self.entry, id='second')])
+        vault.import_file(self.input)  # integration only; the retry count is proven deterministically below
+        self.assertEqual({p['id'] for p in vault.list()}, {'lab', 'second'})
+
+    @unittest.skipUnless(os.name == 'nt', 'requires actual Windows DPAPI')
+    def test_replace_retries_exactly_the_transient_permission_errors(self):
+        from unittest import mock
+        module = importlib.import_module('ase.credentials')
+        self.write_input([self.entry])
+        vault = self.vault()
+        real, failures = module.os.replace, [PermissionError(13, 'in use')] * 3
+
+        def flaky(source, target):
+            if failures:
+                raise failures.pop()
+            return real(source, target)
+        with mock.patch.object(module.os, 'replace', side_effect=flaky), \
+                mock.patch.object(module.time, 'sleep') as slept:
+            vault.import_file(self.input)
+        self.assertEqual(slept.call_count, 3)
+        self.assertEqual({p['id'] for p in vault.list()}, {'lab'})
+
+    @unittest.skipUnless(os.name == 'nt', 'requires Windows replace-while-open semantics')
+    def test_save_still_fails_closed_when_the_vault_stays_held(self):
+        from unittest import mock
+        module = importlib.import_module('ase.credentials')
+        self.write_input([self.entry])
+        vault = self.vault()
+        vault.import_file(self.input)
+        self.write_input([dict(self.entry, id='second')])
+        with open(vault.path, 'rb'), mock.patch.object(module, '_REPLACE_ATTEMPTS', 3):
+            with self.assertRaises(module.CredentialError) as error:
+                vault.import_file(self.input)
+        self.assertEqual(error.exception.code, 'storage_error')
+        self.assertEqual({p['id'] for p in vault.list()}, {'lab'})
+        self.assertEqual([p.name for p in vault.directory.glob('.vault-*')], [])
+
     @unittest.skipUnless(os.name == 'nt', 'requires actual Windows byte-range locking')
     def test_empty_lock_file_waits_before_initialization_and_preserves_cancellation(self):
         import subprocess

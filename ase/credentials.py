@@ -119,6 +119,22 @@ def _read(path):
         raise CredentialError('storage_error') from None
 
 
+_REPLACE_ATTEMPTS = 40
+_REPLACE_DELAY = 0.05
+
+
+def _replace(source, target):
+    """Atomic replace; on Windows retry briefly while another process (scanner, indexer) holds the target open."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            return os.replace(source, target)
+        except PermissionError:
+            if os.name != 'nt' or attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY)
+            _safe_path(target)  # The target must still be the same safe path after the wait.
+
+
 class _Blob(ctypes.Structure):
     _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
 
@@ -251,7 +267,7 @@ class CredentialVault:
                 stream.flush()
                 os.fsync(stream.fileno())
             _safe_path(self.path)
-            os.replace(tmp, self.path)
+            _replace(tmp, self.path)
             tmp = None
         except OSError:
             raise CredentialError('storage_error') from None
