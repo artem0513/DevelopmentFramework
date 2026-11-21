@@ -38,7 +38,7 @@ class StageHistoryTests(unittest.TestCase):
     def capture(self, *, whole=False, alter_verifier=None):
         self.assertTrue(hasattr(self.controller, "_capture_stage"), "stage proof capture is required")
         fixture = self.base / "fixture.py"; fixture.write_text(transport.FIXTURE)
-        trusted = self.base / "trusted"; trusted.mkdir()
+        trusted = self.base / "trusted"; trusted.mkdir(exist_ok=True)
         runner = Runner({"executable": __import__("sys").executable, "executable_args": [str(fixture), "success", "codex"],
                          "trusted_cwd": str(trusted), "protocol_only": True}, self.store.root / "tasks" / "history" / "sessions")
         for role in ("implementation", "ac", "review"):
@@ -230,6 +230,163 @@ class StageHistoryTests(unittest.TestCase):
         history, missing = self.history_packet()
         self.assertEqual(history["stages"], [])
         self.assertTrue(any("Stage history unavailable: draft" in item for item in missing))
+
+    # A newer runtime policy with unchanged artifacts refreshes independent proof only.
+    @staticmethod
+    def newer_policy():
+        from unittest import mock
+        return mock.patch("ase.runtime_policy._identity", return_value="e" * 64)
+
+    def done(self):
+        return read_record(self.store.db, "stage", "history:draft")["payload"]
+
+    def fresh_verification(self):
+        fixture = self.base / "fixture.py"
+        trusted = self.base / "trusted"
+        runner = Runner({"executable": __import__("sys").executable, "executable_args": [str(fixture), "success", "codex"],
+                         "trusted_cwd": str(trusted), "protocol_only": True}, self.store.root / "tasks" / "history" / "sessions")
+        calls = []
+
+        def verify(task_id, stage_id):
+            calls.append(stage_id)
+            for role in ("ac", "review"):
+                request = self.controller._request("history", role, transport.SCHEMA, {"stage_id": stage_id})
+                self.controller._save("verification", "history:" + role, runner.run(CodexAdapter(), request, timeout=5)["receipt"])
+            fingerprint = read_record(self.store.db, "checks", "history")["payload"]["fingerprint"]
+            return {"status": "APPROVED", "blocked_reasons": [], "rejected_reasons": [], "fingerprint": fingerprint}
+        return verify, calls
+
+    @staticmethod
+    def as_independent():
+        # Seam: models independent CLI receipts for the protocol unit only; the
+        # protocol-only tests below prove the real evidence requirement.
+        from unittest import mock
+        return mock.patch("ase.workflow._REFRESH_EVIDENCE", frozenset({"independent_cli", "protocol_only"}))
+
+    def test_policy_change_with_unchanged_source_needs_refresh_but_current_policy_does_not(self):
+        self.capture()
+        task = TaskService(self.store).snapshot("history")
+        self.assertFalse(self.controller._stage_policy_refresh_needed(task, self.done()))
+        with self.newer_policy():
+            # A stage proven only by protocol fixtures is never upgraded by a refresh.
+            self.assertFalse(self.controller._stage_policy_refresh_needed(task, self.done()))
+        with self.newer_policy(), self.as_independent():
+            self.assertTrue(self.controller._stage_policy_refresh_needed(task, self.done()))
+            (self.root / "guide.txt").write_text("changed after approval")
+            self.assertFalse(self.controller._stage_policy_refresh_needed(task, self.done()))
+
+    def test_refresh_keeps_the_implementation_and_records_current_independent_proof(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        stage = task["contract"]["stages"][0]
+        verify, calls = self.fresh_verification()
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", side_effect=verify), self.as_independent():
+            verdict = self.controller._refresh_stage_policy(task, stage, original)
+            self.assertEqual(verdict["status"], "APPROVED")
+            refreshed = self.done()
+            history, missing = self.controller._stage_history(task)
+        self.assertEqual(calls, ["draft"])
+        self.assertEqual(refreshed["proof"]["roles"]["implementation"], original["proof"]["roles"]["implementation"])
+        self.assertNotEqual(refreshed["proof"]["roles"]["ac"], original["proof"]["roles"]["ac"])
+        self.assertEqual(refreshed["proof"]["policy_refresh"]["previous_proof_sha256"],
+                         __import__("ase.state", fromlist=["hash_value"]).hash_value(original["proof"]))
+        self.assertEqual(missing, [])
+        entry = history["stages"][0]
+        self.assertTrue(entry["policy_current"])
+        self.assertFalse(entry["roles"]["implementation"]["policy_current"])
+
+    def test_protocol_only_refresh_never_replaces_the_stage_proof(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        verify, calls = self.fresh_verification()
+        # The original stage is treated as independent; only the fresh receipts are protocol-only.
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", side_effect=verify), \
+                mock.patch.object(self.controller, "_unchanged_under_historical_policy", return_value=True):
+            verdict = self.controller._refresh_stage_policy(task, task["contract"]["stages"][0], original)
+        self.assertEqual(verdict["status"], "BLOCKED")
+        self.assertIn("independent evidence", verdict["blocked_reasons"][0])
+        self.assertEqual(self.done(), original)
+
+    def test_protocol_only_original_stage_is_never_refreshed(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        verify, calls = self.fresh_verification()
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", side_effect=verify):
+            verdict = self.controller._refresh_stage_policy(task, task["contract"]["stages"][0], original)
+        self.assertEqual(verdict["status"], "BLOCKED")
+        self.assertEqual(calls, [])
+        self.assertEqual(self.done(), original)
+
+    def test_refresh_rejection_demotes_the_stage_so_repair_can_capture(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        fresh, _ = self.fresh_verification()
+        # A current rejection that arrives beside a blocker (e.g. the other role timed out) is still durable.
+        rejected = {"status": "REJECTED", "blocked_reasons": ["review session timed out"],
+                    "rejected_reasons": ["P2: newer reviewer found a defect"]}
+
+        def reject(task_id, stage_id):
+            fresh(task_id, stage_id)
+            return rejected
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", side_effect=reject), self.as_independent():
+            verdict = self.controller._refresh_stage_policy(task, task["contract"]["stages"][0], original)
+        self.assertEqual(verdict, rejected)
+        demoted = self.done()
+        self.assertEqual(demoted["state"], "REFRESH_REJECTED")
+        self.assertEqual(demoted["previous"], original)
+        self.assertFalse(self.controller._stage_policy_refresh_needed(task, demoted))
+        self.capture()  # a repaired stage can be captured again instead of "cannot be replaced implicitly"
+        self.assertEqual(self.done()["state"], "COMPLETED")
+
+    def test_refresh_ignores_a_rejection_without_current_independent_receipts(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        rejected = {"status": "REJECTED", "blocked_reasons": [], "rejected_reasons": ["P2: fixture claim"]}
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", return_value=rejected), self.as_independent():
+            verdict = self.controller._refresh_stage_policy(task, task["contract"]["stages"][0], original)
+        self.assertEqual(verdict["status"], "BLOCKED")  # never a repair cycle from an untrusted rejection
+        self.assertEqual(self.done(), original)
+
+    def test_refresh_refuses_receipts_bound_to_other_checks(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        fresh, _ = self.fresh_verification()
+
+        def verify_then_recheck(task_id, stage_id):
+            verdict = fresh(task_id, stage_id)
+            self.controller.check("history")  # new checks record: the saved receipts now bind stale checks
+            return verdict
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", side_effect=verify_then_recheck), self.as_independent():
+            verdict = self.controller._refresh_stage_policy(task, task["contract"]["stages"][0], original)
+        self.assertEqual(verdict["status"], "BLOCKED")
+        self.assertIn("bound to these checks", verdict["blocked_reasons"][0])
+        self.assertEqual(self.done(), original)
+
+    def test_refresh_refuses_changed_source_without_new_receipts(self):
+        from unittest import mock
+        self.capture()
+        original = self.done()
+        task = TaskService(self.store).snapshot("history")
+        verify, calls = self.fresh_verification()
+        (self.root / "guide.txt").write_text("changed after approval")
+        with self.newer_policy(), mock.patch.object(self.controller, "verify", side_effect=verify), self.as_independent():
+            verdict = self.controller._refresh_stage_policy(task, task["contract"]["stages"][0], original)
+        self.assertEqual(verdict["status"], "BLOCKED")
+        self.assertIn("fresh implementation cycle", verdict["blocked_reasons"][0])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.done(), original)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ def _object(properties):
     return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
 
 
+# Only genuine independent sessions may replace completed stage proof on a policy refresh.
+_REFRESH_EVIDENCE = frozenset({"independent_cli"})
 STR = {"type": "string"}
 STRINGS = {"type": "array", "items": STR}
 AC_SCHEMA = _object({"criteria": {"type": "array", "items": _object({
@@ -796,6 +798,121 @@ class WorkflowController:
                     "roles": {"implementation": receipt, **{role: read_record(self.store.db, "verification", task_id + ":" + role)["payload"]
                         for role in ("ac", "review")}}}})
 
+    def _stage_policy_refresh_needed(self, task, done):
+        """A completed stage whose independent receipts predate the current runtime policy
+        while its approved artifacts are unchanged (for example after an ase upgrade)."""
+        proof = done.get("proof")
+        roles = proof.get("roles") if isinstance(proof, dict) else None
+        if (not isinstance(roles, dict) or proof.get("version") != 1
+                or not all(isinstance(roles.get(role), dict) for role in ("implementation", "ac", "review"))):
+            return False
+        return self._unchanged_under_historical_policy(task, proof)
+
+    def _unchanged_under_historical_policy(self, task, proof, *, current_fingerprint=None):
+        """True when the stage's AC/review predate the current runtime policy and today's
+        artifacts, read under that same historical policy, reproduce the approved fingerprint.
+        With current_fingerprint, the same single read must also give that current-policy value."""
+        from .gates import fingerprint_under_policy
+        from .runtime_policy import policy_fingerprint
+        try:
+            implementation = verify_receipt(proof["roles"]["implementation"], require_current_policy=False)
+            verified = [verify_receipt(proof["roles"][role], require_current_policy=False) for role in ("ac", "review")]
+            if any(item["evidence_kind"] not in _REFRESH_EVIDENCE for item in (implementation, *verified)):
+                return False
+            if all(item["policy_current"] for item in verified):
+                return False
+            policy_ids = {item["policy_id"] for item in verified}
+            if len(policy_ids) != 1 or None in policy_ids:
+                return False
+            historical, current = fingerprint_under_policy(self.store, task["contract"], task["task_id"],
+                                                           policy_ids.pop(), policy_fingerprint())
+            return historical == proof["checks"]["fingerprint"] and current_fingerprint in {None, current}
+        except (ValueError, OSError, KeyError, TypeError):
+            return False  # Unverifiable history is never refreshed silently.
+
+    def _refresh_stage_policy(self, task, stage, done):
+        """Fresh checks and independent AC/review under the current policy for unchanged
+        artifacts. The original implementation receipt stays as provenance; changed source
+        still needs a new implementation cycle."""
+        task_id, stage_id = task["task_id"], stage["id"]
+        key = task_id + ":" + stage_id
+        saved = read_record(self.store.db, "stage", key)
+        if saved["payload"] != done:
+            return {"status": "BLOCKED", "blocked_reasons": ["Stage record changed before policy refresh"]}
+        blockers, _ = self._revalidate_prerequisites(task, stage)
+        if blockers:
+            return {"status": "BLOCKED", "blocked_reasons": blockers}
+        original = done["proof"]
+        plan_hash = original["checks"]["plan_hash"]
+        if self.tasks.execution_plan(task_id)["plan_hash"] != plan_hash:
+            return {"status": "BLOCKED", "blocked_reasons": ["Execution plan changed; revalidate the stage instead"]}
+        if not self._unchanged_under_historical_policy(task, original):
+            return {"status": "BLOCKED", "blocked_reasons": [
+                "Stage source changed since completion, or its history cannot be verified; a fresh implementation cycle is required"]}
+        checks = self.check(task_id, stage_id)
+        current = source_snapshot(self.store, task["contract"], task_id=task_id)["fingerprint"]
+        if (checks.get("source_changed_during_checks") or checks["fingerprint"] != current
+                or checks.get("plan_hash") != plan_hash or not self._unchanged_under_historical_policy(task, original)):
+            return {"status": "BLOCKED", "blocked_reasons": ["Stage source changed during policy refresh"]}
+        verdict = self.verify(task_id, stage_id)
+        checks_record = read_record(self.store.db, "checks", task_id)
+        # Receipts count only when bound to exactly these checks of this stage's source.
+        bindings = {"fingerprint": checks["fingerprint"], "contract_sha256": task["contract_hash"],
+            "proposal_sha256": task["proposal_hash"], "plan_sha256": plan_hash,
+            "check_sha256": hash_value(checks_record["payload"]), "workspace_id": self.store.workspace_id}
+        roles, independent = {}, {}
+        for role in ("ac", "review"):
+            record = read_record(self.store.db, "verification", task_id + ":" + role)
+            expected = dict(bindings)
+            receipt_bindings = (record["payload"] or {}).get("bindings") or {}
+            if "verification_context_sha256" in receipt_bindings:
+                expected["verification_context_sha256"] = verification_context_hash(self.store, task["contract"], task_id, stage_id)
+            if "lead_review_sha256" in receipt_bindings:  # lead-review provenance, as _stage_history accepts it
+                expected["lead_review_sha256"] = receipt_bindings["lead_review_sha256"]
+            try:
+                verified = (verify_receipt(record["payload"], expected_bindings=expected, require_current_policy=False)
+                            if record["payload"] else {})
+            except ValueError:
+                verified = {}
+            independent[role] = bool(verified.get("policy_current") and verified.get("evidence_kind") in _REFRESH_EVIDENCE)
+            roles[role] = record
+
+        def unchanged(db):
+            current_task = self.tasks.snapshot(task_id)
+            return not (any(current_task[name] != task[name] for name in ("contract_hash", "proposal_hash"))
+                or self.tasks.execution_plan(task_id)["plan_hash"] != plan_hash
+                or read_record(db, "stage", key)["revision"] != saved["revision"]
+                or read_record(db, "checks", task_id) != checks_record
+                or not self._unchanged_under_historical_policy(task, original, current_fingerprint=checks["fingerprint"])
+                or any(read_record(db, "verification", task_id + ":" + role) != record for role, record in roles.items()))
+
+        if verdict["status"] != "APPROVED":
+            if verdict.get("rejected_reasons") and any(independent.values()):
+                # A current independent rejection is durable even beside a blocker: the stage
+                # leaves COMPLETED, so the next run repairs it instead of re-rolling reviewers.
+                with transaction(self.store.db) as db:
+                    if not unchanged(db):
+                        raise ValueError("Stage policy refresh identities changed during verification")
+                    write_record(db, "stage", key, {"state": "REFRESH_REJECTED", "contract_hash": task["contract_hash"],
+                        "proposal_hash": task["proposal_hash"], "gate": verdict, "rejected_at": now(), "previous": done},
+                        expected_revision=saved["revision"])
+                return verdict
+            return {**verdict, "status": "BLOCKED", "blocked_reasons": verdict.get("blocked_reasons") or [
+                "Refresh rejection is not current independent evidence bound to these checks"]}
+        if not all(independent.values()) or verdict.get("fingerprint") != checks["fingerprint"]:
+            return {"status": "BLOCKED", "blocked_reasons": [
+                "Refreshed stage verification is not current independent evidence bound to these checks"]}
+        with transaction(self.store.db) as db:
+            if not unchanged(db):
+                raise ValueError("Stage policy refresh identities changed during verification")
+            write_record(db, "stage", key, {**done, "gate": verdict, "fingerprint": verdict["fingerprint"], "proof": {
+                "version": 1, "checks": checks_record["payload"],
+                "roles": {"implementation": original["roles"]["implementation"],
+                          **{role: record["payload"] for role, record in roles.items()}},
+                "policy_refresh": {"previous_proof_sha256": hash_value(original), "refreshed_at": now()}}},
+                expected_revision=saved["revision"])
+        return verdict
+
     def _stage_history(self, task):
         history, missing = {"historical_only": True, "stages": []}, []
         for stage in task["contract"]["stages"]:
@@ -1242,7 +1359,9 @@ class WorkflowController:
                 and done.get("proposal_hash") == task["proposal_hash"])
             revalidate_completed = (completed_identity and done.get("proof", {}).get("checks", {}).get("plan_hash")
                 != self.tasks.execution_plan(task_id)["plan_hash"])
-            if completed_identity and not revalidate_completed:
+            refresh_policy = (completed_identity and not revalidate_completed
+                and self._stage_policy_refresh_needed(task, done))
+            if completed_identity and not revalidate_completed and not refresh_policy:
                 continue
             try:
                 self.tasks.require_approval(task_id, stage_id)
@@ -1269,6 +1388,15 @@ class WorkflowController:
                     else:
                         self.check(task_id, stage_id)
                         verdict = self.verify(task_id, stage_id)
+                    if verdict["status"] == "APPROVED":
+                        stage_results[stage_id] = verdict
+                        continue
+                    if not verdict.get("blocked_reasons"):
+                        verdict = self._run_stage(task, stage, runner, adapter, resume=False)
+                elif refresh_policy:
+                    # Same approved artifacts, newer runtime policy: refresh the
+                    # independent proof; a rejection enters the normal repair cycle.
+                    verdict = self._refresh_stage_policy(task, stage, done)
                     if verdict["status"] == "APPROVED":
                         stage_results[stage_id] = verdict
                         continue

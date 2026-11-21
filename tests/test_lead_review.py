@@ -138,6 +138,26 @@ class LeadReviewTests(unittest.TestCase):
         self.assertEqual(ticket['handoff']['number'], 1)
         self.assertEqual(ticket['handoff']['base']['fingerprint'], checks['fingerprint'])
 
+    def test_historical_policy_implementation_needs_current_policy_stage_proof(self):
+        from unittest.mock import patch
+        from ase.state import hash_value
+        self.implementation()
+        receipt = read_record(self.store.db, 'implementation', 'lead')['payload']
+        with patch('ase.runtime_policy._identity', return_value='e' * 64):
+            checks = self.controller.check('lead')
+            with self.assertRaisesRegex(ValueError, 'stale'):
+                self.prepare()
+            task = self.tasks.snapshot('lead')
+            entry = {'stage_id': 'finish', 'semantic_approval': True, 'policy_current': True, 'current_identity': True,
+                'contract_hash': task['contract_hash'], 'proposal_hash': task['proposal_hash'], 'checks': checks,
+                'roles': {'implementation': {'receipt_sha256': hash_value(receipt)}}}
+            with patch.object(self.controller.__class__, '_stage_history', return_value=({'stages': [dict(entry, policy_current=False)]}, [])):
+                with self.assertRaisesRegex(ValueError, 'stale'):
+                    self.prepare()
+            with patch.object(self.controller.__class__, '_stage_history', return_value=({'stages': [entry]}, [])):
+                ticket = self.prepare()
+        self.assertEqual(ticket['handoff']['base']['fingerprint'], checks['fingerprint'])
+
     def test_rechecked_receipt_cannot_borrow_another_stage_implementation(self):
         from unittest.mock import patch
         self.implementation(); checks = self.controller.check('lead'); task = self.tasks.snapshot('lead')

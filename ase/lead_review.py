@@ -399,7 +399,8 @@ class LeadReview:
                 receipt = read_record(self.store.db, 'implementation', task_id)['payload']
                 if not receipt:
                     raise ValueError('Initial implementation capture is required before additional critiques')
-                actual = verify_receipt(receipt)
+                # Policy currency is decided below: current, or proven by refreshed stage proof.
+                actual = verify_receipt(receipt, require_current_policy=False)
                 raw_request = _read(receipt['artifacts']['request']['path'], 8388608)
                 if sha256(raw_request) != receipt['request_sha256']:
                     raise ValueError('Initial implementation request changed')
@@ -413,7 +414,8 @@ class LeadReview:
                     'check_sha256': base['check_hash'], 'workspace_id': base['workspace_id']}
                 current_receipt = receipt['bindings'] == required
                 identity = {k: v for k, v in required.items() if k not in {'fingerprint', 'check_sha256'}}
-                if not current_receipt and all(receipt['bindings'].get(k) == v for k, v in identity.items()):
+                stage_proven = False
+                if (not current_receipt or not actual['policy_current']) and all(receipt['bindings'].get(k) == v for k, v in identity.items()):
                     # Normal run seals a candidate BEFORE applying its edits and
                     # running checks. The exact independently authenticated,
                     # completed stage proves that original candidate reached
@@ -434,9 +436,12 @@ class LeadReview:
                                 and checks.get('workspace_id') == base['workspace_id']
                                 and not checks.get('source_changed_during_checks')
                                 and entry['roles']['implementation'].get('receipt_sha256') == hash_value(receipt)):
-                            current_receipt = True
+                            current_receipt = stage_proven = True
                             break
-                if (actual['result']['status'] != 'COMPLETE' or not actual['policy_current'] or not current_receipt):
+                # An implementation captured under an older runtime policy stays usable only
+                # through current-policy independent stage proof of the exact same source.
+                if (actual['result']['status'] != 'COMPLETE' or not current_receipt
+                        or not (actual['policy_current'] or stage_proven)):
                     raise ValueError('Initial implementation capture is stale')
             number = len(value['passes']) + 1
             ticket = {'id': uuid.uuid4().hex, 'number': number, 'focus': FOCI[number - 1] if number <= 3 else 'corrective-whole-solution',

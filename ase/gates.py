@@ -249,7 +249,7 @@ def _source_inventory(store, task_ids, authenticate):
         _recovery_inventories.reset(scope_handle)
 
 
-def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
+def source_snapshot(store, contract, task_id=None, *, _excluded_files=(), _runtime_policy_sha256s=None):
     _excluded_files = set(_excluded_files)
     for owner, task_ids, authenticate in _recovery_inventories.get():
         if owner is store and task_id in task_ids:
@@ -340,11 +340,23 @@ def source_snapshot(store, contract, task_id=None, *, _excluded_files=()):
     if policy_sha256 is not None:
         observed["fingerprint"] = hash_value({"source_fingerprint": observed["fingerprint"], "discovery_policy_sha256": policy_sha256})
         observed["discovery_policy_sha256"] = policy_sha256
+    if _runtime_policy_sha256s is not None:
+        # The same single read of the artifacts under named runtime policies; nothing is recorded.
+        return [hash_value({'source_fingerprint': observed['fingerprint'], 'runtime_policy_sha256': policy})
+                for policy in _runtime_policy_sha256s]
     from .runtime_policy import policy_fingerprint
     observed['runtime_policy_sha256'] = policy_fingerprint()
     observed['fingerprint'] = hash_value({'source_fingerprint': observed['fingerprint'],
         'runtime_policy_sha256': observed['runtime_policy_sha256']})
     return observed
+
+
+def fingerprint_under_policy(store, contract, task_id, *runtime_policy_sha256s):
+    """Current source fingerprints, from one read, as they would be under the given runtime policy identities."""
+    if not runtime_policy_sha256s or any(not isinstance(item, str) or not re.fullmatch('[0-9a-f]{64}', item)
+                                         for item in runtime_policy_sha256s):
+        raise ValueError('Invalid runtime policy identity')
+    return source_snapshot(store, contract, task_id, _runtime_policy_sha256s=runtime_policy_sha256s)
 
 
 class GateService:

@@ -978,6 +978,40 @@ elif 'cause' in schema['properties']:
         self.assertEqual(read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"], original_budget)
         self.assertEqual(read_record(self.store.db, "stage", "schedule:independent"), original_proof)
 
+    def test_runtime_policy_refresh_reverifies_completed_stage_without_replaying_implementation(self):
+        controller, verification = self.scheduling_fixture()
+        with patch.object(controller, "verify", side_effect=verification):
+            controller.run("schedule")
+        original_candidates = self.implementation_stages()
+        original_budget = read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"]
+        refreshed = []
+
+        def refresh(task, stage, done):
+            refreshed.append(stage["id"])
+            return {"status": "APPROVED", "blocked_reasons": [], "rejected_reasons": []}
+        with patch.object(controller, "verify", side_effect=verification), \
+                patch.object(controller, "_stage_policy_refresh_needed", side_effect=lambda task, done: True), \
+                patch.object(controller, "_refresh_stage_policy", side_effect=refresh):
+            result = controller.run("schedule", resume=True)
+        self.assertEqual(refreshed, ["independent"])
+        self.assertEqual(result["stage_results"]["independent"]["status"], "APPROVED")
+        self.assertEqual(self.implementation_stages(), original_candidates)
+        self.assertEqual(read_record(self.store.db, "budget", "schedule")["payload"]["task_cycles"], original_budget)
+
+    def test_unrefreshable_completed_stage_blocks_without_an_implementation_cycle(self):
+        controller, verification = self.scheduling_fixture()
+        with patch.object(controller, "verify", side_effect=verification):
+            controller.run("schedule")
+        original_candidates = self.implementation_stages()
+        original_proof = read_record(self.store.db, "stage", "schedule:independent")
+        with patch.object(controller, "verify", side_effect=verification), \
+                patch.object(controller, "_stage_policy_refresh_needed", side_effect=lambda task, done: True):
+            result = controller.run("schedule", resume=True)
+        # This fixture's stage proof has no independent receipts, so the real refresh refuses it.
+        self.assertEqual(result["stage_results"]["independent"]["status"], "BLOCKED")
+        self.assertEqual(self.implementation_stages(), original_candidates)
+        self.assertEqual(read_record(self.store.db, "stage", "schedule:independent"), original_proof)
+
     def test_stronger_plan_rejection_preserves_original_repair_cycle_cap(self):
         controller, verification = self.scheduling_fixture()
         with patch.object(controller, "verify", side_effect=verification):
