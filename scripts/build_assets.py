@@ -18,6 +18,15 @@ OWNED_SKILLS = (
 )
 ROLES = {'ase-implementer': 'task-orchestrator', 'ase-ac-verifier': 'independent-ac-verifier',
          'ase-code-reviewer': 'independent-code-reviewer'}
+# Role-specific reminders; the skill itself remains the authoritative text.
+ROLE_NOTES = {
+    'ase-code-reviewer': ('Judge whether each changed hunk is required before judging its correctness, and weigh '
+                          'blast radius on shared components. A review of a change you implemented or co-authored '
+                          'in the same session is a "self-check, not independent", never an approval. '),
+    'ase-implementer': ('A request to review changes this session implemented or co-authored goes to an independent '
+                        'review session. When none is available, the independent review stays pending; label any review '
+                        'you actually perform "self-check, not independent", never an approval. '),
+}
 
 
 def descriptions(root=ROOT):
@@ -62,6 +71,7 @@ def generated_assets(root=ROOT):
                             'critical passes against original requirements and approved clarifications. Record each assessment '
                             'before fixes, recheck after them and retain a current final pass. Workers do not count as the main. '
                             'An awaiting_lead_review handoff is an internal continuation, not another owner approval request. '
+                            + ROLE_NOTES.get(role, '') +
                             'This descriptor grants no access, approval or independent execution by itself.')
             if target == 'codex':
                 path = root / 'agents' / (role + '.toml')
